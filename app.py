@@ -1894,7 +1894,7 @@ def render_outwarding_sources(manual_outwarding: pd.DataFrame) -> None:
     filtered = combined.copy()
     min_date = filtered["Usage Date"].min().date()
     max_date = filtered["Usage Date"].max().date()
-    filter_columns = st.columns([2, 2, 3])
+    filter_columns = st.columns([1.7, 2, 2, 1.3])
     with filter_columns[0]:
         selected_dates = st.date_input(
             "Usage date range",
@@ -1910,6 +1910,21 @@ def render_outwarding_sources(manual_outwarding: pd.DataFrame) -> None:
             key="computed_usage_part_search",
         )
     with filter_columns[2]:
+        supplier_options = sorted(
+            {
+                supplier.strip()
+                for value in filtered["Supplier"].astype(str)
+                for supplier in value.split(",")
+                if supplier.strip()
+            }
+        )
+        selected_suppliers = st.multiselect(
+            "Supplier",
+            supplier_options,
+            placeholder="All suppliers",
+            key="computed_usage_suppliers",
+        )
+    with filter_columns[3]:
         material_options = sorted(
             value
             for value in filtered["Material Type"].astype(str).unique()
@@ -1918,7 +1933,7 @@ def render_outwarding_sources(manual_outwarding: pd.DataFrame) -> None:
         selected_materials = st.multiselect(
             "Material type",
             material_options,
-            placeholder="All material types",
+            placeholder="All types",
             key="computed_usage_material_types",
         )
 
@@ -1932,6 +1947,20 @@ def render_outwarding_sources(manual_outwarding: pd.DataFrame) -> None:
             filtered["Part No."]
             .astype(str)
             .str.contains(part_search.strip(), case=False, na=False, regex=False)
+        ]
+    if selected_suppliers:
+        selected_supplier_set = set(selected_suppliers)
+        filtered = filtered[
+            filtered["Supplier"].astype(str).apply(
+                lambda value: bool(
+                    selected_supplier_set
+                    & {
+                        supplier.strip()
+                        for supplier in value.split(",")
+                        if supplier.strip()
+                    }
+                )
+            )
         ]
     if selected_materials:
         filtered = filtered[filtered["Material Type"].isin(selected_materials)]
