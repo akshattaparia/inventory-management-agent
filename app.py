@@ -83,6 +83,9 @@ SOURCE_SHEETS = {
     },
 }
 COMPUTED_USAGE_CACHE_PATH = DATA_DIR / "computed_part_usage.csv"
+INWARDING_SHEET_URL = DEFAULT_GOOGLE_SHEET_URL
+INWARDING_SNAPSHOT_PATH = DATA_DIR / "inwarding_sheet_snapshot.csv"
+INWARDING_SNAPSHOT_META_PATH = DATA_DIR / "inwarding_sheet_snapshot.json"
 
 TABLES = {
     "part_inventory": {
@@ -1658,7 +1661,7 @@ def render_supplier_buyer_map() -> None:
     )
 
 
-def render_inwarding() -> None:
+def render_superset_inwarding() -> None:
     st.header("Inwarding Parts")
     st.write(
         "Live GRN inwarding from the Superset/Trino source. "
@@ -1773,6 +1776,270 @@ def render_inwarding() -> None:
         filtered.to_csv(index=False),
         file_name="live_superset_grn_filtered.csv",
         mime="text/csv",
+    )
+
+
+def clean_inwarding_snapshot(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    renamed = df.rename(
+        columns={
+            "Suplier Name": "Supplier Name",
+            "Invoice QTY": "Invoice Qty",
+        }
+    )
+    preferred_columns = [
+        "Gate Entry No",
+        "Date",
+        "Shift",
+        "In Time",
+        "Vehicle No",
+        "Invoice Number",
+        "Invoice Date",
+        "PO Number",
+        "Supplier Name",
+        "Part Number",
+        "Part Name",
+        "Invoice Qty",
+        "Receipt Qty",
+        "Discrepancy",
+        "Unloading Status",
+        "Model",
+        "Remarks",
+    ]
+    available_columns = [
+        column for column in preferred_columns if column in renamed.columns
+    ]
+    result = renamed[available_columns].copy().fillna("")
+    if "Date" in result.columns:
+        parsed_dates = pd.to_datetime(
+            result["Date"],
+            errors="coerce",
+            format="mixed",
+        )
+        result = (
+            result.assign(_parsed_date=parsed_dates)
+            .sort_values(
+                ["_parsed_date", "Gate Entry No"],
+                ascending=[False, False],
+                na_position="last",
+            )
+            .drop(columns="_parsed_date")
+        )
+    return result.reset_index(drop=True)
+
+
+def save_inwarding_snapshot(df: pd.DataFrame, tab_name: str) -> None:
+    save_source_cache(INWARDING_SNAPSHOT_PATH, df)
+    metadata = {
+        "source_url": INWARDING_SHEET_URL,
+        "tab": tab_name,
+        "rows": int(len(df)),
+        "refreshed_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    tmp_path = INWARDING_SNAPSHOT_META_PATH.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    tmp_path.replace(INWARDING_SNAPSHOT_META_PATH)
+
+
+def load_inwarding_snapshot_meta() -> dict[str, object]:
+    if not INWARDING_SNAPSHOT_META_PATH.exists():
+        return {}
+    try:
+        return json.loads(
+            INWARDING_SNAPSHOT_META_PATH.read_text(encoding="utf-8")
+        )
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def render_inwarding() -> None:
+    st.header("Inwarding Parts")
+    st.write(
+        "This page shows the last saved copy of the Direct Gate Entry sheet. "
+        "Press Refresh only when you want to replace it with the latest version."
+    )
+
+    settings = google_oauth_settings()
+    credentials = load_google_credentials() if settings is not None else None
+    if settings is None:
+        st.warning("Google OAuth is not configured yet.")
+    elif credentials is None:
+        authorization_url = begin_google_oauth(settings)
+        st.link_button(
+            "Connect Google account",
+            authorization_url,
+            type="primary",
+        )
+        st.caption("Use an account that can view the inwarding Google Sheet.")
+    else:
+        st.success("Google connected with read-only Sheets access.")
+
+    refresh_clicked = st.button(
+        "Refresh inwarding from Google Sheet",
+        type="primary",
+        disabled=credentials is None,
+    )
+    if refresh_clicked:
+        try:
+            with st.spinner("Reading the latest Direct Gate Entry sheet..."):
+                source_df, tab_name = load_google_sheet_oauth(
+                    INWARDING_SHEET_URL,
+                    credentials,
+                )
+                cleaned_df = clean_inwarding_snapshot(source_df)
+                save_inwarding_snapshot(cleaned_df, tab_name)
+            st.success(
+                f"Saved the latest '{tab_name}' snapshot with "
+                f"{len(cleaned_df):,} rows."
+            )
+        except Exception as exc:
+            st.error(
+                "Refresh failed. The previous saved snapshot is still being shown. "
+                f"Details: {exc}"
+            )
+
+    snapshot = clean_inwarding_snapshot(
+        load_source_cache(INWARDING_SNAPSHOT_PATH)
+    )
+    if snapshot.empty:
+        st.info(
+            "No saved inwarding snapshot exists yet. Connect Google and press "
+            "Refresh inwarding from Google Sheet once."
+        )
+        return
+
+    metadata = load_inwarding_snapshot_meta()
+    refreshed_at = str(metadata.get("refreshed_at", "")).replace("T", " ")
+    tab_name = str(metadata.get("tab", "DIRECT GATE ENTRY"))
+    st.caption(
+        f"Showing saved tab: {tab_name}. Last refreshed: "
+        f"{refreshed_at or snapshot_age_label(INWARDING_SNAPSHOT_PATH)}."
+    )
+
+    filtered = snapshot.copy()
+    parsed_dates = pd.to_datetime(
+        filtered.get("Date", pd.Series(index=filtered.index, dtype=str)),
+        errors="coerce",
+        format="mixed",
+    )
+    valid_dates = parsed_dates.dropna()
+    filter_columns = st.columns([1.8, 2, 2, 1.5])
+    with filter_columns[0]:
+        if valid_dates.empty:
+            selected_dates = ()
+            st.caption("No valid dates found")
+        else:
+            min_date = valid_dates.min().date()
+            max_date = valid_dates.max().date()
+            selected_dates = st.date_input(
+                "Entry date range",
+                value=(min_date, max_date),
+                min_value=min_date,
+                max_value=max_date,
+                key="inwarding_snapshot_dates",
+            )
+    with filter_columns[1]:
+        part_search = st.text_input(
+            "Part number",
+            placeholder="Search part number",
+            key="inwarding_snapshot_part",
+        )
+    with filter_columns[2]:
+        supplier_options = sorted(
+            value
+            for value in filtered.get(
+                "Supplier Name",
+                pd.Series(dtype=str),
+            ).astype(str).unique()
+            if value
+        )
+        selected_suppliers = st.multiselect(
+            "Supplier",
+            supplier_options,
+            placeholder="All suppliers",
+            key="inwarding_snapshot_suppliers",
+        )
+    with filter_columns[3]:
+        status_options = sorted(
+            value
+            for value in filtered.get(
+                "Unloading Status",
+                pd.Series(dtype=str),
+            ).astype(str).unique()
+            if value
+        )
+        selected_statuses = st.multiselect(
+            "Unloading status",
+            status_options,
+            placeholder="All statuses",
+            key="inwarding_snapshot_statuses",
+        )
+
+    if isinstance(selected_dates, (tuple, list)) and len(selected_dates) == 2:
+        start_date, end_date = selected_dates
+        if start_date != min_date or end_date != max_date:
+            filtered = filtered[
+                parsed_dates.dt.date.between(start_date, end_date)
+            ]
+    if part_search.strip() and "Part Number" in filtered.columns:
+        filtered = filtered[
+            filtered["Part Number"].astype(str).str.contains(
+                part_search.strip(),
+                case=False,
+                na=False,
+                regex=False,
+            )
+        ]
+    if selected_suppliers and "Supplier Name" in filtered.columns:
+        filtered = filtered[
+            filtered["Supplier Name"].isin(selected_suppliers)
+        ]
+    if selected_statuses and "Unloading Status" in filtered.columns:
+        filtered = filtered[
+            filtered["Unloading Status"].isin(selected_statuses)
+        ]
+
+    receipt_total = numeric(
+        filtered.get("Receipt Qty", pd.Series(dtype=str))
+    ).sum()
+    metric_columns = st.columns(4)
+    with metric_columns[0]:
+        render_metric("Snapshot rows", f"{len(filtered):,}", "neutral")
+    with metric_columns[1]:
+        render_metric("Receipt qty", f"{receipt_total:,.0f}", "ok")
+    with metric_columns[2]:
+        render_metric(
+            "Unique parts",
+            f"{filtered.get('Part Number', pd.Series(dtype=str)).replace('', pd.NA).dropna().nunique():,}",
+            "neutral",
+        )
+    with metric_columns[3]:
+        latest_date = pd.to_datetime(
+            filtered.get("Date", pd.Series(dtype=str)),
+            errors="coerce",
+            format="mixed",
+        ).max()
+        render_metric(
+            "Latest entry",
+            latest_date.strftime("%d %b %Y")
+            if pd.notna(latest_date)
+            else "Not available",
+            "neutral",
+        )
+
+    st.dataframe(
+        filtered,
+        use_container_width=True,
+        hide_index=True,
+        height=600,
+    )
+    st.download_button(
+        "Download filtered inwarding CSV",
+        data=filtered.to_csv(index=False).encode("utf-8"),
+        file_name="inwarding_snapshot_filtered.csv",
+        mime="text/csv",
+        key="inwarding_snapshot_download",
     )
 
 
@@ -2041,21 +2308,20 @@ def render_agentic_flow() -> None:
 
 def render_setup() -> None:
     st.header("Setup")
-    st.write("This starter app stores manual tables as CSV files and reads live GRN inwarding through the Superset export.")
+    st.write(
+        "The app uses saved Google Sheet snapshots for inwarding and "
+        "read-only Google data for production consumption."
+    )
     st.markdown(
         """
         For two people working together:
 
         - Code changes should happen through GitHub branches.
         - App usage can happen through one shared Streamlit URL.
-        - Use the Live Google Sheet page when you want to create a saved copy of a Google Sheet for the app.
         - Use Supplier Buyer Map to create a saved SPOC Summary copy and build buyer-supplier ownership cards.
-        - The app keeps showing the previous saved copy until you click the copy/update button again.
+        - Inwarding Parts keeps showing its previous Direct Gate Entry snapshot until you press Refresh.
         - For private Google Sheets, copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml`, paste the service-account JSON values, and share the sheet with that service-account email.
-        - Use the Inwarding Parts page for live Superset GRN data.
-        - Configure `config/grn_export.env` locally; do not commit that file.
-        - The live GRN CSV is generated at `data/live/grn_live.csv` in this new app only.
-        - For private production data, move from public CSV export to a proper Google service account or database.
+        - Configure `[google_oauth]` for the private inwarding, production, and BOM sheets.
         """
     )
 

@@ -7,7 +7,7 @@ Clean Streamlit starter app for collaborative inventory work.
 - Part Inventory editable table
 - Supplier Buyer Map from a saved SPOC Summary sheet copy
 - Saved Google Sheet copy viewer
-- Inwarding Parts live Superset GRN viewer
+- Inwarding Parts cached Direct Gate Entry Google Sheet viewer
 - Outwarding Parts production/BOM consumption calculator and editable servicing table
 - Basic stock risk flags
 - CSV-backed storage in `data/`
@@ -24,9 +24,9 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Live Superset GRN inwarding
+## Optional Superset GRN exporter
 
-The **Inwarding Parts** page reads only this new app's live GRN export:
+The repository still includes an optional Superset/Trino GRN export script:
 
 ```text
 data/live/grn_live.csv
@@ -47,8 +47,6 @@ To refresh once from the terminal:
 ```bash
 python scripts/scheduled_grn_export.py
 ```
-
-You can also press **Run live export now** inside the **Inwarding Parts** page.
 
 The exporter writes:
 
@@ -111,6 +109,14 @@ part usage = daily FG production × exploded BOM quantity
 
 OAuth tokens and downloaded source caches remain local and are ignored by Git.
 
+## Inwarding snapshot
+
+The **Inwarding Parts** page reads the private `DIRECT GATE ENTRY` worksheet
+through the same read-only Google OAuth connection. Press **Refresh inwarding
+from Google Sheet** to replace the local snapshot. Between refreshes, the page
+continues showing the previous successful snapshot, even if the live sheet
+changes or a later refresh fails.
+
 ## Let another person open your running app
 
 Run Streamlit on your network:
@@ -152,6 +158,7 @@ https://docs.google.com/spreadsheets/d/1V3ic-5Dfcz0PoX-0Z0gXdIrFIIOB_lSh-gM20RzL
 
 For the API method, share the sheet with the service-account email. For the fallback CSV method, the Google Sheet must be shared as **Anyone with the link can view** or published to the web. After someone edits the sheet, press the copy/update button to pull a new snapshot into the app.
 
-The **Inwarding Parts** page is different: it reads current GRN rows from the live Superset export. If Abhiraj runs the app locally, he must create his own local `config/grn_export.env`. If only one shared server runs the app, configure Superset once on that server.
+The **Inwarding Parts** page stores its last successful Google Sheet snapshot
+locally. Each machine or shared server maintains its own cached snapshot.
 
 For real two-person live data entry with private data, move the tables to authenticated Google Sheets access or a database so both users always see the same source of truth safely.
