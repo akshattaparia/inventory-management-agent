@@ -130,10 +130,12 @@ buyer ownership, missing critical fields, overdue unloading, and possible
 duplicate rows. Issues are assigned to the mapped buyer; unowned issues go to
 `SCM Admin`.
 
-The buyer action inbox supports acknowledgement, investigation, resolution
-notes, ageing, escalation, and a downloadable audit history. When a previously
-flagged source issue disappears, the agent marks it `Auto-resolved`. Quantity
-shortages are also compared with the latest calculated production/BOM demand.
+The buyer action inbox supports acknowledgement, investigation, follow-up
+notes, ageing, escalation, and a downloadable audit history. Buyers cannot
+manually mark a discrepancy resolved. When a previously flagged source issue
+disappears after refreshed data is checked, the agent marks it `Auto-resolved`;
+if it still exists, it remains open or is reopened. Quantity shortages are also
+compared with the latest calculated production/BOM demand.
 
 ## Let another person open your running app
 
