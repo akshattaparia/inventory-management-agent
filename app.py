@@ -501,6 +501,29 @@ def create_sheet_snapshot(source_url: str, snapshot_path: Path, meta_path: Path)
     return raw, load_snapshot_meta(meta_path)
 
 
+def show_google_sheet_access_help(exc: Exception) -> None:
+    st.write("This means the Streamlit app is not allowed to read the Google Sheet.")
+    st.write("Being logged in to Google on Chrome does not log in the Python app running Streamlit.")
+    st.markdown(
+        """
+        **Quick fix**
+
+        1. Open the Google Sheet.
+        2. Click **Share**.
+        3. Under **General access**, choose **Anyone with the link**.
+        4. Set it to **Viewer**.
+        5. Come back here and click the copy/update button again.
+
+        **Private-company-data fix**
+
+        1. Configure `.streamlit/secrets.toml` from `.streamlit/secrets.toml.example`.
+        2. Paste the Google service-account JSON values there.
+        3. Share the Google Sheet with the service account `client_email` as **Viewer**.
+        """
+    )
+    st.code(str(exc))
+
+
 def snapshot_age_label(snapshot_path: Path) -> str:
     if not snapshot_path.exists():
         return "no copy yet"
@@ -830,6 +853,8 @@ def render_live_google_sheet() -> None:
             f"Saved copy: `{LIVE_GOOGLE_SHEET_SNAPSHOT_CSV.relative_to(APP_DIR)}`. "
             f"Last copied: {snapshot_age_label(LIVE_GOOGLE_SHEET_SNAPSHOT_CSV)}."
         )
+    if not google_sheets_credentials_configured():
+        st.info("No Google Sheets API credentials found. This button can read only sheets shared as Anyone with the link can view.")
 
     if refresh_clicked:
         try:
@@ -838,9 +863,7 @@ def render_live_google_sheet() -> None:
             st.rerun()
         except Exception as exc:
             st.error("Could not create the sheet copy.")
-            st.write("If the sheet is private, configure the Google Sheets API service account and share the sheet with that service-account email.")
-            st.write("Temporary fallback: in Google Sheets, click Share and give Viewer access to anyone with the link.")
-            st.code(str(exc))
+            show_google_sheet_access_help(exc)
             return
 
     raw = load_sheet_snapshot(LIVE_GOOGLE_SHEET_SNAPSHOT_CSV)
@@ -914,6 +937,8 @@ def render_supplier_buyer_map() -> None:
             f"Saved copy: `{SPOC_SUMMARY_SNAPSHOT_CSV.relative_to(APP_DIR)}`. "
             f"Last copied: {snapshot_age_label(SPOC_SUMMARY_SNAPSHOT_CSV)}."
         )
+    if not google_sheets_credentials_configured():
+        st.info("No Google Sheets API credentials found. This button can read only sheets shared as Anyone with the link can view.")
 
     if refresh_clicked:
         try:
@@ -922,9 +947,7 @@ def render_supplier_buyer_map() -> None:
             st.rerun()
         except Exception as exc:
             st.error("Could not create the SPOC Summary copy.")
-            st.write("For private-sheet access, configure the Google Sheets API service account and share the sheet with that service-account email.")
-            st.write("Temporary fallback: share the Google Sheet as Anyone with the link can view.")
-            st.code(str(exc))
+            show_google_sheet_access_help(exc)
             return
 
     try:
