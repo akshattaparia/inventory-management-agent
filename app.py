@@ -2178,7 +2178,6 @@ with st.sidebar:
         [
             "Part Inventory",
             "Supplier Buyer Map",
-            "Live Google Sheet",
             "Inwarding Parts",
             "Outwarding Parts",
             "Agentic Flow",
@@ -2194,8 +2193,6 @@ if page == "Part Inventory":
     render_part_inventory()
 elif page == "Supplier Buyer Map":
     render_supplier_buyer_map()
-elif page == "Live Google Sheet":
-    render_live_google_sheet()
 elif page == "Inwarding Parts":
     render_inwarding()
 elif page == "Outwarding Parts":
