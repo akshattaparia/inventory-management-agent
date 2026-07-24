@@ -8,5 +8,6 @@ config/grn_export.env
 config/*.env
 data/live/*.csv
 data/live/*.json
+data/live/*.tmp
 data/live/*.pid
 data/live/logs/

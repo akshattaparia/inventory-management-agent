@@ -19,6 +19,10 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 LIVE_GRN_CSV = DATA_DIR / "live" / "grn_live.csv"
 LIVE_GRN_META = LIVE_GRN_CSV.with_suffix(".json")
+LIVE_GOOGLE_SHEET_SNAPSHOT_CSV = DATA_DIR / "live" / "google_sheet_snapshot.csv"
+LIVE_GOOGLE_SHEET_SNAPSHOT_META = LIVE_GOOGLE_SHEET_SNAPSHOT_CSV.with_suffix(".json")
+SPOC_SUMMARY_SNAPSHOT_CSV = DATA_DIR / "live" / "spoc_summary_snapshot.csv"
+SPOC_SUMMARY_SNAPSHOT_META = SPOC_SUMMARY_SNAPSHOT_CSV.with_suffix(".json")
 GRN_EXPORT_SCRIPT = APP_DIR / "scripts" / "scheduled_grn_export.py"
 DEFAULT_GOOGLE_SHEET_URL = (
     "https://docs.google.com/spreadsheets/d/"
@@ -460,6 +464,59 @@ def load_google_sheet_raw(url: str) -> pd.DataFrame:
     return raw
 
 
+def save_sheet_snapshot(raw: pd.DataFrame, snapshot_path: Path, meta_path: Path, source_url: str, source_label: str) -> None:
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = snapshot_path.with_suffix(snapshot_path.suffix + ".tmp")
+    raw.fillna("").to_csv(tmp_path, index=False, header=False)
+    tmp_path.replace(snapshot_path)
+    meta = {
+        "source_url": source_url,
+        "source": source_label,
+        "rows": int(len(raw)),
+        "columns": int(raw.shape[1]) if not raw.empty else 0,
+        "copied_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+
+def load_sheet_snapshot(snapshot_path: Path) -> pd.DataFrame:
+    if not snapshot_path.exists():
+        return pd.DataFrame()
+    return pd.read_csv(snapshot_path, dtype=str, header=None, keep_default_na=False).fillna("")
+
+
+def load_snapshot_meta(meta_path: Path) -> dict[str, object]:
+    if not meta_path.exists():
+        return {}
+    try:
+        return json.loads(meta_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def create_sheet_snapshot(source_url: str, snapshot_path: Path, meta_path: Path) -> tuple[pd.DataFrame, dict[str, object]]:
+    source_label = "Google Sheets API" if google_sheets_credentials_configured() else "CSV export link"
+    raw = load_google_sheet_raw(source_url)
+    save_sheet_snapshot(raw, snapshot_path, meta_path, source_url, source_label)
+    return raw, load_snapshot_meta(meta_path)
+
+
+def snapshot_age_label(snapshot_path: Path) -> str:
+    if not snapshot_path.exists():
+        return "no copy yet"
+    modified_at = datetime.fromtimestamp(snapshot_path.stat().st_mtime)
+    seconds = max(0, int((datetime.now() - modified_at).total_seconds()))
+    if seconds < 90:
+        return "just now"
+    minutes = seconds // 60
+    if minutes < 90:
+        return f"{minutes} min ago"
+    hours = minutes // 60
+    if hours < 48:
+        return f"{hours} hr ago"
+    return f"{hours // 24} days ago"
+
+
 def parse_report_date(value: object) -> pd.Timestamp:
     text = clean_text(value)
     if not text:
@@ -756,7 +813,7 @@ def render_part_inventory() -> None:
 
 def render_live_google_sheet() -> None:
     st.header("Live Google Sheet")
-    st.write("This page reads directly from your Google Sheet. When the sheet changes, refresh this page or press reload.")
+    st.write("This page shows the saved copy of your Google Sheet. Press the button only when you want to pull the latest sheet into the app.")
     source_label = "Google Sheets API" if google_sheets_credentials_configured() else "CSV export link"
 
     sheet_url = st.text_input(
@@ -764,23 +821,35 @@ def render_live_google_sheet() -> None:
         value=DEFAULT_GOOGLE_SHEET_URL,
         help="With API credentials, the sheet can stay private. Without credentials, it must be shared as Anyone with link can view.",
     )
-    left, right = st.columns([1, 5])
+    left, right = st.columns([1.4, 4.6])
     with left:
-        reload_clicked = st.button("Reload sheet", type="primary")
+        refresh_clicked = st.button("Create / update sheet copy", type="primary")
     with right:
-        st.caption("Use this as the shared live source. Do not paste private tokens here.")
+        st.caption(
+            f"Current read method: {source_label}. "
+            f"Saved copy: `{LIVE_GOOGLE_SHEET_SNAPSHOT_CSV.relative_to(APP_DIR)}`. "
+            f"Last copied: {snapshot_age_label(LIVE_GOOGLE_SHEET_SNAPSHOT_CSV)}."
+        )
 
-    if reload_clicked:
-        st.cache_data.clear()
+    if refresh_clicked:
+        try:
+            create_sheet_snapshot(sheet_url, LIVE_GOOGLE_SHEET_SNAPSHOT_CSV, LIVE_GOOGLE_SHEET_SNAPSHOT_META)
+            st.success("Created a fresh copy of the Google Sheet.")
+            st.rerun()
+        except Exception as exc:
+            st.error("Could not create the sheet copy.")
+            st.write("If the sheet is private, configure the Google Sheets API service account and share the sheet with that service-account email.")
+            st.write("Temporary fallback: in Google Sheets, click Share and give Viewer access to anyone with the link.")
+            st.code(str(exc))
+            return
 
-    try:
-        df = load_google_sheet(sheet_url)
-    except Exception as exc:
-        st.error("Could not read the Google Sheet.")
-        st.write("If the sheet is private, configure the Google Sheets API service account and share the sheet with that service-account email.")
-        st.write("Temporary fallback: in Google Sheets, click Share and give Viewer access to anyone with the link.")
-        st.code(str(exc))
+    raw = load_sheet_snapshot(LIVE_GOOGLE_SHEET_SNAPSHOT_CSV)
+    if raw.empty:
+        st.warning("No saved copy exists yet.")
+        st.write("Click **Create / update sheet copy** once. After that, the app will keep showing that saved copy until you click the button again.")
         return
+    meta = load_snapshot_meta(LIVE_GOOGLE_SHEET_SNAPSHOT_META)
+    df = raw_sheet_to_table(raw)
 
     cols = st.columns(3)
     with cols[0]:
@@ -788,15 +857,16 @@ def render_live_google_sheet() -> None:
     with cols[1]:
         render_metric("Columns", f"{len(df.columns):,}", "neutral")
     with cols[2]:
-        render_metric("Source", source_label, "ok")
+        copied_at = str(meta.get("copied_at", "")) or snapshot_age_label(LIVE_GOOGLE_SHEET_SNAPSHOT_CSV)
+        render_metric("Copied", copied_at, "ok")
 
     filtered = filter_frame(df, "live_google_sheet")
-    st.caption(f"{len(filtered):,} rows shown from the live Google Sheet.")
+    st.caption(f"{len(filtered):,} rows shown from the saved sheet copy.")
     st.dataframe(filtered, use_container_width=True, hide_index=True)
     st.download_button(
-        "Download live view as CSV",
+        "Download saved copy as CSV",
         filtered.to_csv(index=False),
-        file_name="live_google_sheet.csv",
+        file_name="google_sheet_snapshot.csv",
         mime="text/csv",
     )
 
@@ -827,7 +897,7 @@ def supplier_cards_html(summary: pd.DataFrame, limit: int = 24) -> str:
 
 def render_supplier_buyer_map() -> None:
     st.header("Supplier Buyer Map")
-    st.write("Live ownership snapshot from the SPOC Summary sheet.")
+    st.write("Buyer-supplier ownership from the saved SPOC Summary copy.")
     source_label = "Google Sheets API" if google_sheets_credentials_configured() else "CSV export link"
 
     sheet_url = st.text_input(
@@ -835,18 +905,41 @@ def render_supplier_buyer_map() -> None:
         value=DEFAULT_SPOC_SUMMARY_SHEET_URL,
         help="Paste the exact Google Sheet tab URL for the SPOC/SCM Summary sheet.",
     )
-    reload_clicked = st.button("Reload SPOC sheet", type="primary")
-    st.caption(f"Current read method: {source_label}. Refreshing the app reloads the latest sheet data.")
-    if reload_clicked:
-        st.cache_data.clear()
+    action_col, info_col = st.columns([1.4, 4.6])
+    with action_col:
+        refresh_clicked = st.button("Create / update SPOC copy", type="primary")
+    with info_col:
+        st.caption(
+            f"Current fetch method: {source_label}. "
+            f"Saved copy: `{SPOC_SUMMARY_SNAPSHOT_CSV.relative_to(APP_DIR)}`. "
+            f"Last copied: {snapshot_age_label(SPOC_SUMMARY_SNAPSHOT_CSV)}."
+        )
+
+    if refresh_clicked:
+        try:
+            create_sheet_snapshot(sheet_url, SPOC_SUMMARY_SNAPSHOT_CSV, SPOC_SUMMARY_SNAPSHOT_META)
+            st.success("Created a fresh SPOC Summary copy.")
+            st.rerun()
+        except Exception as exc:
+            st.error("Could not create the SPOC Summary copy.")
+            st.write("For private-sheet access, configure the Google Sheets API service account and share the sheet with that service-account email.")
+            st.write("Temporary fallback: share the Google Sheet as Anyone with the link can view.")
+            st.code(str(exc))
+            return
 
     try:
-        raw = load_google_sheet_raw(sheet_url)
+        raw = load_sheet_snapshot(SPOC_SUMMARY_SNAPSHOT_CSV)
+        if raw.empty:
+            st.warning("No saved SPOC Summary copy exists yet.")
+            st.write(
+                "Click **Create / update SPOC copy** once. "
+                "After that, this page will keep showing that saved copy until you click the button again."
+            )
+            return
+        snapshot_meta = load_snapshot_meta(SPOC_SUMMARY_SNAPSHOT_META)
         parts, meta = parse_spoc_summary_raw(raw)
     except Exception as exc:
-        st.error("Could not read the SPOC Summary sheet.")
-        st.write("For private-sheet live refresh, configure the Google Sheets API service account and share the sheet with that service-account email.")
-        st.write("Temporary fallback: share the Google Sheet as Anyone with the link can view.")
+        st.error("Could not read the saved SPOC Summary copy.")
         st.code(str(exc))
         return
 
@@ -877,6 +970,9 @@ def render_supplier_buyer_map() -> None:
     labels = [label for label in [meta.get("requirement_label"), meta.get("commitment_label"), meta.get("closing_label")] if label]
     if labels:
         st.caption("Snapshot date columns used: " + " | ".join(dict.fromkeys(labels)))
+    copied_at = str(snapshot_meta.get("copied_at", "") or "")
+    if copied_at:
+        st.caption(f"Saved Google Sheet copy created at: {copied_at}. Source rows copied: {snapshot_meta.get('rows', 0):,}.")
 
     filter_cols = st.columns([1.2, 1.2, 1.2, 1.6])
     with filter_cols[0]:
@@ -1084,8 +1180,9 @@ def render_setup() -> None:
 
         - Code changes should happen through GitHub branches.
         - App usage can happen through one shared Streamlit URL.
-        - Use the Live Google Sheet page when you want changes in a Google Sheet to show in the app.
-        - Use Supplier Buyer Map to read the live SPOC Summary sheet and build buyer-supplier ownership cards.
+        - Use the Live Google Sheet page when you want to create a saved copy of a Google Sheet for the app.
+        - Use Supplier Buyer Map to create a saved SPOC Summary copy and build buyer-supplier ownership cards.
+        - The app keeps showing the previous saved copy until you click the copy/update button again.
         - For private Google Sheets, copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml`, paste the service-account JSON values, and share the sheet with that service-account email.
         - Use the Inwarding Parts page for live Superset GRN data.
         - Configure `config/grn_export.env` locally; do not commit that file.

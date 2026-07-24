@@ -5,8 +5,8 @@ Clean Streamlit starter app for collaborative inventory work.
 ## What is inside
 
 - Part Inventory editable table
-- Supplier Buyer Map from the live SPOC Summary sheet
-- Live Google Sheet viewer
+- Supplier Buyer Map from a saved SPOC Summary sheet copy
+- Saved Google Sheet copy viewer
 - Inwarding Parts live Superset GRN viewer
 - Outwarding Parts editable table
 - Basic stock risk flags
@@ -61,7 +61,7 @@ Those generated files are also ignored by Git. Each laptop/server should generat
 
 ## Live Google Sheets API
 
-The app can read your SPOC / SCM Google Sheet directly through the Google Sheets API. This is better than public CSV export because the sheet can stay private.
+The app can create a saved copy of your SPOC / SCM Google Sheet through the Google Sheets API. This is better than public CSV export because the sheet can stay private.
 
 Setup on the machine running Streamlit:
 
@@ -79,7 +79,19 @@ After that:
 streamlit run app.py
 ```
 
-Open **Supplier Buyer Map** and press **Reload SPOC sheet**. Any daily update in the Google Sheet will show in the app after refresh.
+Open **Supplier Buyer Map** and press **Create / update SPOC copy**. The app saves the current sheet into:
+
+```text
+data/live/spoc_summary_snapshot.csv
+```
+
+The website shows this saved copy by default. If the Google Sheet changes tomorrow, the website will still show the old copy until you press **Create / update SPOC copy** again.
+
+The **Live Google Sheet** page works the same way. Press **Create / update sheet copy** to save the latest sheet into:
+
+```text
+data/live/google_sheet_snapshot.csv
+```
 
 If API credentials are not configured, the app can only use the fallback CSV export link. For that fallback, the sheet must be shared as **Anyone with the link can view**.
 
@@ -122,7 +134,7 @@ The **Live Google Sheet** page reads this sheet by default:
 https://docs.google.com/spreadsheets/d/1V3ic-5Dfcz0PoX-0Z0gXdIrFIIOB_lSh-gM20RzLUKs/edit?gid=2111379627#gid=2111379627
 ```
 
-For the API method, share the sheet with the service-account email. For the fallback CSV method, the Google Sheet must be shared as **Anyone with the link can view** or published to the web. After someone edits the sheet, refresh the Streamlit page or press **Reload sheet**.
+For the API method, share the sheet with the service-account email. For the fallback CSV method, the Google Sheet must be shared as **Anyone with the link can view** or published to the web. After someone edits the sheet, press the copy/update button to pull a new snapshot into the app.
 
 The **Inwarding Parts** page is different: it reads current GRN rows from the live Superset export. If Abhiraj runs the app locally, he must create his own local `config/grn_export.env`. If only one shared server runs the app, configure Superset once on that server.
 
