@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import re
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime, timedelta
+from html import escape
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -22,6 +24,16 @@ DEFAULT_GOOGLE_SHEET_URL = (
     "https://docs.google.com/spreadsheets/d/"
     "1V3ic-5Dfcz0PoX-0Z0gXdIrFIIOB_lSh-gM20RzLUKs/edit?gid=2111379627#gid=2111379627"
 )
+DEFAULT_SPOC_SUMMARY_SHEET_URL = (
+    "https://docs.google.com/spreadsheets/d/"
+    "1j3cRrw-O5TzBEICHYvfUBcQBRyZveYEmR3TD7wLfIzo/edit?gid=543512006#gid=543512006"
+)
+BUYER_NAME_ALIASES = {
+    "kavipriya": "Kavipriya",
+    "subash": "Subhash",
+    "subhash": "Subhash",
+}
+GOOGLE_SHEETS_READONLY_SCOPE = "https://www.googleapis.com/auth/spreadsheets.readonly"
 
 TABLES = {
     "part_inventory": {
@@ -113,6 +125,42 @@ def numeric(series: pd.Series) -> pd.Series:
 
 def normalize_column_name(value: object) -> str:
     return re.sub(r"[^a-z0-9]+", "_", str(value).strip().lower()).strip("_")
+
+
+def clean_text(value: object) -> str:
+    if pd.isna(value):
+        return ""
+    text = re.sub(r"\s+", " ", str(value).strip())
+    if text.lower() in {"", "nan", "none", "nat", "na", "n/a", "-", "#n/a"}:
+        return ""
+    return text
+
+
+def normalize_buyer_name(value: object) -> str:
+    text = clean_text(value)
+    if not text:
+        return ""
+    alias_key = re.sub(r"[^a-z0-9]+", "", text.lower())
+    if alias_key in BUYER_NAME_ALIASES:
+        return BUYER_NAME_ALIASES[alias_key]
+    return " ".join(part.capitalize() for part in text.split(" "))
+
+
+def normalize_supplier_name(value: object) -> str:
+    text = clean_text(value)
+    return text.upper() if text else ""
+
+
+def stock_part_key(value: object) -> str:
+    text = clean_text(value)
+    if re.fullmatch(r"\d+\.0", text):
+        text = text[:-2]
+    return text.upper()
+
+
+def display_qty(value: object) -> str:
+    number = pd.to_numeric(pd.Series([value]), errors="coerce").fillna(0).iloc[0]
+    return f"{number:,.0f}" if float(number).is_integer() else f"{number:,.1f}"
 
 
 def first_existing_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
@@ -273,14 +321,332 @@ def parse_google_sheet_url(url: str) -> tuple[str, str]:
     return spreadsheet_id, gid
 
 
+def google_sheets_credentials_configured() -> bool:
+    try:
+        if "google_service_account" in st.secrets:
+            return True
+    except Exception:
+        pass
+    return bool(
+        os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+        or os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    )
+
+
+def google_sheets_credentials():
+    try:
+        from google.oauth2 import service_account
+    except ImportError as exc:
+        raise RuntimeError("Install Google API packages first: pip install -r requirements.txt") from exc
+
+    info = None
+    try:
+        if "google_service_account" in st.secrets:
+            info = dict(st.secrets["google_service_account"])
+    except Exception:
+        info = None
+
+    if info:
+        if "private_key" in info:
+            info["private_key"] = str(info["private_key"]).replace("\\n", "\n")
+        return service_account.Credentials.from_service_account_info(
+            info,
+            scopes=[GOOGLE_SHEETS_READONLY_SCOPE],
+        )
+
+    credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+    if credentials_path:
+        return service_account.Credentials.from_service_account_file(
+            credentials_path,
+            scopes=[GOOGLE_SHEETS_READONLY_SCOPE],
+        )
+
+    credentials_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    if credentials_json:
+        info = json.loads(credentials_json)
+        if "private_key" in info:
+            info["private_key"] = str(info["private_key"]).replace("\\n", "\n")
+        return service_account.Credentials.from_service_account_info(
+            info,
+            scopes=[GOOGLE_SHEETS_READONLY_SCOPE],
+        )
+
+    raise RuntimeError(
+        "Google Sheets API credentials are not configured. Add `.streamlit/secrets.toml` "
+        "with `[google_service_account]`, then share the Google Sheet with that service-account email."
+    )
+
+
+def google_sheets_service():
+    try:
+        from googleapiclient.discovery import build
+    except ImportError as exc:
+        raise RuntimeError("Install Google API packages first: pip install -r requirements.txt") from exc
+    return build("sheets", "v4", credentials=google_sheets_credentials(), cache_discovery=False)
+
+
+def sheet_title_from_gid(service, spreadsheet_id: str, gid: str) -> str:
+    metadata = (
+        service.spreadsheets()
+        .get(spreadsheetId=spreadsheet_id, fields="sheets(properties(sheetId,title))")
+        .execute()
+    )
+    sheets = metadata.get("sheets", [])
+    if not sheets:
+        raise ValueError("The spreadsheet has no visible sheets.")
+    for sheet in sheets:
+        properties = sheet.get("properties", {})
+        if str(properties.get("sheetId", "")) == str(gid):
+            return str(properties.get("title", ""))
+    return str(sheets[0].get("properties", {}).get("title", ""))
+
+
+def load_google_sheet_api_raw(url: str) -> pd.DataFrame:
+    spreadsheet_id, gid = parse_google_sheet_url(url)
+    service = google_sheets_service()
+    sheet_title = sheet_title_from_gid(service, spreadsheet_id, gid)
+    safe_title = sheet_title.replace("'", "''")
+    result = (
+        service.spreadsheets()
+        .values()
+        .get(spreadsheetId=spreadsheet_id, range=f"'{safe_title}'!A:ZZ")
+        .execute()
+    )
+    rows = result.get("values", [])
+    if not rows:
+        return pd.DataFrame()
+    width = max(len(row) for row in rows)
+    padded_rows = [row + [""] * (width - len(row)) for row in rows]
+    return pd.DataFrame(padded_rows, dtype=str).fillna("")
+
+
+def raw_sheet_to_table(raw: pd.DataFrame) -> pd.DataFrame:
+    if raw.empty:
+        return raw
+    header_row = 0
+    for index in range(min(len(raw), 20)):
+        non_blank_count = sum(bool(clean_text(value)) for value in raw.iloc[index].tolist())
+        if non_blank_count >= 2:
+            header_row = index
+            break
+    columns = [clean_text(value) or f"Column {idx + 1}" for idx, value in enumerate(raw.iloc[header_row].tolist())]
+    table = raw.iloc[header_row + 1 :].copy()
+    table.columns = columns
+    return table.reset_index(drop=True).fillna("")
+
+
 def google_sheet_csv_url(url: str) -> str:
     spreadsheet_id, gid = parse_google_sheet_url(url)
     return f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/export?format=csv&gid={gid}"
 
 
 def load_google_sheet(url: str) -> pd.DataFrame:
+    if google_sheets_credentials_configured():
+        return raw_sheet_to_table(load_google_sheet_api_raw(url))
     csv_url = google_sheet_csv_url(url)
     return pd.read_csv(csv_url, dtype=str).fillna("")
+
+
+def load_google_sheet_raw(url: str) -> pd.DataFrame:
+    if google_sheets_credentials_configured():
+        return load_google_sheet_api_raw(url)
+    csv_url = google_sheet_csv_url(url)
+    raw = pd.read_csv(csv_url, dtype=str, header=None, keep_default_na=False).fillna("")
+    if raw.empty:
+        return raw
+    first_cell = str(raw.iat[0, 0]).lower()
+    if "<html" in first_cell or "unauthorized" in first_cell or "sign in" in first_cell:
+        raise ValueError("Google did not return sheet data. The sheet is probably private.")
+    return raw
+
+
+def parse_report_date(value: object) -> pd.Timestamp:
+    text = clean_text(value)
+    if not text:
+        return pd.NaT
+    parsed = pd.to_datetime(text, errors="coerce", dayfirst=True)
+    if pd.notna(parsed):
+        return parsed
+    for fmt in ("%d-%b", "%d %b", "%d/%m", "%m/%d"):
+        try:
+            parsed_dt = datetime.strptime(text, fmt)
+            return pd.Timestamp(year=datetime.now().year, month=parsed_dt.month, day=parsed_dt.day)
+        except ValueError:
+            continue
+    return pd.NaT
+
+
+def find_spoc_header_row(raw: pd.DataFrame) -> int | None:
+    max_rows = min(len(raw), 30)
+    for row_index in range(max_rows):
+        headers = {normalize_column_name(value) for value in raw.iloc[row_index].tolist() if clean_text(value)}
+        has_part = bool(headers.intersection({"component", "part_no", "part_number"}))
+        has_supplier = bool(headers.intersection({"supplier", "supplier_name"}))
+        has_buyer = bool(headers.intersection({"scm_buyer", "buyer", "buyer_name"}))
+        if has_part and has_supplier and has_buyer:
+            return row_index
+    return None
+
+
+def sheet_col(headers: list[str], *names: str) -> int | None:
+    wanted = {normalize_column_name(name) for name in names}
+    for index, header in enumerate(headers):
+        if normalize_column_name(header) in wanted:
+            return index
+    return None
+
+
+def sheet_col_contains(headers: list[str], *terms: str) -> int | None:
+    wanted = [term.lower() for term in terms]
+    for index, header in enumerate(headers):
+        label = clean_text(header).lower()
+        if label and all(term in label for term in wanted):
+            return index
+    return None
+
+
+def choose_latest_group_date_column(raw: pd.DataFrame, header_row: int, *group_terms: str) -> tuple[int | None, str]:
+    if raw.empty:
+        return None, ""
+    group_row = max(header_row - 1, 0)
+    start_col = None
+    terms = [term.lower() for term in group_terms]
+    for col in range(raw.shape[1]):
+        group_label = clean_text(raw.iat[group_row, col]).lower()
+        if any(term in group_label for term in terms):
+            start_col = col
+            break
+    if start_col is None:
+        return None, ""
+
+    candidates: list[tuple[int, pd.Timestamp, str]] = []
+    for col in range(start_col, raw.shape[1]):
+        group_label = clean_text(raw.iat[group_row, col]).lower()
+        header_label = clean_text(raw.iat[header_row, col])
+        if col != start_col and group_label:
+            break
+        parsed = parse_report_date(header_label)
+        if pd.notna(parsed):
+            candidates.append((col, parsed, header_label))
+        elif candidates and header_label:
+            break
+    if not candidates:
+        return None, ""
+    col, _, label = sorted(candidates, key=lambda item: item[1])[-1]
+    return col, label
+
+
+def raw_cell(raw: pd.DataFrame, row: int, col: int | None) -> object:
+    if col is None or row >= len(raw) or col >= raw.shape[1]:
+        return ""
+    return raw.iat[row, col]
+
+
+def parse_spoc_summary_raw(raw: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, str]]:
+    columns = [
+        "Buyer",
+        "Supplier",
+        "Part No.",
+        "Part Name",
+        "Opening Stock",
+        "MRP / Requirement",
+        "Initial Commitment",
+        "Closing Stock",
+        "Stock Gap",
+        "Status",
+    ]
+    empty = pd.DataFrame(columns=columns)
+    header_row = find_spoc_header_row(raw)
+    if header_row is None:
+        return empty, {"error": "Could not find Summary headers: Component, Supplier, SCM Buyer."}
+
+    headers = [clean_text(value) for value in raw.iloc[header_row].tolist()]
+    part_col = sheet_col(headers, "component", "part_no", "part_number")
+    part_name_col = sheet_col(headers, "object_description", "part_description", "description", "part_name")
+    supplier_col = sheet_col(headers, "supplier", "supplier_name")
+    buyer_col = sheet_col(headers, "scm_buyer", "buyer", "buyer_name")
+    opening_col = sheet_col_contains(headers, "opening", "stock")
+    cumulative_req_col = sheet_col(headers, "cummulative_req", "cumulative_req")
+    requirement_col, requirement_label = choose_latest_group_date_column(raw, header_row, "part requirement")
+    commitment_col, commitment_label = choose_latest_group_date_column(raw, header_row, "supply visiblity", "supply visibility")
+    closing_col, closing_label = choose_latest_group_date_column(raw, header_row, "closing stock")
+    if requirement_col is None:
+        requirement_col = cumulative_req_col
+
+    records = []
+    for row_index in range(header_row + 1, len(raw)):
+        part_no = stock_part_key(raw_cell(raw, row_index, part_col))
+        supplier = normalize_supplier_name(raw_cell(raw, row_index, supplier_col))
+        buyer = normalize_buyer_name(raw_cell(raw, row_index, buyer_col))
+        part_name = clean_text(raw_cell(raw, row_index, part_name_col)).upper()
+        if not part_no or part_no in {"#N/A", "N/A", "NA", "NONE"}:
+            continue
+        if not any([supplier, buyer, part_name]):
+            continue
+
+        opening_stock = pd.to_numeric(raw_cell(raw, row_index, opening_col), errors="coerce")
+        requirement = pd.to_numeric(raw_cell(raw, row_index, requirement_col), errors="coerce")
+        commitment = pd.to_numeric(raw_cell(raw, row_index, commitment_col), errors="coerce")
+        closing_stock = pd.to_numeric(raw_cell(raw, row_index, closing_col), errors="coerce")
+        opening_stock = 0 if pd.isna(opening_stock) else float(opening_stock)
+        requirement = 0 if pd.isna(requirement) else float(requirement)
+        commitment = 0 if pd.isna(commitment) else float(commitment)
+        closing_stock = 0 if pd.isna(closing_stock) else float(closing_stock)
+        stock_gap = max(requirement - closing_stock, 0)
+        if requirement <= 0:
+            status = "Requirement missing"
+        elif closing_stock <= 0:
+            status = "Critical"
+        elif closing_stock < requirement:
+            status = "Below required"
+        else:
+            status = "Healthy"
+
+        records.append(
+            {
+                "Buyer": buyer or "Unmapped buyer",
+                "Supplier": supplier or "Unmapped supplier",
+                "Part No.": part_no,
+                "Part Name": part_name,
+                "Opening Stock": opening_stock,
+                "MRP / Requirement": requirement,
+                "Initial Commitment": commitment,
+                "Closing Stock": closing_stock,
+                "Stock Gap": stock_gap,
+                "Status": status,
+            }
+        )
+
+    if not records:
+        return empty, {"error": "Summary sheet was found, but no part rows were readable."}
+    meta = {
+        "requirement_label": requirement_label,
+        "commitment_label": commitment_label,
+        "closing_label": closing_label,
+    }
+    return pd.DataFrame(records, columns=columns), meta
+
+
+def build_supplier_buyer_summary(parts: pd.DataFrame) -> pd.DataFrame:
+    columns = ["Buyer", "Supplier", "Parts", "Below Required", "Critical", "Opening Stock", "Required Qty", "Closing Stock"]
+    if parts.empty:
+        return pd.DataFrame(columns=columns)
+    grouped = (
+        parts.groupby(["Buyer", "Supplier"], as_index=False)
+        .agg(
+            Parts=("Part No.", "nunique"),
+            **{
+                "Below Required": ("Status", lambda values: values.isin(["Below required", "Critical"]).sum()),
+                "Critical": ("Status", lambda values: values.eq("Critical").sum()),
+                "Opening Stock": ("Opening Stock", "sum"),
+                "Required Qty": ("MRP / Requirement", "sum"),
+                "Closing Stock": ("Closing Stock", "sum"),
+            },
+        )
+        .sort_values(["Below Required", "Critical", "Parts", "Supplier"], ascending=[False, False, False, True])
+        .reset_index(drop=True)
+    )
+    return grouped[columns]
 
 
 def build_inventory_status(df: pd.DataFrame) -> pd.DataFrame:
@@ -391,11 +757,12 @@ def render_part_inventory() -> None:
 def render_live_google_sheet() -> None:
     st.header("Live Google Sheet")
     st.write("This page reads directly from your Google Sheet. When the sheet changes, refresh this page or press reload.")
+    source_label = "Google Sheets API" if google_sheets_credentials_configured() else "CSV export link"
 
     sheet_url = st.text_input(
         "Google Sheet link",
         value=DEFAULT_GOOGLE_SHEET_URL,
-        help="The sheet must be shared as Anyone with link can view, or published to web.",
+        help="With API credentials, the sheet can stay private. Without credentials, it must be shared as Anyone with link can view.",
     )
     left, right = st.columns([1, 5])
     with left:
@@ -410,8 +777,8 @@ def render_live_google_sheet() -> None:
         df = load_google_sheet(sheet_url)
     except Exception as exc:
         st.error("Could not read the Google Sheet.")
-        st.write("Most likely reason: the sheet is private.")
-        st.write("Fix: in Google Sheets, click Share and give Viewer access to anyone with the link.")
+        st.write("If the sheet is private, configure the Google Sheets API service account and share the sheet with that service-account email.")
+        st.write("Temporary fallback: in Google Sheets, click Share and give Viewer access to anyone with the link.")
         st.code(str(exc))
         return
 
@@ -421,7 +788,7 @@ def render_live_google_sheet() -> None:
     with cols[1]:
         render_metric("Columns", f"{len(df.columns):,}", "neutral")
     with cols[2]:
-        render_metric("Source", "Google Sheet", "ok")
+        render_metric("Source", source_label, "ok")
 
     filtered = filter_frame(df, "live_google_sheet")
     st.caption(f"{len(filtered):,} rows shown from the live Google Sheet.")
@@ -430,6 +797,132 @@ def render_live_google_sheet() -> None:
         "Download live view as CSV",
         filtered.to_csv(index=False),
         file_name="live_google_sheet.csv",
+        mime="text/csv",
+    )
+
+
+def supplier_cards_html(summary: pd.DataFrame, limit: int = 24) -> str:
+    if summary.empty:
+        return "<div class='supplier-empty'>No supplier mapping found for the selected filters.</div>"
+    cards = []
+    for _, row in summary.head(limit).iterrows():
+        risk_parts = int(row.get("Below Required", 0) or 0)
+        critical_parts = int(row.get("Critical", 0) or 0)
+        tone = "bad" if critical_parts else "warn" if risk_parts else "ok"
+        cards.append(
+            f"""
+            <div class="supplier-card {tone}">
+                <div class="supplier-card-title">{escape(str(row.get("Supplier", "Unmapped supplier")))}</div>
+                <div class="supplier-card-owner">{escape(str(row.get("Buyer", "Unmapped buyer")))}</div>
+                <div class="supplier-card-kpis">
+                    <div><span>Parts</span><b>{int(row.get("Parts", 0) or 0):,}</b></div>
+                    <div><span>Low</span><b>{risk_parts:,}</b></div>
+                    <div><span>Stock</span><b>{escape(display_qty(row.get("Closing Stock", 0)))}</b></div>
+                </div>
+            </div>
+            """
+        )
+    return f"<div class='supplier-grid'>{''.join(cards)}</div>"
+
+
+def render_supplier_buyer_map() -> None:
+    st.header("Supplier Buyer Map")
+    st.write("Live ownership snapshot from the SPOC Summary sheet.")
+    source_label = "Google Sheets API" if google_sheets_credentials_configured() else "CSV export link"
+
+    sheet_url = st.text_input(
+        "SPOC Summary Sheet link",
+        value=DEFAULT_SPOC_SUMMARY_SHEET_URL,
+        help="Paste the exact Google Sheet tab URL for the SPOC/SCM Summary sheet.",
+    )
+    reload_clicked = st.button("Reload SPOC sheet", type="primary")
+    st.caption(f"Current read method: {source_label}. Refreshing the app reloads the latest sheet data.")
+    if reload_clicked:
+        st.cache_data.clear()
+
+    try:
+        raw = load_google_sheet_raw(sheet_url)
+        parts, meta = parse_spoc_summary_raw(raw)
+    except Exception as exc:
+        st.error("Could not read the SPOC Summary sheet.")
+        st.write("For private-sheet live refresh, configure the Google Sheets API service account and share the sheet with that service-account email.")
+        st.write("Temporary fallback: share the Google Sheet as Anyone with the link can view.")
+        st.code(str(exc))
+        return
+
+    if parts.empty:
+        st.warning("No supplier-buyer mapping could be built from this sheet.")
+        if meta.get("error"):
+            st.code(meta["error"])
+        return
+
+    summary = build_supplier_buyer_summary(parts)
+    buyers = sorted(parts["Buyer"].replace("", pd.NA).dropna().unique().tolist())
+    supplier_values = sorted(parts["Supplier"].replace("", pd.NA).dropna().unique().tolist())
+
+    metric_cols = st.columns(5)
+    with metric_cols[0]:
+        render_metric("Parts mapped", f"{parts['Part No.'].nunique():,}", "neutral")
+    with metric_cols[1]:
+        render_metric("Buyers", f"{len(buyers):,}", "neutral")
+    with metric_cols[2]:
+        render_metric("Suppliers", f"{len(supplier_values):,}", "ok")
+    with metric_cols[3]:
+        below_count = int(parts["Status"].isin(["Below required", "Critical"]).sum())
+        render_metric("Below required", f"{below_count:,}", "warn")
+    with metric_cols[4]:
+        critical_count = int(parts["Status"].eq("Critical").sum())
+        render_metric("Critical", f"{critical_count:,}", "bad")
+
+    labels = [label for label in [meta.get("requirement_label"), meta.get("commitment_label"), meta.get("closing_label")] if label]
+    if labels:
+        st.caption("Snapshot date columns used: " + " | ".join(dict.fromkeys(labels)))
+
+    filter_cols = st.columns([1.2, 1.2, 1.2, 1.6])
+    with filter_cols[0]:
+        selected_buyer = st.selectbox("Buyer view", ["All buyers"] + buyers, index=0)
+    with filter_cols[1]:
+        selected_statuses = st.multiselect(
+            "Status",
+            sorted(parts["Status"].unique().tolist()),
+            default=[],
+        )
+    with filter_cols[2]:
+        selected_suppliers = st.multiselect("Supplier", supplier_values, default=[])
+    with filter_cols[3]:
+        search = st.text_input("Search part or supplier", placeholder="part no., part name, supplier")
+
+    filtered_parts = parts.copy()
+    if selected_buyer != "All buyers":
+        filtered_parts = filtered_parts[filtered_parts["Buyer"].eq(selected_buyer)]
+    if selected_statuses:
+        filtered_parts = filtered_parts[filtered_parts["Status"].isin(selected_statuses)]
+    if selected_suppliers:
+        filtered_parts = filtered_parts[filtered_parts["Supplier"].isin(selected_suppliers)]
+    if search.strip():
+        term = search.strip().lower()
+        search_cols = ["Part No.", "Part Name", "Supplier", "Buyer"]
+        filtered_parts = filtered_parts[
+            filtered_parts[search_cols]
+            .astype(str)
+            .apply(lambda col: col.str.lower().str.contains(term, na=False))
+            .any(axis=1)
+        ]
+
+    filtered_summary = build_supplier_buyer_summary(filtered_parts)
+    st.subheader("Supplier Ownership Snapshot")
+    st.markdown(supplier_cards_html(filtered_summary), unsafe_allow_html=True)
+    if len(filtered_summary) > 24:
+        st.caption(f"Showing first 24 supplier cards out of {len(filtered_summary):,}. Use filters to narrow the view.")
+
+    st.subheader("Part-Level Mapping")
+    table = filtered_parts.sort_values(["Status", "Buyer", "Supplier", "Part No."]).reset_index(drop=True)
+    st.caption(f"{len(table):,} part rows shown after filters.")
+    st.dataframe(table, use_container_width=True, hide_index=True, height=520)
+    st.download_button(
+        "Download mapping CSV",
+        table.to_csv(index=False),
+        file_name="spoc_supplier_buyer_mapping.csv",
         mime="text/csv",
     )
 
@@ -592,6 +1085,8 @@ def render_setup() -> None:
         - Code changes should happen through GitHub branches.
         - App usage can happen through one shared Streamlit URL.
         - Use the Live Google Sheet page when you want changes in a Google Sheet to show in the app.
+        - Use Supplier Buyer Map to read the live SPOC Summary sheet and build buyer-supplier ownership cards.
+        - For private Google Sheets, copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml`, paste the service-account JSON values, and share the sheet with that service-account email.
         - Use the Inwarding Parts page for live Superset GRN data.
         - Configure `config/grn_export.env` locally; do not commit that file.
         - The live GRN CSV is generated at `data/live/grn_live.csv` in this new app only.
@@ -632,6 +1127,69 @@ st.markdown(
         margin: 12px 0;
         background: #ffffff;
     }
+    .supplier-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 14px;
+        margin: 10px 0 18px;
+    }
+    .supplier-card {
+        border: 1px solid #dbe3ef;
+        border-left: 5px solid #16a34a;
+        border-radius: 8px;
+        padding: 16px;
+        background: #ffffff;
+        min-height: 132px;
+        box-shadow: 0 8px 18px rgba(15, 23, 42, 0.06);
+    }
+    .supplier-card.ok { border-left-color: #16a34a; }
+    .supplier-card.warn { border-left-color: #d97706; }
+    .supplier-card.bad { border-left-color: #dc2626; }
+    .supplier-card-title {
+        color: #0f172a;
+        font-weight: 850;
+        font-size: 1rem;
+        line-height: 1.25;
+        margin-bottom: 5px;
+        min-height: 40px;
+    }
+    .supplier-card-owner {
+        color: #64748b;
+        font-weight: 700;
+        font-size: 0.85rem;
+        margin-bottom: 13px;
+    }
+    .supplier-card-kpis {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 10px;
+    }
+    .supplier-card-kpis span {
+        color: #94a3b8;
+        display: block;
+        font-size: 0.72rem;
+        font-weight: 800;
+        text-transform: uppercase;
+    }
+    .supplier-card-kpis b {
+        color: #0f172a;
+        display: block;
+        font-size: 1.05rem;
+        margin-top: 3px;
+    }
+    .supplier-empty {
+        border: 1px solid #dbe3ef;
+        border-radius: 8px;
+        padding: 18px;
+        color: #64748b;
+        background: #ffffff;
+    }
+    @media (max-width: 1000px) {
+        .supplier-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 720px) {
+        .supplier-grid { grid-template-columns: 1fr; }
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -644,6 +1202,7 @@ with st.sidebar:
         "Navigation",
         [
             "Part Inventory",
+            "Supplier Buyer Map",
             "Live Google Sheet",
             "Inwarding Parts",
             "Outwarding Parts",
@@ -658,6 +1217,8 @@ st.title(APP_TITLE)
 
 if page == "Part Inventory":
     render_part_inventory()
+elif page == "Supplier Buyer Map":
+    render_supplier_buyer_map()
 elif page == "Live Google Sheet":
     render_live_google_sheet()
 elif page == "Inwarding Parts":

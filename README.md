@@ -5,6 +5,7 @@ Clean Streamlit starter app for collaborative inventory work.
 ## What is inside
 
 - Part Inventory editable table
+- Supplier Buyer Map from the live SPOC Summary sheet
 - Live Google Sheet viewer
 - Inwarding Parts live Superset GRN viewer
 - Outwarding Parts editable table
@@ -58,6 +59,30 @@ data/live/grn_live.json
 
 Those generated files are also ignored by Git. Each laptop/server should generate its own current live file from Superset.
 
+## Live Google Sheets API
+
+The app can read your SPOC / SCM Google Sheet directly through the Google Sheets API. This is better than public CSV export because the sheet can stay private.
+
+Setup on the machine running Streamlit:
+
+```bash
+cp .streamlit/secrets.toml.example .streamlit/secrets.toml
+```
+
+Paste the Google service-account JSON values into `.streamlit/secrets.toml`.
+
+Then open the Google Sheet, click **Share**, and add the service-account `client_email` as a **Viewer**.
+
+After that:
+
+```bash
+streamlit run app.py
+```
+
+Open **Supplier Buyer Map** and press **Reload SPOC sheet**. Any daily update in the Google Sheet will show in the app after refresh.
+
+If API credentials are not configured, the app can only use the fallback CSV export link. For that fallback, the sheet must be shared as **Anyone with the link can view**.
+
 ## Let another person open your running app
 
 Run Streamlit on your network:
@@ -97,7 +122,7 @@ The **Live Google Sheet** page reads this sheet by default:
 https://docs.google.com/spreadsheets/d/1V3ic-5Dfcz0PoX-0Z0gXdIrFIIOB_lSh-gM20RzLUKs/edit?gid=2111379627#gid=2111379627
 ```
 
-For the simple live-read method to work, the Google Sheet must be shared as **Anyone with the link can view** or published to the web. After someone edits the sheet, refresh the Streamlit page or press **Reload sheet**.
+For the API method, share the sheet with the service-account email. For the fallback CSV method, the Google Sheet must be shared as **Anyone with the link can view** or published to the web. After someone edits the sheet, refresh the Streamlit page or press **Reload sheet**.
 
 The **Inwarding Parts** page is different: it reads current GRN rows from the live Superset export. If Abhiraj runs the app locally, he must create his own local `config/grn_export.env`. If only one shared server runs the app, configure Superset once on that server.
 
