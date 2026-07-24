@@ -5,6 +5,7 @@ Clean Streamlit starter app for collaborative inventory work.
 ## What is inside
 
 - Part Inventory editable table
+- Embedded live Google Sheet link
 - Inwarding Parts editable table
 - Outwarding Parts editable table
 - Basic stock risk flags
@@ -36,6 +37,36 @@ http://YOUR_LOCAL_IP:8501
 ```
 
 This works only while your laptop is awake and Streamlit is running.
+
+## Linked Google Sheet
+
+Open **Linked Google Sheet**, paste a standard Google Sheets URL, and click
+**Add link and display**. The URL is stored locally and the live sheet is embedded
+inside the Streamlit page.
+
+The embedded sheet uses the Google account signed into the viewer's browser.
+Google continues to control whether that person can view or edit it. An
+**Open in new tab** button is provided if Google does not allow the sheet to render
+inside an iframe.
+
+## Read-only production and BOM sources
+
+The **Outwarding Parts** page can connect to the private daily-production and BOM
+Google Sheets using read-only OAuth. To configure it:
+
+1. Enable the Google Sheets API in a Google Cloud project.
+2. Configure the OAuth consent screen and add the intended Google account as a
+   test user while the OAuth app is in testing.
+3. Create an OAuth client of type **Web application**.
+4. Add `http://localhost:8501/` as an authorized redirect URI.
+5. Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and insert
+   the OAuth client ID and client secret.
+6. Restart Streamlit, open **Outwarding Parts**, and connect a Google account that
+   can view both sheets.
+
+The app requests only the `spreadsheets.readonly` scope. Source previews are cached
+locally in `data/` and are ignored by Git. The original Google Sheets cannot be
+modified through this connection.
 
 ## Collaboration workflow
 
