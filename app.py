@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import re
+import json
+import subprocess
+import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -9,7 +13,11 @@ import streamlit as st
 
 
 APP_TITLE = "Inventory Management Agent"
-DATA_DIR = Path("data")
+APP_DIR = Path(__file__).resolve().parent
+DATA_DIR = APP_DIR / "data"
+LIVE_GRN_CSV = DATA_DIR / "live" / "grn_live.csv"
+LIVE_GRN_META = LIVE_GRN_CSV.with_suffix(".json")
+GRN_EXPORT_SCRIPT = APP_DIR / "scripts" / "scheduled_grn_export.py"
 DEFAULT_GOOGLE_SHEET_URL = (
     "https://docs.google.com/spreadsheets/d/"
     "1V3ic-5Dfcz0PoX-0Z0gXdIrFIIOB_lSh-gM20RzLUKs/edit?gid=2111379627#gid=2111379627"
@@ -101,6 +109,156 @@ def save_table(key: str, df: pd.DataFrame) -> None:
 
 def numeric(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce").fillna(0)
+
+
+def normalize_column_name(value: object) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(value).strip().lower()).strip("_")
+
+
+def first_existing_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    normalized = {normalize_column_name(column): column for column in df.columns}
+    for candidate in candidates:
+        column = normalized.get(normalize_column_name(candidate))
+        if column:
+            return column
+    return None
+
+
+def column_or_blank(df: pd.DataFrame, candidates: list[str]) -> pd.Series:
+    column = first_existing_column(df, candidates)
+    if not column:
+        return pd.Series([""] * len(df), index=df.index, dtype=str)
+    return df[column].fillna("").astype(str).str.strip()
+
+
+def parse_grn_dates(series: pd.Series) -> pd.Series:
+    values = series.fillna("").astype(str).str.strip()
+    dates = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
+    yyyymmdd = values.str.fullmatch(r"\d{8}", na=False)
+    dates.loc[yyyymmdd] = pd.to_datetime(values.loc[yyyymmdd], format="%Y%m%d", errors="coerce")
+    dates.loc[~yyyymmdd] = pd.to_datetime(values.loc[~yyyymmdd], errors="coerce")
+    return dates
+
+
+def format_grn_dates(series: pd.Series) -> pd.Series:
+    dates = parse_grn_dates(series)
+    formatted = dates.dt.strftime("%Y-%m-%d")
+    return formatted.fillna(series.fillna("").astype(str).str.strip())
+
+
+def format_grn_times(series: pd.Series) -> pd.Series:
+    def format_one(value: object) -> str:
+        text = str(value or "").strip()
+        if not text or text.lower() == "nan":
+            return ""
+        if "." in text and text.replace(".", "", 1).isdigit():
+            text = text.split(".", 1)[0]
+        digits = re.sub(r"\D", "", text)
+        if ":" in text:
+            return text
+        if 1 <= len(digits) <= 6:
+            digits = digits.zfill(6)
+            return f"{digits[:2]}:{digits[2:4]}:{digits[4:6]}"
+        return text
+
+    return series.apply(format_one)
+
+
+def load_live_grn() -> pd.DataFrame:
+    if not LIVE_GRN_CSV.exists():
+        return pd.DataFrame()
+    return pd.read_csv(LIVE_GRN_CSV, dtype=str).fillna("")
+
+
+def load_live_grn_meta() -> dict[str, object]:
+    if not LIVE_GRN_META.exists():
+        return {}
+    try:
+        return json.loads(LIVE_GRN_META.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def run_grn_export() -> tuple[bool, str]:
+    if not GRN_EXPORT_SCRIPT.exists():
+        return False, f"Exporter script not found: {GRN_EXPORT_SCRIPT}"
+    try:
+        result = subprocess.run(
+            [sys.executable, str(GRN_EXPORT_SCRIPT)],
+            cwd=APP_DIR,
+            text=True,
+            capture_output=True,
+            timeout=240,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "The Superset GRN export timed out after 4 minutes."
+    output = "\n".join(part for part in [result.stdout.strip(), result.stderr.strip()] if part)
+    if "Zscaler" in output or "company policy prohibits" in output or "Website blocked" in output:
+        return (
+            False,
+            "The live export reached the internal Trino/Superset host, but the company network blocked it through Zscaler. "
+            "Run the app/export from the normal VPN/ZPA-enabled environment, or configure `GRN_EXPORT_SOURCE=superset_api` "
+            "with a Superset service account in `config/grn_export.env`.",
+        )
+    if "plain HTTP request was sent to HTTPS port" in output:
+        return False, "Use `TRINO_HTTP_SCHEME=https` for this host. Port 443 rejected plain HTTP."
+    if len(output) > 4000:
+        output = output[-4000:]
+    return result.returncode == 0, output or "Export finished."
+
+
+def grn_file_age_label() -> str:
+    if not LIVE_GRN_CSV.exists():
+        return "not created yet"
+    modified_at = datetime.fromtimestamp(LIVE_GRN_CSV.stat().st_mtime)
+    seconds = max(0, int((datetime.now() - modified_at).total_seconds()))
+    if seconds < 90:
+        return "just now"
+    minutes = seconds // 60
+    if minutes < 90:
+        return f"{minutes} min ago"
+    hours = minutes // 60
+    if hours < 48:
+        return f"{hours} hr ago"
+    return f"{hours // 24} days ago"
+
+
+def build_grn_display_frame(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(
+            columns=[
+                "Buyer",
+                "Supplier",
+                "Part No.",
+                "Part Name",
+                "Rcvd Qty",
+                "Arrival Time",
+                "Arrival Date",
+                "PO Number",
+                "Storage Location",
+                "Plant",
+                "Movement Type",
+                "UOM",
+                "Source Row",
+            ]
+        )
+
+    result = pd.DataFrame(index=df.index)
+    result["Buyer"] = column_or_blank(df, ["buyer", "buyer_name"])
+    result["Supplier"] = column_or_blank(df, ["supplier", "supplier_name", "vendor", "vendor_name"])
+    result["Part No."] = column_or_blank(df, ["part_no", "matnr", "material", "material_code"])
+    result["Part Name"] = column_or_blank(df, ["part_name", "part_description", "material_description", "maktx"])
+    result["Rcvd Qty"] = column_or_blank(df, ["received_qty", "rcvd_qty", "menge", "actual_quantity_received"])
+    result["Arrival Time"] = format_grn_times(column_or_blank(df, ["arrival_time", "sap_entry_time", "cputm"]))
+    result["Arrival Date"] = format_grn_dates(column_or_blank(df, ["arrival_date", "grn_date", "sap_entry_date", "budat", "posting_date"]))
+    result["PO Number"] = column_or_blank(df, ["po_no", "po_number", "ebeln"])
+    result["Storage Location"] = column_or_blank(df, ["storage_location", "lgort"])
+    result["Plant"] = column_or_blank(df, ["plant", "werks"])
+    result["Movement Type"] = column_or_blank(df, ["movement_type", "bwart"])
+    result["UOM"] = column_or_blank(df, ["uom", "meins"])
+    result["Source Row"] = (pd.Series(range(1, len(df) + 1), index=df.index)).astype(str)
+    return result
 
 
 def parse_google_sheet_url(url: str) -> tuple[str, str]:
@@ -278,18 +436,120 @@ def render_live_google_sheet() -> None:
 
 def render_inwarding() -> None:
     st.header("Inwarding Parts")
-    st.write("Use this for parts received from suppliers, GRN entries, gate entry checks, and arrival tracking.")
-    df = load_table("inwarding_parts")
-    received_total = numeric(df.get("Received Qty", pd.Series(dtype=str))).sum() if not df.empty else 0
-    cols = st.columns(3)
-    with cols[0]:
-        render_metric("Inwarding rows", len(df), "neutral")
-    with cols[1]:
+    st.write(
+        "Live GRN inwarding from the Superset/Trino source. "
+        "This page does not use sample data or the previous app's files."
+    )
+
+    top_left, top_right = st.columns([1, 4])
+    with top_left:
+        if st.button("Run live export now", type="primary"):
+            ok, message = run_grn_export()
+            if ok:
+                st.success(message)
+                st.rerun()
+            else:
+                st.error("Live Superset GRN export failed.")
+                st.code(message)
+    with top_right:
+        st.caption(
+            f"Source file for this new app: `{LIVE_GRN_CSV.relative_to(APP_DIR)}`. "
+            f"Last refreshed: {grn_file_age_label()}."
+        )
+
+    if not LIVE_GRN_CSV.exists():
+        st.warning("No live Superset GRN export exists yet for this new app.")
+        st.write("Press **Run live export now** after `config/grn_export.env` is configured on this machine.")
+        st.code("python scripts/scheduled_grn_export.py", language="bash")
+        return
+
+    raw_df = load_live_grn()
+    meta = load_live_grn_meta()
+    grn_df = build_grn_display_frame(raw_df)
+    if grn_df.empty:
+        st.warning("The live Superset GRN export exists, but it has no rows.")
+        return
+
+    grn_dates = parse_grn_dates(grn_df["Arrival Date"])
+    valid_dates = grn_dates.dropna()
+    if not valid_dates.empty:
+        latest_date = valid_dates.max().date()
+        default_start = latest_date - timedelta(days=2)
+        default_end = latest_date
+    else:
+        default_start = datetime.now().date() - timedelta(days=2)
+        default_end = datetime.now().date()
+
+    filter_row_1 = st.columns(4)
+    with filter_row_1[0]:
+        start_date = st.date_input("Start date", value=default_start, key="grn_start_date")
+    with filter_row_1[1]:
+        end_date = st.date_input("End date", value=default_end, key="grn_end_date")
+    with filter_row_1[2]:
+        plants = sorted(value for value in grn_df["Plant"].unique() if value)
+        selected_plants = st.multiselect("Plant", plants, default=[], key="grn_plants")
+    with filter_row_1[3]:
+        locations = sorted(value for value in grn_df["Storage Location"].unique() if value)
+        selected_locations = st.multiselect("Storage location", locations, default=[], key="grn_locations")
+
+    filter_row_2 = st.columns(3)
+    with filter_row_2[0]:
+        part_query = st.text_input("Part No. contains", key="grn_part_query")
+    with filter_row_2[1]:
+        po_query = st.text_input("PO Number contains", key="grn_po_query")
+    with filter_row_2[2]:
+        movement_types = sorted(value for value in grn_df["Movement Type"].unique() if value)
+        selected_movements = st.multiselect("Movement type", movement_types, default=[], key="grn_movements")
+
+    filtered = grn_df.copy()
+    filtered_dates = parse_grn_dates(filtered["Arrival Date"])
+    if not valid_dates.empty:
+        filtered = filtered[(filtered_dates.dt.date >= start_date) & (filtered_dates.dt.date <= end_date)]
+    if selected_plants:
+        filtered = filtered[filtered["Plant"].isin(selected_plants)]
+    if selected_locations:
+        filtered = filtered[filtered["Storage Location"].isin(selected_locations)]
+    if selected_movements:
+        filtered = filtered[filtered["Movement Type"].isin(selected_movements)]
+    if part_query.strip():
+        filtered = filtered[filtered["Part No."].str.contains(part_query.strip(), case=False, na=False)]
+    if po_query.strip():
+        filtered = filtered[filtered["PO Number"].str.contains(po_query.strip(), case=False, na=False)]
+
+    received_total = numeric(filtered["Rcvd Qty"]).sum()
+    unique_parts = filtered["Part No."].replace("", pd.NA).dropna().nunique()
+    latest_visible = parse_grn_dates(filtered["Arrival Date"]).max()
+    exported_at = str(meta.get("exported_at_utc", "") or "").replace("T", " ").replace("+00:00", " UTC")
+
+    metrics = st.columns(4)
+    with metrics[0]:
+        render_metric("GRN rows", f"{len(filtered):,}", "neutral")
+    with metrics[1]:
         render_metric("Received qty", f"{received_total:,.0f}", "ok")
-    with cols[2]:
-        render_metric("Suppliers", df["Supplier"].replace("", pd.NA).dropna().nunique() if not df.empty else 0, "neutral")
-    st.subheader("Editable Inwarding Table")
-    render_editable_table("inwarding_parts")
+    with metrics[2]:
+        render_metric("Parts", f"{unique_parts:,}", "neutral")
+    with metrics[3]:
+        latest_label = latest_visible.strftime("%Y-%m-%d") if pd.notna(latest_visible) else "not available"
+        render_metric("Latest date", latest_label, "neutral")
+
+    if exported_at:
+        st.caption(f"Exported at: {exported_at}. Raw Superset rows in file: {len(raw_df):,}.")
+    else:
+        st.caption(f"Raw Superset rows in file: {len(raw_df):,}.")
+
+    st.subheader("Live GRN Inwarding Table")
+    st.dataframe(
+        filtered,
+        use_container_width=True,
+        hide_index=True,
+        height=560,
+    )
+    st.download_button(
+        "Download filtered GRN CSV",
+        filtered.to_csv(index=False),
+        file_name="live_superset_grn_filtered.csv",
+        mime="text/csv",
+    )
 
 
 def render_outwarding() -> None:
@@ -324,7 +584,7 @@ def render_agentic_flow() -> None:
 
 def render_setup() -> None:
     st.header("Setup")
-    st.write("This starter app stores editable tables as CSV files in the `data/` folder and can read one live Google Sheet.")
+    st.write("This starter app stores manual tables as CSV files and reads live GRN inwarding through the Superset export.")
     st.markdown(
         """
         For two people working together:
@@ -332,6 +592,9 @@ def render_setup() -> None:
         - Code changes should happen through GitHub branches.
         - App usage can happen through one shared Streamlit URL.
         - Use the Live Google Sheet page when you want changes in a Google Sheet to show in the app.
+        - Use the Inwarding Parts page for live Superset GRN data.
+        - Configure `config/grn_export.env` locally; do not commit that file.
+        - The live GRN CSV is generated at `data/live/grn_live.csv` in this new app only.
         - For private production data, move from public CSV export to a proper Google service account or database.
         """
     )

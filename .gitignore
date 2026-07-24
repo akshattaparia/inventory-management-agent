@@ -4,3 +4,9 @@ __pycache__/
 .DS_Store
 .streamlit/secrets.toml
 data/*.tmp
+config/grn_export.env
+config/*.env
+data/live/*.csv
+data/live/*.json
+data/live/*.pid
+data/live/logs/

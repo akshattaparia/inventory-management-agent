@@ -6,10 +6,11 @@ Clean Streamlit starter app for collaborative inventory work.
 
 - Part Inventory editable table
 - Live Google Sheet viewer
-- Inwarding Parts editable table
+- Inwarding Parts live Superset GRN viewer
 - Outwarding Parts editable table
 - Basic stock risk flags
 - CSV-backed storage in `data/`
+- Local Superset/Trino GRN exporter in `scripts/scheduled_grn_export.py`
 
 ## Run locally
 
@@ -21,6 +22,41 @@ source .venv/bin/activate
 pip install -r requirements.txt
 streamlit run app.py
 ```
+
+## Live Superset GRN inwarding
+
+The **Inwarding Parts** page reads only this new app's live GRN export:
+
+```text
+data/live/grn_live.csv
+```
+
+It does not read the previous app and it does not fall back to sample data.
+
+To configure it on your machine:
+
+```bash
+cp config/grn_export.env.example config/grn_export.env
+```
+
+Then fill `config/grn_export.env` with the Superset/Trino access details. Keep this file private; it is ignored by Git.
+
+To refresh once from the terminal:
+
+```bash
+python scripts/scheduled_grn_export.py
+```
+
+You can also press **Run live export now** inside the **Inwarding Parts** page.
+
+The exporter writes:
+
+```text
+data/live/grn_live.csv
+data/live/grn_live.json
+```
+
+Those generated files are also ignored by Git. Each laptop/server should generate its own current live file from Superset.
 
 ## Let another person open your running app
 
@@ -62,5 +98,7 @@ https://docs.google.com/spreadsheets/d/1V3ic-5Dfcz0PoX-0Z0gXdIrFIIOB_lSh-gM20RzL
 ```
 
 For the simple live-read method to work, the Google Sheet must be shared as **Anyone with the link can view** or published to the web. After someone edits the sheet, refresh the Streamlit page or press **Reload sheet**.
+
+The **Inwarding Parts** page is different: it reads current GRN rows from the live Superset export. If Abhiraj runs the app locally, he must create his own local `config/grn_export.env`. If only one shared server runs the app, configure Superset once on that server.
 
 For real two-person live data entry with private data, move the tables to authenticated Google Sheets access or a database so both users always see the same source of truth safely.
