@@ -2018,15 +2018,11 @@ def render_outwarding_sources(manual_outwarding: pd.DataFrame) -> None:
 
 def render_outwarding() -> None:
     st.header("Outwarding Parts")
-    st.write(
-        "Production consumption is calculated from daily production × BOM. "
-        "Servicing issues remain a separate outwarding source."
+    st.write("Production consumption is calculated from daily production × BOM.")
+    empty_manual_outwarding = pd.DataFrame(
+        columns=TABLES["outwarding_parts"]["columns"]
     )
-    df = load_table("outwarding_parts")
-    render_outwarding_sources(df)
-    st.divider()
-    st.subheader("Servicing and Other Manual Outwarding")
-    render_editable_table("outwarding_parts")
+    render_outwarding_sources(empty_manual_outwarding)
 
 
 def render_agentic_flow() -> None:
