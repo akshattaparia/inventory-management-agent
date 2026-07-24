@@ -8,6 +8,8 @@ Clean Streamlit starter app for collaborative inventory work.
 - Supplier Buyer Map from a saved SPOC Summary sheet copy
 - Inwarding Parts cached Direct Gate Entry Google Sheet viewer
 - Outwarding Parts production/BOM consumption calculator and editable servicing table
+- Inwarding discrepancy agent with buyer ownership, severity, escalation,
+  production-impact checks, and a persistent resolution audit
 - Basic stock risk flags
 - CSV-backed storage in `data/`
 - Local Superset/Trino GRN exporter in `scripts/scheduled_grn_export.py`
@@ -119,6 +121,19 @@ changes or a later refresh fails.
 Each inwarding row is enriched with its SCM buyer from the configured buyer
 mapping sheet. Part number is matched first, followed by a normalized supplier
 name; unresolved source rows are shown as `Not mapped`.
+
+## Inwarding discrepancy agent
+
+The **Agentic Flow** page continuously checks the most recently saved inwarding
+snapshot whenever the page is opened. It flags quantity differences, missing
+buyer ownership, missing critical fields, overdue unloading, and possible
+duplicate rows. Issues are assigned to the mapped buyer; unowned issues go to
+`SCM Admin`.
+
+The buyer action inbox supports acknowledgement, investigation, resolution
+notes, ageing, escalation, and a downloadable audit history. When a previously
+flagged source issue disappears, the agent marks it `Auto-resolved`. Quantity
+shortages are also compared with the latest calculated production/BOM demand.
 
 ## Let another person open your running app
 
