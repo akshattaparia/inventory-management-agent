@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
 import streamlit as st
@@ -8,6 +10,10 @@ import streamlit as st
 
 APP_TITLE = "Inventory Management Agent"
 DATA_DIR = Path("data")
+DEFAULT_GOOGLE_SHEET_URL = (
+    "https://docs.google.com/spreadsheets/d/"
+    "1V3ic-5Dfcz0PoX-0Z0gXdIrFIIOB_lSh-gM20RzLUKs/edit?gid=2111379627#gid=2111379627"
+)
 
 TABLES = {
     "part_inventory": {
@@ -95,6 +101,28 @@ def save_table(key: str, df: pd.DataFrame) -> None:
 
 def numeric(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce").fillna(0)
+
+
+def parse_google_sheet_url(url: str) -> tuple[str, str]:
+    match = re.search(r"/spreadsheets/d/([^/]+)", url)
+    if not match:
+        raise ValueError("This does not look like a Google Sheets link.")
+    spreadsheet_id = match.group(1)
+    parsed = urlparse(url)
+    query_gid = parse_qs(parsed.query).get("gid", ["0"])[0]
+    fragment_gid_match = re.search(r"gid=(\d+)", parsed.fragment or "")
+    gid = fragment_gid_match.group(1) if fragment_gid_match else query_gid
+    return spreadsheet_id, gid
+
+
+def google_sheet_csv_url(url: str) -> str:
+    spreadsheet_id, gid = parse_google_sheet_url(url)
+    return f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/export?format=csv&gid={gid}"
+
+
+def load_google_sheet(url: str) -> pd.DataFrame:
+    csv_url = google_sheet_csv_url(url)
+    return pd.read_csv(csv_url, dtype=str).fillna("")
 
 
 def build_inventory_status(df: pd.DataFrame) -> pd.DataFrame:
@@ -202,6 +230,52 @@ def render_part_inventory() -> None:
     render_editable_table("part_inventory")
 
 
+def render_live_google_sheet() -> None:
+    st.header("Live Google Sheet")
+    st.write("This page reads directly from your Google Sheet. When the sheet changes, refresh this page or press reload.")
+
+    sheet_url = st.text_input(
+        "Google Sheet link",
+        value=DEFAULT_GOOGLE_SHEET_URL,
+        help="The sheet must be shared as Anyone with link can view, or published to web.",
+    )
+    left, right = st.columns([1, 5])
+    with left:
+        reload_clicked = st.button("Reload sheet", type="primary")
+    with right:
+        st.caption("Use this as the shared live source. Do not paste private tokens here.")
+
+    if reload_clicked:
+        st.cache_data.clear()
+
+    try:
+        df = load_google_sheet(sheet_url)
+    except Exception as exc:
+        st.error("Could not read the Google Sheet.")
+        st.write("Most likely reason: the sheet is private.")
+        st.write("Fix: in Google Sheets, click Share and give Viewer access to anyone with the link.")
+        st.code(str(exc))
+        return
+
+    cols = st.columns(3)
+    with cols[0]:
+        render_metric("Rows", f"{len(df):,}", "neutral")
+    with cols[1]:
+        render_metric("Columns", f"{len(df.columns):,}", "neutral")
+    with cols[2]:
+        render_metric("Source", "Google Sheet", "ok")
+
+    filtered = filter_frame(df, "live_google_sheet")
+    st.caption(f"{len(filtered):,} rows shown from the live Google Sheet.")
+    st.dataframe(filtered, use_container_width=True, hide_index=True)
+    st.download_button(
+        "Download live view as CSV",
+        filtered.to_csv(index=False),
+        file_name="live_google_sheet.csv",
+        mime="text/csv",
+    )
+
+
 def render_inwarding() -> None:
     st.header("Inwarding Parts")
     st.write("Use this for parts received from suppliers, GRN entries, gate entry checks, and arrival tracking.")
@@ -250,14 +324,15 @@ def render_agentic_flow() -> None:
 
 def render_setup() -> None:
     st.header("Setup")
-    st.write("This starter app stores editable tables as CSV files in the `data/` folder.")
+    st.write("This starter app stores editable tables as CSV files in the `data/` folder and can read one live Google Sheet.")
     st.markdown(
         """
         For two people working together:
 
         - Code changes should happen through GitHub branches.
         - App usage can happen through one shared Streamlit URL.
-        - For real production data sharing, move the CSV tables to Google Sheets or a database.
+        - Use the Live Google Sheet page when you want changes in a Google Sheet to show in the app.
+        - For private production data, move from public CSV export to a proper Google service account or database.
         """
     )
 
@@ -306,6 +381,7 @@ with st.sidebar:
         "Navigation",
         [
             "Part Inventory",
+            "Live Google Sheet",
             "Inwarding Parts",
             "Outwarding Parts",
             "Agentic Flow",
@@ -319,6 +395,8 @@ st.title(APP_TITLE)
 
 if page == "Part Inventory":
     render_part_inventory()
+elif page == "Live Google Sheet":
+    render_live_google_sheet()
 elif page == "Inwarding Parts":
     render_inwarding()
 elif page == "Outwarding Parts":

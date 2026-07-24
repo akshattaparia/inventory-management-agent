@@ -5,6 +5,7 @@ Clean Streamlit starter app for collaborative inventory work.
 ## What is inside
 
 - Part Inventory editable table
+- Live Google Sheet viewer
 - Inwarding Parts editable table
 - Outwarding Parts editable table
 - Basic stock risk flags
@@ -54,4 +55,12 @@ Then open a pull request or tell the owner before merging.
 
 The starter app saves data to local CSV files. That is fine for a first shared laptop/server demo.
 
-For real two-person live data entry, move the tables to Google Sheets or a database so both users always see the same source of truth.
+The **Live Google Sheet** page reads this sheet by default:
+
+```text
+https://docs.google.com/spreadsheets/d/1V3ic-5Dfcz0PoX-0Z0gXdIrFIIOB_lSh-gM20RzLUKs/edit?gid=2111379627#gid=2111379627
+```
+
+For the simple live-read method to work, the Google Sheet must be shared as **Anyone with the link can view** or published to the web. After someone edits the sheet, refresh the Streamlit page or press **Reload sheet**.
+
+For real two-person live data entry with private data, move the tables to authenticated Google Sheets access or a database so both users always see the same source of truth safely.
