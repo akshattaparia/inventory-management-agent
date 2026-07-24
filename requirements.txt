@@ -1,5 +1,7 @@
 streamlit>=1.36
 pandas>=2.0
-google-auth>=2.40
+requests>=2.31
+trino>=0.329
+google-api-python-client>=2.137
+google-auth>=2.31
 google-auth-oauthlib>=1.2
-requests>=2.32

@@ -17,3 +17,10 @@ data/part_type_mapping.csv
 data/part_supplier_mapping.csv
 data/computed_part_usage.csv
 data/*.tmp
+config/grn_export.env
+config/*.env
+data/live/*.csv
+data/live/*.json
+data/live/*.tmp
+data/live/*.pid
+data/live/logs/
