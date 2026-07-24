@@ -6,7 +6,6 @@ Clean Streamlit starter app for collaborative inventory work.
 
 - Part Inventory editable table
 - Supplier Buyer Map from a saved SPOC Summary sheet copy
-- Saved Google Sheet copy viewer
 - Inwarding Parts cached Direct Gate Entry Google Sheet viewer
 - Outwarding Parts production/BOM consumption calculator and editable servicing table
 - Basic stock risk flags
@@ -116,6 +115,10 @@ through the same read-only Google OAuth connection. Press **Refresh inwarding
 from Google Sheet** to replace the local snapshot. Between refreshes, the page
 continues showing the previous successful snapshot, even if the live sheet
 changes or a later refresh fails.
+
+Each inwarding row is enriched with its SCM buyer from the configured buyer
+mapping sheet. Part number is matched first, followed by a normalized supplier
+name; unresolved source rows are shown as `Not mapped`.
 
 ## Let another person open your running app
 

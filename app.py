@@ -86,6 +86,11 @@ COMPUTED_USAGE_CACHE_PATH = DATA_DIR / "computed_part_usage.csv"
 INWARDING_SHEET_URL = DEFAULT_GOOGLE_SHEET_URL
 INWARDING_SNAPSHOT_PATH = DATA_DIR / "inwarding_sheet_snapshot.csv"
 INWARDING_SNAPSHOT_META_PATH = DATA_DIR / "inwarding_sheet_snapshot.json"
+BUYER_MAPPING_SHEET_URL = (
+    "https://docs.google.com/spreadsheets/d/"
+    "147vIBFZxf6aQddMG-cpQmuFtcM-6nH0pjn0HDHMyLhE/edit?gid=0#gid=0"
+)
+BUYER_MAPPING_CACHE_PATH = DATA_DIR / "buyer_mapping_source.csv"
 
 TABLES = {
     "part_inventory": {
@@ -1811,6 +1816,19 @@ def clean_inwarding_snapshot(df: pd.DataFrame) -> pd.DataFrame:
         column for column in preferred_columns if column in renamed.columns
     ]
     result = renamed[available_columns].copy().fillna("")
+    supplier_values = result.get(
+        "Supplier Name",
+        pd.Series("", index=result.index),
+    ).map(clean_text)
+    part_values = result.get(
+        "Part Number",
+        pd.Series("", index=result.index),
+    ).map(clean_text)
+    placeholder_rows = (
+        supplier_values.str.lower().str.startswith("enter ")
+        | part_values.str.lower().str.startswith("enter ")
+    )
+    result = result[~placeholder_rows]
     if "Date" in result.columns:
         parsed_dates = pd.to_datetime(
             result["Date"],
@@ -1827,6 +1845,159 @@ def clean_inwarding_snapshot(df: pd.DataFrame) -> pd.DataFrame:
             .drop(columns="_parsed_date")
         )
     return result.reset_index(drop=True)
+
+
+def supplier_match_key(value: object) -> str:
+    return re.sub(r"[^A-Z0-9]", "", clean_text(value).upper())
+
+
+def canonical_supplier_key(value: object) -> str:
+    ignored_words = {
+        "CO",
+        "COMPANY",
+        "INC",
+        "INDIA",
+        "INDIAN",
+        "LIMITED",
+        "LLP",
+        "LTD",
+        "PRIVATE",
+        "PVT",
+        "UNIT",
+    }
+    words = [
+        word
+        for word in re.findall(r"[A-Z0-9]+", clean_text(value).upper())
+        if word not in ignored_words and not word.isdigit()
+    ]
+    normalized_words: list[str] = []
+    for word in words:
+        if word.endswith("IES") and len(word) > 4:
+            word = f"{word[:-3]}Y"
+        elif word.endswith("S") and len(word) > 5:
+            word = word[:-1]
+        normalized_words.append(word)
+    return "".join(normalized_words)
+
+
+def clean_buyer_mapping_source(df: pd.DataFrame) -> pd.DataFrame:
+    output_columns = ["Part Number", "Mapped Supplier", "Buyer Name"]
+    if df.empty:
+        return pd.DataFrame(columns=output_columns)
+    if set(output_columns).issubset(df.columns):
+        result = df[output_columns].copy()
+    else:
+        rows = df.astype(str).to_numpy().tolist()
+        header_index = next(
+            (
+                index
+                for index, row in enumerate(rows)
+                if {"Component", "Supplier", "SCM Buyer"}.issubset(
+                    {str(value).strip() for value in row}
+                )
+            ),
+            None,
+        )
+        if header_index is None:
+            return pd.DataFrame(columns=output_columns)
+        width = len(df.columns)
+        headers = unique_headers(rows[header_index], width)
+        data_rows = [
+            row + [""] * (width - len(row))
+            for row in rows[header_index + 1 :]
+        ]
+        table = pd.DataFrame(data_rows, columns=headers).fillna("")
+        result = table[["Component", "Supplier", "SCM Buyer"]].copy()
+        result.columns = output_columns
+
+    result["Part Number"] = result["Part Number"].map(stock_part_key)
+    result["Mapped Supplier"] = result["Mapped Supplier"].map(clean_text)
+    result["Buyer Name"] = result["Buyer Name"].map(normalize_buyer_name)
+    return result[
+        result["Buyer Name"].ne("")
+        & (
+            result["Part Number"].ne("")
+            | result["Mapped Supplier"].ne("")
+        )
+    ].drop_duplicates()
+
+
+def enrich_inwarding_buyers(
+    inwarding: pd.DataFrame,
+    buyer_mapping: pd.DataFrame,
+) -> pd.DataFrame:
+    result = inwarding.copy()
+    if result.empty:
+        return result
+
+    mapping = clean_buyer_mapping_source(buyer_mapping)
+    if mapping.empty:
+        result["Buyer Name"] = "Not mapped"
+    else:
+        mapping["Part Key"] = mapping["Part Number"].map(stock_part_key)
+        mapping["Supplier Key"] = mapping["Mapped Supplier"].map(
+            supplier_match_key
+        )
+        mapping["Supplier Prefix"] = mapping["Supplier Key"].str[:20]
+        mapping["Canonical Supplier Key"] = mapping["Mapped Supplier"].map(
+            canonical_supplier_key
+        )
+
+        part_map = (
+            mapping[mapping["Part Key"].ne("")]
+            .groupby("Part Key")["Buyer Name"]
+            .agg(joined_text)
+        )
+        supplier_map = (
+            mapping[mapping["Supplier Key"].ne("")]
+            .groupby("Supplier Key")["Buyer Name"]
+            .agg(joined_text)
+        )
+        supplier_prefix_map = (
+            mapping[mapping["Supplier Prefix"].ne("")]
+            .groupby("Supplier Prefix")["Buyer Name"]
+            .agg(joined_text)
+        )
+        canonical_supplier_map = (
+            mapping[mapping["Canonical Supplier Key"].ne("")]
+            .groupby("Canonical Supplier Key")["Buyer Name"]
+            .agg(joined_text)
+        )
+
+        part_keys = result.get(
+            "Part Number",
+            pd.Series("", index=result.index),
+        ).map(stock_part_key)
+        supplier_keys = result.get(
+            "Supplier Name",
+            pd.Series("", index=result.index),
+        ).map(supplier_match_key)
+        buyers = part_keys.map(part_map).fillna("")
+        buyers = buyers.where(
+            buyers.ne(""),
+            supplier_keys.map(supplier_map).fillna(""),
+        )
+        buyers = buyers.where(
+            buyers.ne(""),
+            supplier_keys.str[:20].map(supplier_prefix_map).fillna(""),
+        )
+        canonical_supplier_keys = result.get(
+            "Supplier Name",
+            pd.Series("", index=result.index),
+        ).map(canonical_supplier_key)
+        buyers = buyers.where(
+            buyers.ne(""),
+            canonical_supplier_keys.map(canonical_supplier_map).fillna(""),
+        )
+        result["Buyer Name"] = buyers.replace("", "Not mapped")
+
+    if "Supplier Name" in result.columns:
+        columns = list(result.columns)
+        columns.remove("Buyer Name")
+        supplier_index = columns.index("Supplier Name")
+        columns.insert(supplier_index + 1, "Buyer Name")
+        result = result[columns]
+    return result
 
 
 def save_inwarding_snapshot(df: pd.DataFrame, tab_name: str) -> None:
@@ -1887,11 +2058,23 @@ def render_inwarding() -> None:
                     INWARDING_SHEET_URL,
                     credentials,
                 )
+                buyer_source_df, buyer_tab_name = load_google_sheet_oauth(
+                    BUYER_MAPPING_SHEET_URL,
+                    credentials,
+                )
                 cleaned_df = clean_inwarding_snapshot(source_df)
+                cleaned_buyer_mapping = clean_buyer_mapping_source(
+                    buyer_source_df
+                )
                 save_inwarding_snapshot(cleaned_df, tab_name)
+                save_source_cache(
+                    BUYER_MAPPING_CACHE_PATH,
+                    cleaned_buyer_mapping,
+                )
             st.success(
                 f"Saved the latest '{tab_name}' snapshot with "
-                f"{len(cleaned_df):,} rows."
+                f"{len(cleaned_df):,} rows and buyer mapping from "
+                f"'{buyer_tab_name}'."
             )
         except Exception as exc:
             st.error(
@@ -1899,8 +2082,11 @@ def render_inwarding() -> None:
                 f"Details: {exc}"
             )
 
-    snapshot = clean_inwarding_snapshot(
-        load_source_cache(INWARDING_SNAPSHOT_PATH)
+    snapshot = enrich_inwarding_buyers(
+        clean_inwarding_snapshot(
+            load_source_cache(INWARDING_SNAPSHOT_PATH)
+        ),
+        load_source_cache(BUYER_MAPPING_CACHE_PATH),
     )
     if snapshot.empty:
         st.info(
@@ -1924,7 +2110,7 @@ def render_inwarding() -> None:
         format="mixed",
     )
     valid_dates = parsed_dates.dropna()
-    filter_columns = st.columns([1.8, 2, 2, 1.5])
+    filter_columns = st.columns([1.6, 1.7, 1.8, 1.5, 1.4])
     with filter_columns[0]:
         if valid_dates.empty:
             selected_dates = ()
@@ -1961,6 +2147,21 @@ def render_inwarding() -> None:
             key="inwarding_snapshot_suppliers",
         )
     with filter_columns[3]:
+        buyer_options = sorted(
+            value
+            for value in filtered.get(
+                "Buyer Name",
+                pd.Series(dtype=str),
+            ).astype(str).unique()
+            if value
+        )
+        selected_buyers = st.multiselect(
+            "Buyer",
+            buyer_options,
+            placeholder="All buyers",
+            key="inwarding_snapshot_buyers",
+        )
+    with filter_columns[4]:
         status_options = sorted(
             value
             for value in filtered.get(
@@ -1995,6 +2196,8 @@ def render_inwarding() -> None:
         filtered = filtered[
             filtered["Supplier Name"].isin(selected_suppliers)
         ]
+    if selected_buyers and "Buyer Name" in filtered.columns:
+        filtered = filtered[filtered["Buyer Name"].isin(selected_buyers)]
     if selected_statuses and "Unloading Status" in filtered.columns:
         filtered = filtered[
             filtered["Unloading Status"].isin(selected_statuses)
@@ -2003,6 +2206,17 @@ def render_inwarding() -> None:
     receipt_total = numeric(
         filtered.get("Receipt Qty", pd.Series(dtype=str))
     ).sum()
+    mapped_rows = int(
+        filtered.get("Buyer Name", pd.Series(dtype=str))
+        .astype(str)
+        .ne("Not mapped")
+        .sum()
+    )
+    mapping_coverage = (
+        mapped_rows / len(filtered) * 100
+        if len(filtered)
+        else 0
+    )
     metric_columns = st.columns(4)
     with metric_columns[0]:
         render_metric("Snapshot rows", f"{len(filtered):,}", "neutral")
@@ -2027,6 +2241,11 @@ def render_inwarding() -> None:
             else "Not available",
             "neutral",
         )
+    st.caption(
+        f"Buyer mapping coverage: {mapped_rows:,} of {len(filtered):,} rows "
+        f"({mapping_coverage:.1f}%). Part-number mapping is used first; "
+        "supplier mapping is the fallback."
+    )
 
     st.dataframe(
         filtered,
