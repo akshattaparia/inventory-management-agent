@@ -28,6 +28,7 @@ LIVE_GOOGLE_SHEET_SNAPSHOT_META = LIVE_GOOGLE_SHEET_SNAPSHOT_CSV.with_suffix(".j
 SPOC_SUMMARY_SNAPSHOT_CSV = DATA_DIR / "live" / "spoc_summary_snapshot.csv"
 SPOC_SUMMARY_SNAPSHOT_META = SPOC_SUMMARY_SNAPSHOT_CSV.with_suffix(".json")
 GRN_EXPORT_SCRIPT = APP_DIR / "scripts" / "scheduled_grn_export.py"
+GOOGLE_SERVICE_ACCOUNT_JSON_PATH = APP_DIR / ".streamlit" / "google_service_account.json"
 DEFAULT_GOOGLE_SHEET_URL = (
     "https://docs.google.com/spreadsheets/d/"
     "1V3ic-5Dfcz0PoX-0Z0gXdIrFIIOB_lSh-gM20RzLUKs/edit?gid=2111379627#gid=2111379627"
@@ -377,6 +378,8 @@ def google_sheets_credentials_configured() -> bool:
     except Exception:
         pass
     return bool(
+        GOOGLE_SERVICE_ACCOUNT_JSON_PATH.exists()
+        or
         os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
         or os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
     )
@@ -400,6 +403,12 @@ def google_sheets_credentials():
             info["private_key"] = str(info["private_key"]).replace("\\n", "\n")
         return service_account.Credentials.from_service_account_info(
             info,
+            scopes=[GOOGLE_SHEETS_READONLY_SCOPE],
+        )
+
+    if GOOGLE_SERVICE_ACCOUNT_JSON_PATH.exists():
+        return service_account.Credentials.from_service_account_file(
+            GOOGLE_SERVICE_ACCOUNT_JSON_PATH,
             scopes=[GOOGLE_SHEETS_READONLY_SCOPE],
         )
 
@@ -567,6 +576,38 @@ def show_google_sheet_access_help(exc: Exception) -> None:
         """
     )
     st.code(str(exc))
+
+
+def load_saved_service_account_email() -> str:
+    if not GOOGLE_SERVICE_ACCOUNT_JSON_PATH.exists():
+        return ""
+    try:
+        info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return ""
+    return clean_text(info.get("client_email", ""))
+
+
+def save_uploaded_service_account(uploaded_file) -> tuple[bool, str]:
+    try:
+        info = json.loads(uploaded_file.getvalue().decode("utf-8"))
+    except Exception as exc:
+        return False, f"Could not read this as a JSON file: {exc}"
+
+    required = ["type", "project_id", "private_key", "client_email", "token_uri"]
+    missing = [key for key in required if not clean_text(info.get(key, ""))]
+    if missing:
+        return False, f"This does not look like a Google service-account key. Missing: {', '.join(missing)}"
+    if info.get("type") != "service_account":
+        return False, "This JSON is not a service-account key. It must have type = service_account."
+
+    GOOGLE_SERVICE_ACCOUNT_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
+    GOOGLE_SERVICE_ACCOUNT_JSON_PATH.write_text(json.dumps(info, indent=2), encoding="utf-8")
+    try:
+        GOOGLE_SERVICE_ACCOUNT_JSON_PATH.chmod(0o600)
+    except OSError:
+        pass
+    return True, clean_text(info.get("client_email", ""))
 
 
 def snapshot_age_label(snapshot_path: Path) -> str:
@@ -2046,6 +2087,27 @@ def render_agentic_flow() -> None:
 def render_setup() -> None:
     st.header("Setup")
     st.write("This starter app stores manual tables as CSV files and reads live GRN inwarding through the Superset export.")
+
+    st.subheader("Google Sheets API")
+    saved_email = load_saved_service_account_email()
+    if saved_email:
+        st.success(f"Google API key is configured. Share the Google Sheet with: {saved_email}")
+    else:
+        st.warning("Google API key is not configured yet.")
+
+    uploaded_key = st.file_uploader(
+        "Upload Google service-account JSON",
+        type=["json"],
+        help="Download this from Google Cloud. The file stays local and is not committed to GitHub.",
+    )
+    if uploaded_key and st.button("Save Google API key", type="primary"):
+        ok, message = save_uploaded_service_account(uploaded_key)
+        if ok:
+            st.success(f"Saved Google API key. Now share the Google Sheet with this Viewer email: {message}")
+            st.rerun()
+        else:
+            st.error(message)
+
     st.markdown(
         """
         For two people working together:

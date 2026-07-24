@@ -5,6 +5,7 @@ __pycache__/
 .streamlit/secrets.toml
 .streamlit/google_oauth_token.json
 .streamlit/google_oauth_state.txt
+.streamlit/google_service_account.json
 data/google_sheet_link.txt
 data/daily_production_source.csv
 data/bom_source.csv

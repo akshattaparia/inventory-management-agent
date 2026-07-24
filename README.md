@@ -65,6 +65,15 @@ The app can create a saved copy of your SPOC / SCM Google Sheet through the Goog
 
 Setup on the machine running Streamlit:
 
+Simple app setup:
+
+1. Open **Setup** in the app.
+2. Upload the Google service-account JSON.
+3. Press **Save Google API key**.
+4. Share the Google Sheet with the displayed `client_email` as **Viewer**.
+
+Manual file setup:
+
 ```bash
 cp .streamlit/secrets.toml.example .streamlit/secrets.toml
 ```
