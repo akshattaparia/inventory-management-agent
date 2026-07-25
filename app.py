@@ -2304,6 +2304,8 @@ def render_inwarding() -> None:
         mime="text/csv",
         key="inwarding_snapshot_download",
     )
+    st.divider()
+    render_agentic_flow()
 
 
 def render_outwarding_sources(manual_outwarding: pd.DataFrame) -> None:
@@ -3993,7 +3995,6 @@ with st.sidebar:
             "Supplier Buyer Map",
             "Inwarding Parts",
             "Outwarding Parts",
-            "Agentic Flow",
             "Setup",
         ],
         label_visibility="collapsed",
@@ -4010,7 +4011,5 @@ elif page == "Inwarding Parts":
     render_inwarding()
 elif page == "Outwarding Parts":
     render_outwarding()
-elif page == "Agentic Flow":
-    render_agentic_flow()
 else:
     render_setup()

@@ -124,8 +124,9 @@ name; unresolved source rows are shown as `Not mapped`.
 
 ## Inwarding discrepancy agent
 
-The **Agentic Flow** page continuously checks the most recently saved inwarding
-snapshot whenever the page is opened. It flags quantity differences, missing
+The discrepancy-agent section under **Inwarding Parts** continuously checks the
+most recently saved inwarding snapshot whenever the page is opened. It flags
+quantity differences, missing
 buyer ownership, missing critical fields, overdue unloading, and possible
 duplicate rows. Issues are assigned to the mapped buyer; unowned issues go to
 `SCM Admin`.
