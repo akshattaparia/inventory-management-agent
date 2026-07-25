@@ -2969,7 +2969,108 @@ def save_agent_followup(action_id: str) -> None:
     )
 
 
-def render_agentic_flow() -> None:
+def render_agent_action_detail(
+    selected: pd.Series,
+    actions: pd.DataFrame,
+) -> None:
+    selected_action_id = clean_text(selected["Action ID"])
+    severity_class = clean_text(selected["Severity"]).lower()
+    st.markdown(
+        f"<div class='agent-review-heading'>"
+        f"<span class='agent-chip {escape(severity_class)}'>"
+        f"{escape(clean_text(selected['Severity']))}</span>"
+        f"<b>{escape(clean_text(selected['Issue Type']))}</b>"
+        f"<span>Action {escape(selected_action_id)}</span>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+    detail_columns = st.columns(3)
+    with detail_columns[0]:
+        with st.container(border=True):
+            st.markdown("**Owner and source**")
+            st.markdown(
+                f"Buyer: **{escape(clean_text(selected['Buyer Name']))}**  \n"
+                f"Supplier: {escape(clean_text(selected['Supplier Name']) or '—')}  \n"
+                f"Gate entry: {escape(clean_text(selected['Gate Entry No']) or '—')}  \n"
+                f"Entry date: {escape(clean_text(selected['Entry Date']) or '—')}"
+            )
+    with detail_columns[1]:
+        with st.container(border=True):
+            st.markdown("**Material**")
+            st.markdown(
+                f"Part: **{escape(clean_text(selected['Part Number']) or '—')}**  \n"
+                f"Name: {escape(clean_text(selected['Part Name']) or '—')}  \n"
+                f"Age: {escape(clean_text(selected['Age (days)']) or '0')} day(s)  \n"
+                f"Escalation: **{escape(clean_text(selected['Escalation']))}**"
+            )
+    with detail_columns[2]:
+        with st.container(border=True):
+            st.markdown("**Quantity and production**")
+            st.markdown(
+                f"Invoice: **{display_qty(selected['Invoice Qty'])}**  \n"
+                f"Received: **{display_qty(selected['Receipt Qty'])}**  \n"
+                f"Difference: **{display_qty(selected['Difference Qty'])}**  \n"
+                f"{escape(clean_text(selected['Production Impact']))}"
+            )
+
+    if selected["Severity"] == "Critical":
+        st.error(f"Why it was flagged: {selected['Reason']}", icon="🔴")
+    elif selected["Severity"] == "High":
+        st.warning(f"Why it was flagged: {selected['Reason']}", icon="🟠")
+    else:
+        st.info(f"Why it was flagged: {selected['Reason']}", icon="🟡")
+
+    st.markdown("**Buyer follow-up**")
+    if clean_text(selected["Active"]) == "No":
+        st.success(
+            "Verified resolved: the latest agent check could no longer "
+            "find this discrepancy in the source data."
+        )
+        st.caption(
+            f"Resolved at: {clean_text(selected['Resolved At']) or 'Not recorded'}"
+        )
+        return
+
+    workflow_options = [
+        "New",
+        "Reopened",
+        "Acknowledged",
+        "Investigating",
+        "Awaiting source correction",
+    ]
+    current_status = clean_text(selected["Status"])
+    if current_status not in workflow_options:
+        current_status = "Reopened"
+    with st.form(
+        key=f"agent_followup_form_{selected_action_id}",
+        border=True,
+    ):
+        workflow_columns = st.columns([1, 2])
+        with workflow_columns[0]:
+            st.selectbox(
+                "Workflow status",
+                workflow_options,
+                index=workflow_options.index(current_status),
+                key=f"agent_status_{selected_action_id}",
+                help="Buyers can progress the work, but cannot mark it resolved. Resolution is system-verified from refreshed source data.",
+            )
+        with workflow_columns[1]:
+            st.text_area(
+                "Follow-up notes",
+                value=clean_text(selected["Notes"]),
+                placeholder="Add supplier follow-up, expected correction date, or investigation details.",
+                key=f"agent_notes_{selected_action_id}",
+                help="Notes are retained in the audit history for management review.",
+            )
+        st.form_submit_button(
+            "Save follow-up",
+            type="primary",
+            on_click=save_agent_followup,
+            args=(selected_action_id,),
+        )
+
+
+def render_agentic_flow_legacy() -> None:
     st.header("Inwarding Discrepancy Agent")
     st.caption(
         "A buyer-owned action queue generated from the latest saved inwarding "
@@ -3398,6 +3499,308 @@ def render_agentic_flow() -> None:
             file_name="inwarding_agent_action_audit.csv",
             mime="text/csv",
             key="agent_audit_download",
+        )
+
+
+def render_agentic_flow() -> None:
+    st.header("Inwarding Discrepancy Agent")
+    st.caption(
+        "Each buyer gets one workspace containing all assigned issues, grouped "
+        "by severity and ordered by age."
+    )
+    with st.expander("How to use this page", expanded=False):
+        st.markdown(
+            """
+            1. Choose your name under **Buyer workspace**.
+            2. Open the **Critical**, **High**, or **Medium** tab.
+            3. Click any row to see its evidence and record follow-up.
+            4. The **Verified resolved** tab contains only issues the agent
+               confirmed were corrected in refreshed source data.
+            """
+        )
+
+    snapshot = enrich_inwarding_buyers(
+        clean_inwarding_snapshot(
+            load_source_cache(INWARDING_SNAPSHOT_PATH)
+        ),
+        load_source_cache(BUYER_MAPPING_CACHE_PATH),
+    )
+    if snapshot.empty:
+        st.info(
+            "Refresh the Inwarding Parts sheet once before running the agent."
+        )
+        return
+
+    with st.spinner("Agent is checking inwarding data..."):
+        actions = reconcile_agent_actions(build_agent_issues(snapshot))
+    followup_notice = st.session_state.pop("agent_followup_notice", "")
+    if followup_notice:
+        st.success(followup_notice)
+
+    active_open = actions[
+        actions["Active"].eq("Yes")
+        & ~actions["Status"].isin(["Resolved", "Auto-resolved"])
+    ].copy()
+    critical = active_open[active_open["Severity"].eq("Critical")]
+    escalations = active_open[active_open["Escalation"].ne("None")]
+    production_risk = active_open[
+        active_open["Production Impact"].str.startswith("At risk", na=False)
+    ]
+
+    metric_columns = st.columns(4)
+    metric_columns[0].metric(
+        "Open actions",
+        f"{len(active_open):,}",
+        help="All currently active discrepancies across buyers.",
+        border=True,
+    )
+    metric_columns[1].metric(
+        "Critical",
+        f"{len(critical):,}",
+        help="Issues requiring immediate attention.",
+        border=True,
+    )
+    metric_columns[2].metric(
+        "Escalations due",
+        f"{len(escalations):,}",
+        help="Issues old enough to require buyer or management follow-up.",
+        border=True,
+    )
+    metric_columns[3].metric(
+        "Production risks",
+        f"{len(production_risk):,}",
+        help="Short receipts linked to the latest production/BOM demand.",
+        border=True,
+    )
+
+    st.subheader(
+        "Buyer workspace",
+        help="Select one buyer to see only their assigned issues.",
+    )
+    open_counts = active_open.groupby("Buyer Name").size().to_dict()
+    buyer_options = sorted(
+        actions["Buyer Name"].dropna().unique(),
+        key=lambda buyer: (-int(open_counts.get(buyer, 0)), buyer),
+    )
+    if not buyer_options:
+        st.info("No buyer assignments are available yet.")
+        return
+    selected_buyer = st.selectbox(
+        "Choose buyer workspace",
+        buyer_options,
+        index=0,
+        format_func=lambda buyer: (
+            f"{buyer} ({int(open_counts.get(buyer, 0))})"
+        ),
+        key="agent_buyer_workspace",
+        help="The number beside each name is that buyer's open-action count.",
+        width="stretch",
+    )
+    if not selected_buyer:
+        st.info("Choose a buyer to open their issue lists.")
+        return
+
+    buyer_actions = actions[
+        actions["Buyer Name"].eq(selected_buyer)
+    ].copy()
+    buyer_open = buyer_actions[
+        buyer_actions["Active"].eq("Yes")
+        & ~buyer_actions["Status"].isin(["Resolved", "Auto-resolved"])
+    ]
+    buyer_metrics = st.columns(4)
+    buyer_metrics[0].metric(
+        "Total open",
+        f"{len(buyer_open):,}",
+        border=True,
+    )
+    for metric_column, severity, icon in zip(
+        buyer_metrics[1:],
+        ["Critical", "High", "Medium"],
+        ["🔴", "🟠", "🟡"],
+    ):
+        metric_column.metric(
+            f"{icon} {severity}",
+            f"{int(buyer_open['Severity'].eq(severity).sum()):,}",
+            border=True,
+        )
+
+    filter_columns = st.columns([1.4, 1])
+    with filter_columns[0]:
+        buyer_search = st.text_input(
+            "Search this buyer's issues",
+            placeholder="Part number, supplier, part name, or gate entry",
+            key="agent_buyer_issue_search",
+            help="Search only inside the selected buyer's workspace.",
+        )
+    with filter_columns[1]:
+        buyer_issue_types = st.multiselect(
+            "Problem type",
+            sorted(buyer_actions["Issue Type"].dropna().unique()),
+            placeholder="All problem types",
+            key="agent_buyer_issue_types",
+            help="Limit the lists to selected control failures.",
+        )
+    if buyer_search.strip():
+        search_text = buyer_search.strip()
+        search_mask = pd.Series(False, index=buyer_actions.index)
+        for column in [
+            "Part Number",
+            "Part Name",
+            "Supplier Name",
+            "Gate Entry No",
+        ]:
+            search_mask |= buyer_actions[column].astype(str).str.contains(
+                search_text,
+                case=False,
+                na=False,
+                regex=False,
+            )
+        buyer_actions = buyer_actions[search_mask]
+    if buyer_issue_types:
+        buyer_actions = buyer_actions[
+            buyer_actions["Issue Type"].isin(buyer_issue_types)
+        ]
+
+    severity_groups = [
+        (
+            "Critical",
+            buyer_actions[
+                buyer_actions["Active"].eq("Yes")
+                & buyer_actions["Severity"].eq("Critical")
+            ],
+        ),
+        (
+            "High",
+            buyer_actions[
+                buyer_actions["Active"].eq("Yes")
+                & buyer_actions["Severity"].eq("High")
+            ],
+        ),
+        (
+            "Medium",
+            buyer_actions[
+                buyer_actions["Active"].eq("Yes")
+                & buyer_actions["Severity"].eq("Medium")
+            ],
+        ),
+        (
+            "Verified resolved",
+            buyer_actions[
+                buyer_actions["Active"].eq("No")
+                & buyer_actions["Status"].eq("Auto-resolved")
+            ],
+        ),
+    ]
+    tab_labels = [
+        f"🔴 Critical ({len(severity_groups[0][1])})",
+        f"🟠 High ({len(severity_groups[1][1])})",
+        f"🟡 Medium ({len(severity_groups[2][1])})",
+        f"🟢 Verified resolved ({len(severity_groups[3][1])})",
+    ]
+    severity_tabs = st.tabs(tab_labels)
+    for tab, (group_name, group) in zip(
+        severity_tabs,
+        severity_groups,
+    ):
+        with tab:
+            if group.empty:
+                if group_name == "Verified resolved":
+                    st.info("No verified resolved issues match these filters.")
+                else:
+                    st.success(
+                        f"No {group_name.lower()} issues match these filters."
+                    )
+                continue
+
+            group = group.copy()
+            group["_age_numeric"] = pd.to_numeric(
+                group["Age (days)"],
+                errors="coerce",
+            ).fillna(0)
+            group = group.sort_values(
+                ["_age_numeric", "Escalation", "Part Number"],
+                ascending=[False, True, True],
+            ).drop(columns="_age_numeric").reset_index(drop=True)
+            group["Production Risk"] = group["Production Impact"].map(
+                lambda value: (
+                    "At risk"
+                    if clean_text(value).startswith("At risk")
+                    else "—"
+                )
+            )
+            visible_columns = [
+                "Issue Type",
+                "Supplier Name",
+                "Part Number",
+                "Part Name",
+                "Difference Qty",
+                "Production Risk",
+                "Age (days)",
+                "Escalation",
+                "Status",
+            ]
+            queue = group[visible_columns].copy()
+            queue["Difference Qty"] = pd.to_numeric(
+                queue["Difference Qty"],
+                errors="coerce",
+            ).fillna(0)
+            queue["Age (days)"] = pd.to_numeric(
+                queue["Age (days)"],
+                errors="coerce",
+            ).fillna(0).astype(int)
+            st.caption(
+                f"{selected_buyer} has {len(group):,} "
+                f"{group_name.lower()} issue(s). Click a row for evidence "
+                "and follow-up controls."
+            )
+            workspace_key = re.sub(
+                r"[^a-z0-9]+",
+                "_",
+                f"{selected_buyer}_{group_name}".lower(),
+            ).strip("_")
+            selection = st.dataframe(
+                queue,
+                width="stretch",
+                hide_index=True,
+                height=min(460, 38 + len(queue) * 35),
+                on_select="rerun",
+                selection_mode="single-row",
+                key=f"agent_workspace_{workspace_key}",
+                column_config={
+                    "Difference Qty": st.column_config.NumberColumn(
+                        format="%.2f"
+                    ),
+                    "Age (days)": st.column_config.NumberColumn(
+                        format="%d"
+                    ),
+                },
+            )
+            selected_rows = selection.selection.rows
+            if selected_rows:
+                render_agent_action_detail(
+                    group.iloc[selected_rows[0]],
+                    actions,
+                )
+
+    with st.expander("Agent rules and complete audit history"):
+        st.markdown(
+            """
+            - Buyers see all assigned issues separated into Critical, High,
+              Medium, and Verified Resolved lists.
+            - Click a row to review the invoice, receipt, source evidence,
+              production impact, and follow-up workflow.
+            - Buyers cannot manually close an issue. The agent sets
+              `Auto-resolved` only after the discrepancy disappears from the
+              refreshed source snapshot.
+            """
+        )
+        st.dataframe(actions, width="stretch", hide_index=True)
+        st.download_button(
+            "Download complete action audit CSV",
+            data=actions.to_csv(index=False).encode("utf-8"),
+            file_name="inwarding_agent_action_audit.csv",
+            mime="text/csv",
+            key="agent_workspace_audit_download",
         )
 
 

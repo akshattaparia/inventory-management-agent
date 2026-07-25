@@ -137,6 +137,10 @@ disappears after refreshed data is checked, the agent marks it `Auto-resolved`;
 if it still exists, it remains open or is reopened. Quantity shortages are also
 compared with the latest calculated production/BOM demand.
 
+Each buyer has a dedicated workspace with separate **Critical**, **High**,
+**Medium**, and **Verified resolved** tabs. Buyers can see their complete list
+at once and click a row to review its evidence or update follow-up details.
+
 ## Let another person open your running app
 
 Run Streamlit on your network:
