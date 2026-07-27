@@ -2075,7 +2075,7 @@ def render_inwarding() -> None:
         st.success("Google connected with read-only Sheets access.")
 
     refresh_clicked = st.button(
-        "Refresh inwarding from Google Sheet",
+        "Refresh",
         type="primary",
         disabled=credentials is None,
     )
