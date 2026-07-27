@@ -23,16 +23,20 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 LIVE_GRN_CSV = DATA_DIR / "live" / "grn_live.csv"
 LIVE_GRN_META = LIVE_GRN_CSV.with_suffix(".json")
+GRN_SHEET_SNAPSHOT_CSV = DATA_DIR / "live" / "grn_sheet_snapshot.csv"
+GRN_SHEET_SNAPSHOT_META = GRN_SHEET_SNAPSHOT_CSV.with_suffix(".json")
 LIVE_GOOGLE_SHEET_SNAPSHOT_CSV = DATA_DIR / "live" / "google_sheet_snapshot.csv"
 LIVE_GOOGLE_SHEET_SNAPSHOT_META = LIVE_GOOGLE_SHEET_SNAPSHOT_CSV.with_suffix(".json")
 SPOC_SUMMARY_SNAPSHOT_CSV = DATA_DIR / "live" / "spoc_summary_snapshot.csv"
 SPOC_SUMMARY_SNAPSHOT_META = SPOC_SUMMARY_SNAPSHOT_CSV.with_suffix(".json")
 GRN_EXPORT_SCRIPT = APP_DIR / "scripts" / "scheduled_grn_export.py"
 GOOGLE_SERVICE_ACCOUNT_JSON_PATH = APP_DIR / ".streamlit" / "google_service_account.json"
+GOOGLE_OAUTH_CONFIG_PATH = APP_DIR / ".streamlit" / "google_oauth.json"
 DEFAULT_GOOGLE_SHEET_URL = (
     "https://docs.google.com/spreadsheets/d/"
     "1V3ic-5Dfcz0PoX-0Z0gXdIrFIIOB_lSh-gM20RzLUKs/edit?gid=2111379627#gid=2111379627"
 )
+DEFAULT_GRN_SHEET_URL = DEFAULT_GOOGLE_SHEET_URL
 DEFAULT_SPOC_SUMMARY_SHEET_URL = (
     "https://docs.google.com/spreadsheets/d/"
     "1j3cRrw-O5TzBEICHYvfUBcQBRyZveYEmR3TD7wLfIzo/edit?gid=543512006#gid=543512006"
@@ -43,7 +47,7 @@ BUYER_NAME_ALIASES = {
     "subhash": "Subhash",
 }
 GOOGLE_SHEETS_READONLY_SCOPE = "https://www.googleapis.com/auth/spreadsheets.readonly"
-GOOGLE_OAUTH_SCOPE = GOOGLE_SHEETS_READONLY_SCOPE
+GOOGLE_OAUTH_SCOPES = [GOOGLE_SHEETS_READONLY_SCOPE]
 GOOGLE_TOKEN_PATH = APP_DIR / ".streamlit" / "google_oauth_token.json"
 GOOGLE_STATE_PATH = APP_DIR / ".streamlit" / "google_oauth_state.txt"
 PRODUCTION_SHEET_ID = "1KLvkeqE71PwJN6keLuIqQYLywfFvvQa7sCq9bo-Ii6I"
@@ -84,6 +88,10 @@ SOURCE_SHEETS = {
     },
 }
 COMPUTED_USAGE_CACHE_PATH = DATA_DIR / "computed_part_usage.csv"
+OUTWARDING_BASELINE_PATH = DATA_DIR / "outwarding_plan_baseline.csv"
+OUTWARDING_ALERT_LOG_PATH = DATA_DIR / "outwarding_alert_log.csv"
+OUTWARDING_OWNER_DEFAULT = "Akshat Taparia, Abhiraj Koslia"
+AGENT_TABLE_LIMIT = 250
 
 TABLES = {
     "part_inventory": {
@@ -170,7 +178,8 @@ def save_table(key: str, df: pd.DataFrame) -> None:
 
 
 def numeric(series: pd.Series) -> pd.Series:
-    return pd.to_numeric(series, errors="coerce").fillna(0)
+    cleaned = series.astype(str).str.replace(",", "", regex=False).str.strip()
+    return pd.to_numeric(cleaned, errors="coerce").fillna(0)
 
 
 def normalize_column_name(value: object) -> str:
@@ -214,7 +223,9 @@ def display_qty(value: object) -> str:
 
 
 def first_existing_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    normalized = {normalize_column_name(column): column for column in df.columns}
+    normalized: dict[str, str] = {}
+    for column in df.columns:
+        normalized.setdefault(normalize_column_name(column), column)
     for candidate in candidates:
         column = normalized.get(normalize_column_name(candidate))
         if column:
@@ -334,29 +345,148 @@ def build_grn_display_frame(df: pd.DataFrame) -> pd.DataFrame:
                 "Arrival Time",
                 "Arrival Date",
                 "PO Number",
+                "Gate Entry No.",
+                "Invoice Number",
+                "Invoice Qty",
+                "Discrepancy",
                 "Storage Location",
                 "Plant",
-                "Movement Type",
-                "UOM",
                 "Source Row",
             ]
         )
 
     result = pd.DataFrame(index=df.index)
     result["Buyer"] = column_or_blank(df, ["buyer", "buyer_name"])
-    result["Supplier"] = column_or_blank(df, ["supplier", "supplier_name", "vendor", "vendor_name"])
-    result["Part No."] = column_or_blank(df, ["part_no", "matnr", "material", "material_code"])
+    result["Supplier"] = column_or_blank(df, ["supplier", "supplier_name", "suplier_name", "vendor", "vendor_name"])
+    result["Part No."] = column_or_blank(df, ["part_no", "part_number", "matnr", "material", "material_code"])
     result["Part Name"] = column_or_blank(df, ["part_name", "part_description", "material_description", "maktx"])
-    result["Rcvd Qty"] = column_or_blank(df, ["received_qty", "rcvd_qty", "menge", "actual_quantity_received"])
-    result["Arrival Time"] = format_grn_times(column_or_blank(df, ["arrival_time", "sap_entry_time", "cputm"]))
-    result["Arrival Date"] = format_grn_dates(column_or_blank(df, ["arrival_date", "grn_date", "sap_entry_date", "budat", "posting_date"]))
+    result["Rcvd Qty"] = column_or_blank(
+        df,
+        ["receipt_qty", "received_qty", "quantity_received", "rcvd_qty", "menge", "actual_quantity_received"],
+    )
+    result["Arrival Time"] = format_grn_times(column_or_blank(df, ["arrival_time", "in_time", "sap_entry_time", "cputm"]))
+    result["Arrival Date"] = format_grn_dates(column_or_blank(df, ["arrival_date", "grn_date", "date", "gate_entry_date", "sap_entry_date", "budat", "posting_date"]))
     result["PO Number"] = column_or_blank(df, ["po_no", "po_number", "ebeln"])
+    result["Gate Entry No."] = column_or_blank(df, ["gate_entry_no", "gate_no", "entry_no"])
+    result["Invoice Number"] = column_or_blank(df, ["invoice_number", "invoice_no"])
+    result["Invoice Qty"] = column_or_blank(df, ["invoice_qty", "invoice_quantity"])
+    result["Discrepancy"] = column_or_blank(df, ["discrepancy", "qty_discrepancy"])
     result["Storage Location"] = column_or_blank(df, ["storage_location", "lgort"])
     result["Plant"] = column_or_blank(df, ["plant", "werks"])
-    result["Movement Type"] = column_or_blank(df, ["movement_type", "bwart"])
-    result["UOM"] = column_or_blank(df, ["uom", "meins"])
     result["Source Row"] = (pd.Series(range(1, len(df) + 1), index=df.index)).astype(str)
     return result
+
+
+def grn_reference(row: pd.Series) -> str:
+    parts = []
+    for label in ["Gate Entry No.", "Invoice Number", "PO Number", "Source Row"]:
+        value = clean_text(row.get(label, ""))
+        if value:
+            parts.append(f"{label}: {value}")
+    return " | ".join(parts)
+
+
+def build_grn_quality_alerts(grn_df: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "Agent",
+        "Severity",
+        "Issue",
+        "Part No.",
+        "Supplier",
+        "Reference",
+        "Rcvd Qty",
+        "Arrival Date",
+        "Recommended Action",
+    ]
+    if grn_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    df = grn_df.copy().fillna("")
+    df["Part No."] = df["Part No."].apply(stock_part_key)
+    df["Supplier"] = df["Supplier"].apply(normalize_supplier_name)
+    rcvd_qty = numeric(df["Rcvd Qty"])
+    invoice_qty = numeric(df["Invoice Qty"]) if "Invoice Qty" in df.columns else pd.Series(0, index=df.index)
+    discrepancy = numeric(df["Discrepancy"]) if "Discrepancy" in df.columns else invoice_qty - rcvd_qty
+    arrival_dates = parse_grn_dates(df["Arrival Date"])
+
+    records: list[dict[str, object]] = []
+
+    def add_issue(mask: pd.Series, severity: str, issue: str, action: str) -> None:
+        for _, row in df.loc[mask].iterrows():
+            records.append(
+                {
+                    "Agent": "GRN Data Quality Agent",
+                    "Severity": severity,
+                    "Issue": issue,
+                    "Part No.": row.get("Part No.", ""),
+                    "Supplier": row.get("Supplier", ""),
+                    "Reference": grn_reference(row),
+                    "Rcvd Qty": row.get("Rcvd Qty", ""),
+                    "Arrival Date": row.get("Arrival Date", ""),
+                    "Recommended Action": action,
+                }
+            )
+
+    add_issue(
+        df["Part No."].eq(""),
+        "Critical",
+        "Missing part number",
+        "Fix the part number in the GRN sheet before this receipt is used in part-level stock.",
+    )
+    add_issue(
+        df["Supplier"].eq(""),
+        "Watch",
+        "Missing supplier",
+        "Add supplier in the source sheet or map the part to a supplier from the SPOC/BOM master.",
+    )
+    add_issue(
+        rcvd_qty <= 0,
+        "Critical",
+        "Received quantity is blank, zero, or negative",
+        "Correct Receipt Qty. Stock cannot increase from a non-positive GRN receipt.",
+    )
+    add_issue(
+        arrival_dates.isna(),
+        "Watch",
+        "Missing arrival date",
+        "Add the arrival/posting date so the receipt can be compared against production consumption by day/week.",
+    )
+
+    invoice_mismatch = (invoice_qty > 0) & ((invoice_qty - rcvd_qty).abs() > 0.0001)
+    add_issue(
+        invoice_mismatch,
+        "Watch",
+        "Invoice quantity and received quantity differ",
+        "Check whether the difference is accepted shortage/excess or a source entry issue.",
+    )
+
+    explicit_discrepancy = discrepancy.abs() > 0.0001
+    add_issue(
+        explicit_discrepancy,
+        "Watch",
+        "Quantity discrepancy is recorded",
+        "Review discrepancy reason and make sure supplier/SCM follow-up is captured.",
+    )
+
+    key_columns = ["Gate Entry No.", "Part No.", "Invoice Number"]
+    if all(column in df.columns for column in key_columns):
+        duplicate_source = df[key_columns].astype(str).apply(lambda col: col.str.strip())
+        non_blank_key = duplicate_source.ne("").all(axis=1)
+        duplicate_key = duplicate_source.agg("|".join, axis=1)
+        duplicate_mask = non_blank_key & duplicate_key.duplicated(keep=False)
+        add_issue(
+            duplicate_mask,
+            "Watch",
+            "Possible duplicate GRN line",
+            "Check whether this is a real split receipt or the same gate/invoice/part repeated twice.",
+        )
+
+    alerts = pd.DataFrame(records, columns=columns)
+    if alerts.empty:
+        return alerts
+    severity_rank = {"Critical": 0, "Watch": 1}
+    alerts["_rank"] = alerts["Severity"].map(severity_rank).fillna(9)
+    return alerts.sort_values(["_rank", "Issue", "Part No."]).drop(columns="_rank").reset_index(drop=True)
 
 
 def parse_google_sheet_url(url: str) -> tuple[str, str]:
@@ -487,7 +617,7 @@ def raw_sheet_to_table(raw: pd.DataFrame) -> pd.DataFrame:
         if non_blank_count >= 2:
             header_row = index
             break
-    columns = [clean_text(value) or f"Column {idx + 1}" for idx, value in enumerate(raw.iloc[header_row].tolist())]
+    columns = unique_headers(raw.iloc[header_row].tolist(), raw.shape[1])
     table = raw.iloc[header_row + 1 :].copy()
     table.columns = columns
     return table.reset_index(drop=True).fillna("")
@@ -499,6 +629,10 @@ def google_sheet_csv_url(url: str) -> str:
 
 
 def load_google_sheet(url: str) -> pd.DataFrame:
+    credentials = load_google_credentials()
+    if credentials is not None:
+        raw, _ = load_google_sheet_oauth_raw(url, credentials)
+        return raw_sheet_to_table(raw)
     if google_sheets_credentials_configured():
         return raw_sheet_to_table(load_google_sheet_api_raw(url))
     csv_url = google_sheet_csv_url(url)
@@ -506,6 +640,10 @@ def load_google_sheet(url: str) -> pd.DataFrame:
 
 
 def load_google_sheet_raw(url: str) -> pd.DataFrame:
+    credentials = load_google_credentials()
+    if credentials is not None:
+        raw, _ = load_google_sheet_oauth_raw(url, credentials)
+        return raw
     if google_sheets_credentials_configured():
         return load_google_sheet_api_raw(url)
     csv_url = google_sheet_csv_url(url)
@@ -549,7 +687,7 @@ def load_snapshot_meta(meta_path: Path) -> dict[str, object]:
 
 
 def create_sheet_snapshot(source_url: str, snapshot_path: Path, meta_path: Path) -> tuple[pd.DataFrame, dict[str, object]]:
-    source_label = "Google Sheets API" if google_sheets_credentials_configured() else "CSV export link"
+    source_label = google_sheet_read_method_label()
     raw = load_google_sheet_raw(source_url)
     save_sheet_snapshot(raw, snapshot_path, meta_path, source_url, source_label)
     return raw, load_snapshot_meta(meta_path)
@@ -562,17 +700,15 @@ def show_google_sheet_access_help(exc: Exception) -> None:
         """
         **Quick fix**
 
-        1. Open the Google Sheet.
-        2. Click **Share**.
-        3. Under **General access**, choose **Anyone with the link**.
-        4. Set it to **Viewer**.
+        1. Use the **Google Sheets authorization** panel on this page.
+        2. Save the Google OAuth Client ID and Client Secret.
+        3. Click **Connect Google account for Sheets**.
+        4. Sign in with a Google account that can view the sheet.
         5. Come back here and click the copy/update button again.
 
-        **Private-company-data fix**
+        **Fallback for non-private sheets**
 
-        1. Configure `.streamlit/secrets.toml` from `.streamlit/secrets.toml.example`.
-        2. Paste the Google service-account JSON values there.
-        3. Share the Google Sheet with the service account `client_email` as **Viewer**.
+        Share the Google Sheet as **Anyone with the link can view**.
         """
     )
     st.code(str(exc))
@@ -815,16 +951,178 @@ def build_supplier_buyer_summary(parts: pd.DataFrame) -> pd.DataFrame:
     return grouped[columns]
 
 
-def google_oauth_settings() -> dict[str, str] | None:
+def build_part_owner_lookup(parts: pd.DataFrame) -> pd.DataFrame:
+    columns = ["Part No.", "Buyer", "Mapped Supplier"]
+    if parts.empty:
+        return pd.DataFrame(columns=columns)
+    lookup = parts.copy()
+    lookup["Part No."] = lookup["Part No."].apply(stock_part_key)
+    lookup = lookup[lookup["Part No."].ne("")]
+    if lookup.empty:
+        return pd.DataFrame(columns=columns)
+    grouped = (
+        lookup.groupby("Part No.", as_index=False)
+        .agg(
+            Buyer=("Buyer", joined_text),
+            **{"Mapped Supplier": ("Supplier", joined_text)},
+        )
+    )
+    return grouped[columns]
+
+
+def load_part_owner_lookup() -> pd.DataFrame:
+    raw = load_sheet_snapshot(SPOC_SUMMARY_SNAPSHOT_CSV)
+    if raw.empty:
+        return pd.DataFrame(columns=["Part No.", "Buyer", "Mapped Supplier"])
     try:
-        config = st.secrets["google_oauth"]
-        return {
-            "client_id": str(config["client_id"]),
-            "client_secret": str(config["client_secret"]),
-            "redirect_uri": str(config["redirect_uri"]),
-        }
-    except (FileNotFoundError, KeyError):
+        parts, _ = parse_spoc_summary_raw(raw)
+    except Exception:
+        return pd.DataFrame(columns=["Part No.", "Buyer", "Mapped Supplier"])
+    return build_part_owner_lookup(parts)
+
+
+def build_supplier_owner_alerts(parts: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "Agent",
+        "Severity",
+        "Buyer",
+        "Supplier",
+        "Parts",
+        "At Risk Parts",
+        "Critical Parts",
+        "Issue",
+        "Recommended Action",
+    ]
+    if parts.empty:
+        return pd.DataFrame(columns=columns)
+
+    summary = build_supplier_buyer_summary(parts)
+    records: list[dict[str, object]] = []
+    for _, row in summary.iterrows():
+        buyer = clean_text(row.get("Buyer", "")) or "Unmapped buyer"
+        supplier = clean_text(row.get("Supplier", "")) or "Unmapped supplier"
+        at_risk = int(row.get("Below Required", 0) or 0)
+        critical = int(row.get("Critical", 0) or 0)
+        parts_count = int(row.get("Parts", 0) or 0)
+        if buyer == "Unmapped buyer" or supplier == "Unmapped supplier":
+            records.append(
+                {
+                    "Agent": "Supplier Ownership Agent",
+                    "Severity": "Critical" if critical else "Watch",
+                    "Buyer": buyer,
+                    "Supplier": supplier,
+                    "Parts": parts_count,
+                    "At Risk Parts": at_risk,
+                    "Critical Parts": critical,
+                    "Issue": "Buyer/supplier ownership needs cleanup",
+                    "Recommended Action": "Fix the SPOC Summary buyer/supplier mapping so follow-up ownership is clear.",
+                }
+            )
+            continue
+        if critical:
+            records.append(
+                {
+                    "Agent": "Supplier Ownership Agent",
+                    "Severity": "Critical",
+                    "Buyer": buyer,
+                    "Supplier": supplier,
+                    "Parts": parts_count,
+                    "At Risk Parts": at_risk,
+                    "Critical Parts": critical,
+                    "Issue": "Critical parts under this owner",
+                    "Recommended Action": "Buyer should follow up with the supplier and SCM owner before production release.",
+                }
+            )
+        elif at_risk:
+            records.append(
+                {
+                    "Agent": "Supplier Ownership Agent",
+                    "Severity": "Watch",
+                    "Buyer": buyer,
+                    "Supplier": supplier,
+                    "Parts": parts_count,
+                    "At Risk Parts": at_risk,
+                    "Critical Parts": critical,
+                    "Issue": "Parts below required quantity",
+                    "Recommended Action": "Buyer should confirm incoming supply, pull-in options, or stock correction.",
+                }
+            )
+
+    alerts = pd.DataFrame(records, columns=columns)
+    if alerts.empty:
+        return alerts
+    severity_rank = {"Critical": 0, "Watch": 1}
+    alerts["_rank"] = alerts["Severity"].map(severity_rank).fillna(9)
+    return (
+        alerts.sort_values(["_rank", "Critical Parts", "At Risk Parts", "Supplier"], ascending=[True, False, False, True])
+        .drop(columns="_rank")
+        .reset_index(drop=True)
+    )
+
+
+def google_oauth_settings() -> dict[str, str] | None:
+    config: dict[str, object] | None = None
+    try:
+        if "google_oauth" in st.secrets:
+            config = dict(st.secrets["google_oauth"])
+    except Exception:
+        config = None
+
+    if config is None and GOOGLE_OAUTH_CONFIG_PATH.exists():
+        try:
+            config = json.loads(GOOGLE_OAUTH_CONFIG_PATH.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            config = None
+
+    if not config:
         return None
+
+    client_id = clean_text(config.get("client_id", ""))
+    client_secret = clean_text(config.get("client_secret", ""))
+    redirect_uri = clean_text(config.get("redirect_uri", ""))
+    if (
+        not client_id
+        or not client_secret
+        or not redirect_uri
+        or client_id.startswith("YOUR_")
+        or client_secret.startswith("YOUR_")
+    ):
+        return None
+
+    return {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "redirect_uri": redirect_uri,
+    }
+
+
+def save_google_oauth_settings(
+    client_id: str,
+    client_secret: str,
+    redirect_uri: str,
+) -> tuple[bool, str]:
+    client_id = clean_text(client_id)
+    client_secret = clean_text(client_secret)
+    redirect_uri = clean_text(redirect_uri)
+    if not client_id or not client_secret or not redirect_uri:
+        return False, "Client ID, client secret, and redirect URI are required."
+    if not redirect_uri.startswith(("http://", "https://")):
+        return False, "Redirect URI must start with http:// or https://."
+
+    save_private_text(
+        GOOGLE_OAUTH_CONFIG_PATH,
+        json.dumps(
+            {
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "redirect_uri": redirect_uri,
+            },
+            indent=2,
+        ),
+    )
+    GOOGLE_TOKEN_PATH.unlink(missing_ok=True)
+    GOOGLE_STATE_PATH.unlink(missing_ok=True)
+    return True, "Google OAuth settings saved."
 
 
 def build_google_oauth_flow(
@@ -842,7 +1140,7 @@ def build_google_oauth_flow(
     }
     flow = Flow.from_client_config(
         client_config,
-        scopes=[GOOGLE_OAUTH_SCOPE],
+        scopes=GOOGLE_OAUTH_SCOPES,
         state=state,
     )
     flow.redirect_uri = settings["redirect_uri"]
@@ -867,7 +1165,7 @@ def load_google_credentials() -> Credentials | None:
     try:
         credentials = Credentials.from_authorized_user_file(
             GOOGLE_TOKEN_PATH,
-            scopes=[GOOGLE_OAUTH_SCOPE],
+            scopes=GOOGLE_OAUTH_SCOPES,
         )
         if credentials.expired and credentials.refresh_token:
             credentials.refresh(GoogleAuthRequest())
@@ -875,6 +1173,25 @@ def load_google_credentials() -> Credentials | None:
         return credentials if credentials.valid else None
     except Exception:
         return None
+
+
+def clear_google_oauth() -> None:
+    GOOGLE_TOKEN_PATH.unlink(missing_ok=True)
+    GOOGLE_STATE_PATH.unlink(missing_ok=True)
+    for key in ("google_oauth_connected_notice",):
+        st.session_state.pop(key, None)
+
+
+def google_oauth_connected() -> bool:
+    return load_google_credentials() is not None
+
+
+def google_sheet_read_method_label() -> str:
+    if google_oauth_connected():
+        return "Google OAuth"
+    if google_sheets_credentials_configured():
+        return "Google service account"
+    return "CSV export link"
 
 
 def begin_google_oauth(settings: dict[str, str]) -> str:
@@ -948,7 +1265,7 @@ def unique_headers(values: list[object], width: int) -> list[str]:
     return headers
 
 
-def load_google_sheet_oauth(
+def load_google_sheet_oauth_raw(
     url: str,
     credentials: Credentials,
 ) -> tuple[pd.DataFrame, str]:
@@ -1001,9 +1318,21 @@ def load_google_sheet_oauth(
         return pd.DataFrame(), selected_sheet
 
     width = max(len(row) for row in values)
-    columns = unique_headers(values[0], width)
-    rows = [row + [""] * (width - len(row)) for row in values[1:]]
-    return pd.DataFrame(rows, columns=columns).fillna(""), selected_sheet
+    rows = [row + [""] * (width - len(row)) for row in values]
+    return pd.DataFrame(rows, dtype=str).fillna(""), selected_sheet
+
+
+def load_google_sheet_oauth(
+    url: str,
+    credentials: Credentials,
+) -> tuple[pd.DataFrame, str]:
+    raw, selected_sheet = load_google_sheet_oauth_raw(url, credentials)
+    if raw.empty:
+        return pd.DataFrame(), selected_sheet
+    columns = unique_headers(raw.iloc[0].tolist(), raw.shape[1])
+    rows = raw.iloc[1:].copy()
+    rows.columns = columns
+    return rows.reset_index(drop=True).fillna(""), selected_sheet
 
 
 def save_source_cache(path: Path, df: pd.DataFrame) -> None:
@@ -1382,6 +1711,436 @@ def combine_manual_outwarding(
     )
 
 
+def prepare_usage_for_agent(usage: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "Usage Date",
+        "Daily Total Production",
+        "Part No.",
+        "Part Name",
+        "Supplier",
+        "Production Used Qty",
+        "Servicing Used Qty",
+        "Total Outwarding Qty",
+    ]
+    if usage.empty:
+        return pd.DataFrame(columns=columns + ["Plan Week"])
+
+    result = usage.copy()
+    for column in columns:
+        if column not in result.columns:
+            result[column] = 0 if column.endswith("Qty") or column == "Daily Total Production" else ""
+    result["Usage Date"] = pd.to_datetime(result["Usage Date"], errors="coerce").dt.normalize()
+    result = result[result["Usage Date"].notna()].copy()
+    for column in [
+        "Daily Total Production",
+        "Production Used Qty",
+        "Servicing Used Qty",
+        "Total Outwarding Qty",
+    ]:
+        result[column] = numeric(result[column])
+    result["Part No."] = result["Part No."].astype(str).str.strip()
+    result["Part Name"] = result["Part Name"].fillna("").astype(str).str.strip()
+    result["Supplier"] = result["Supplier"].fillna("").astype(str).str.strip()
+    iso = result["Usage Date"].dt.isocalendar()
+    result["Plan Week"] = (
+        iso["year"].astype(str)
+        + "-W"
+        + iso["week"].astype(str).str.zfill(2)
+    )
+    return result[columns + ["Plan Week"]]
+
+
+def save_outwarding_baseline(usage: pd.DataFrame) -> None:
+    baseline = prepare_usage_for_agent(usage).copy()
+    if not baseline.empty:
+        baseline["Usage Date"] = baseline["Usage Date"].dt.strftime("%Y-%m-%d")
+    save_source_cache(OUTWARDING_BASELINE_PATH, baseline)
+
+
+def load_outwarding_baseline() -> pd.DataFrame:
+    if not OUTWARDING_BASELINE_PATH.exists():
+        return pd.DataFrame()
+    return pd.read_csv(OUTWARDING_BASELINE_PATH, dtype=str).fillna("")
+
+
+def load_outwarding_alert_log() -> pd.DataFrame:
+    if not OUTWARDING_ALERT_LOG_PATH.exists():
+        return pd.DataFrame()
+    return pd.read_csv(OUTWARDING_ALERT_LOG_PATH, dtype=str).fillna("")
+
+
+def weekly_production_summary(usage: pd.DataFrame) -> pd.DataFrame:
+    prepared = prepare_usage_for_agent(usage)
+    if prepared.empty:
+        return pd.DataFrame(columns=["Plan Week", "Vehicles"])
+    daily = (
+        prepared.groupby(["Usage Date", "Plan Week"], as_index=False)["Daily Total Production"]
+        .max()
+    )
+    return (
+        daily.groupby("Plan Week", as_index=False)["Daily Total Production"]
+        .sum()
+        .rename(columns={"Daily Total Production": "Vehicles"})
+    )
+
+
+def weekly_part_usage_summary(usage: pd.DataFrame) -> pd.DataFrame:
+    prepared = prepare_usage_for_agent(usage)
+    columns = [
+        "Plan Week",
+        "Part No.",
+        "Part Name",
+        "Supplier",
+        "Production Used Qty",
+        "Servicing Used Qty",
+        "Total Outwarding Qty",
+    ]
+    if prepared.empty:
+        return pd.DataFrame(columns=columns)
+    return (
+        prepared.groupby(["Plan Week", "Part No."], as_index=False)
+        .agg(
+            **{
+                "Part Name": ("Part Name", joined_text),
+                "Supplier": ("Supplier", joined_text),
+                "Production Used Qty": ("Production Used Qty", "sum"),
+                "Servicing Used Qty": ("Servicing Used Qty", "sum"),
+                "Total Outwarding Qty": ("Total Outwarding Qty", "sum"),
+            }
+        )
+        .sort_values(["Plan Week", "Part No."], ascending=[False, True])
+    )
+
+
+def load_grn_sheet_display_snapshot() -> pd.DataFrame:
+    raw = load_sheet_snapshot(GRN_SHEET_SNAPSHOT_CSV)
+    if raw.empty:
+        return build_grn_display_frame(pd.DataFrame())
+    return build_grn_display_frame(raw_sheet_to_table(raw))
+
+
+def weekly_grn_receipts_summary(grn_df: pd.DataFrame) -> pd.DataFrame:
+    columns = ["Plan Week", "Part No.", "Inward Supplier", "Received Qty", "Last Arrival Date"]
+    if grn_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    prepared = grn_df.copy()
+    prepared["Part No."] = prepared["Part No."].apply(stock_part_key)
+    prepared["Inward Supplier"] = prepared["Supplier"].apply(normalize_supplier_name)
+    prepared["Received Qty"] = numeric(prepared["Rcvd Qty"])
+    prepared["Arrival Date Parsed"] = parse_grn_dates(prepared["Arrival Date"])
+    prepared = prepared[
+        prepared["Part No."].ne("")
+        & prepared["Arrival Date Parsed"].notna()
+        & (prepared["Received Qty"] > 0)
+    ].copy()
+    if prepared.empty:
+        return pd.DataFrame(columns=columns)
+
+    iso = prepared["Arrival Date Parsed"].dt.isocalendar()
+    prepared["Plan Week"] = (
+        iso["year"].astype(str)
+        + "-W"
+        + iso["week"].astype(str).str.zfill(2)
+    )
+    grouped = (
+        prepared.groupby(["Plan Week", "Part No."], as_index=False)
+        .agg(
+            **{
+                "Inward Supplier": ("Inward Supplier", joined_text),
+                "Received Qty": ("Received Qty", "sum"),
+                "Last Arrival Date": ("Arrival Date Parsed", "max"),
+            }
+        )
+    )
+    grouped["Last Arrival Date"] = grouped["Last Arrival Date"].dt.strftime("%Y-%m-%d")
+    return grouped[columns]
+
+
+def pct_delta(current: float, baseline: float) -> float:
+    if baseline == 0:
+        return 100.0 if current > 0 else 0.0
+    return ((current - baseline) / baseline) * 100
+
+
+def scalar_float(value: object) -> float:
+    return float(pd.to_numeric(pd.Series([value]), errors="coerce").fillna(0).iloc[0])
+
+
+def alert_severity(delta_pct: float, delta_qty: float, critical_qty: float) -> str:
+    if abs(delta_pct) >= 30 or abs(delta_qty) >= critical_qty:
+        return "Critical"
+    return "Watch"
+
+
+def build_outwarding_agent_alerts(
+    current_usage: pd.DataFrame,
+    baseline_usage: pd.DataFrame,
+    owners: str,
+    reduction_pct_threshold: float,
+    vehicle_delta_threshold: float,
+    part_delta_threshold: float,
+) -> pd.DataFrame:
+    alert_columns = [
+        "Alert ID",
+        "Agent",
+        "Severity",
+        "Plan Week",
+        "Part No.",
+        "Part Name",
+        "Supplier",
+        "Baseline Qty",
+        "Current Qty",
+        "Delta Qty",
+        "Delta %",
+        "Owners",
+        "Recommended Action",
+    ]
+    if baseline_usage.empty or current_usage.empty:
+        return pd.DataFrame(columns=alert_columns)
+
+    records: list[dict[str, object]] = []
+    owner_text = clean_text(owners) or OUTWARDING_OWNER_DEFAULT
+
+    current_weekly = weekly_production_summary(current_usage)
+    baseline_weekly = weekly_production_summary(baseline_usage)
+    production_compare = current_weekly.merge(
+        baseline_weekly,
+        on="Plan Week",
+        how="outer",
+        suffixes=("_current", "_baseline"),
+    ).fillna(0)
+    for _, row in production_compare.iterrows():
+        current_qty = float(row.get("Vehicles_current", 0) or 0)
+        baseline_qty = float(row.get("Vehicles_baseline", 0) or 0)
+        delta_qty = current_qty - baseline_qty
+        delta_percent = pct_delta(current_qty, baseline_qty)
+        if baseline_qty <= 0 and current_qty <= 0:
+            continue
+        if delta_qty <= -vehicle_delta_threshold and abs(delta_percent) >= reduction_pct_threshold:
+            severity = alert_severity(delta_percent, delta_qty, vehicle_delta_threshold * 3)
+            records.append(
+                {
+                    "Alert ID": f"production_drop|{row['Plan Week']}|{current_qty:.0f}|{baseline_qty:.0f}",
+                    "Agent": "Production fluctuation agent",
+                    "Severity": severity,
+                    "Plan Week": row["Plan Week"],
+                    "Part No.": "",
+                    "Part Name": "Weekly vehicle production",
+                    "Supplier": "",
+                    "Baseline Qty": baseline_qty,
+                    "Current Qty": current_qty,
+                    "Delta Qty": delta_qty,
+                    "Delta %": delta_percent,
+                    "Owners": owner_text,
+                    "Recommended Action": "Production is down versus baseline. Review supplier call-offs and line-feed quantities before over-issuing material.",
+                }
+            )
+        elif delta_qty >= vehicle_delta_threshold and delta_percent >= reduction_pct_threshold:
+            severity = alert_severity(delta_percent, delta_qty, vehicle_delta_threshold * 3)
+            records.append(
+                {
+                    "Alert ID": f"production_increase|{row['Plan Week']}|{current_qty:.0f}|{baseline_qty:.0f}",
+                    "Agent": "Production fluctuation agent",
+                    "Severity": severity,
+                    "Plan Week": row["Plan Week"],
+                    "Part No.": "",
+                    "Part Name": "Weekly vehicle production",
+                    "Supplier": "",
+                    "Baseline Qty": baseline_qty,
+                    "Current Qty": current_qty,
+                    "Delta Qty": delta_qty,
+                    "Delta %": delta_percent,
+                    "Owners": owner_text,
+                    "Recommended Action": "Production is up versus baseline. Check stock cover and inwarding support for extra outwarding demand.",
+                }
+            )
+
+    current_parts = weekly_part_usage_summary(current_usage)
+    baseline_parts = weekly_part_usage_summary(baseline_usage)
+    part_compare = current_parts.merge(
+        baseline_parts,
+        on=["Plan Week", "Part No."],
+        how="outer",
+        suffixes=("_current", "_baseline"),
+    ).fillna("")
+    for _, row in part_compare.iterrows():
+        current_qty = scalar_float(row.get("Total Outwarding Qty_current", 0))
+        baseline_qty = scalar_float(row.get("Total Outwarding Qty_baseline", 0))
+        delta_qty = current_qty - baseline_qty
+        if abs(delta_qty) < part_delta_threshold:
+            continue
+        delta_percent = pct_delta(current_qty, baseline_qty)
+        part_name = clean_text(row.get("Part Name_current", "")) or clean_text(row.get("Part Name_baseline", ""))
+        supplier = clean_text(row.get("Supplier_current", "")) or clean_text(row.get("Supplier_baseline", ""))
+        if baseline_qty == 0 and current_qty > 0:
+            agent = "New outwarding demand agent"
+            action = "New part demand appears in the plan. Confirm stock, supplier coverage, and line-feed readiness."
+        elif current_qty == 0 and baseline_qty > 0:
+            agent = "Reduced production impact agent"
+            action = "Part demand has dropped to zero. Pause or reduce calls for this part and check if inventory will become excess."
+        elif delta_qty > 0:
+            agent = "Outward stock pressure agent"
+            action = "Part usage increased versus baseline. Check available stock and pending inwarding before plan release."
+        else:
+            agent = "Reduced production impact agent"
+            action = "Part usage reduced versus baseline. Check if supplier call-offs or line-feed issues should be adjusted."
+        severity = alert_severity(delta_percent, delta_qty, part_delta_threshold * 3)
+        records.append(
+            {
+                "Alert ID": f"{agent}|{row['Plan Week']}|{row['Part No.']}|{current_qty:.0f}|{baseline_qty:.0f}",
+                "Agent": agent,
+                "Severity": severity,
+                "Plan Week": row["Plan Week"],
+                "Part No.": row["Part No."],
+                "Part Name": part_name,
+                "Supplier": supplier,
+                "Baseline Qty": baseline_qty,
+                "Current Qty": current_qty,
+                "Delta Qty": delta_qty,
+                "Delta %": delta_percent,
+                "Owners": owner_text,
+                "Recommended Action": action,
+            }
+        )
+
+    alerts = pd.DataFrame(records, columns=alert_columns)
+    if alerts.empty:
+        return alerts
+    severity_rank = {"Critical": 0, "Watch": 1}
+    alerts["_severity_rank"] = alerts["Severity"].map(severity_rank).fillna(9)
+    alerts["_abs_delta"] = alerts["Delta Qty"].abs()
+    alerts = alerts.sort_values(
+        ["_severity_rank", "Plan Week", "_abs_delta"],
+        ascending=[True, False, False],
+    ).drop(columns=["_severity_rank", "_abs_delta"])
+    return alerts.reset_index(drop=True)
+
+
+def build_inbound_coverage_alerts(
+    current_usage: pd.DataFrame,
+    grn_df: pd.DataFrame,
+    minimum_gap_qty: float,
+) -> pd.DataFrame:
+    columns = [
+        "Agent",
+        "Severity",
+        "Plan Week",
+        "Buyer",
+        "Supplier",
+        "Part No.",
+        "Part Name",
+        "Outwarding Qty",
+        "GRN Received Qty",
+        "Gap Qty",
+        "Last GRN Date",
+        "Recommended Action",
+    ]
+    if current_usage.empty:
+        return pd.DataFrame(columns=columns)
+
+    outward = weekly_part_usage_summary(current_usage).rename(
+        columns={
+            "Supplier": "Outward Supplier",
+            "Total Outwarding Qty": "Outwarding Qty",
+        }
+    )
+    if outward.empty:
+        return pd.DataFrame(columns=columns)
+    outward["Part No."] = outward["Part No."].apply(stock_part_key)
+    outward = outward[outward["Part No."].ne("")]
+
+    inward = weekly_grn_receipts_summary(grn_df)
+    owner_lookup = load_part_owner_lookup()
+    merged = outward.merge(inward, on=["Plan Week", "Part No."], how="left")
+    if not owner_lookup.empty:
+        merged = merged.merge(owner_lookup, on="Part No.", how="left")
+    else:
+        merged["Buyer"] = ""
+        merged["Mapped Supplier"] = ""
+
+    for column in ["Received Qty", "Production Used Qty", "Servicing Used Qty", "Outwarding Qty"]:
+        if column not in merged.columns:
+            merged[column] = 0
+        merged[column] = numeric(merged[column])
+    for column in ["Buyer", "Mapped Supplier", "Outward Supplier", "Inward Supplier", "Part Name", "Last Arrival Date"]:
+        if column not in merged.columns:
+            merged[column] = ""
+        merged[column] = merged[column].fillna("").astype(str)
+
+    merged["Gap Qty"] = merged["Outwarding Qty"] - merged["Received Qty"]
+    action_rows = merged[
+        (merged["Outwarding Qty"] > 0)
+        & (
+            merged["Received Qty"].le(0)
+            | merged["Gap Qty"].ge(float(minimum_gap_qty))
+        )
+    ].copy()
+    if action_rows.empty:
+        return pd.DataFrame(columns=columns)
+
+    records: list[dict[str, object]] = []
+    for _, row in action_rows.iterrows():
+        outward_qty = scalar_float(row.get("Outwarding Qty", 0))
+        received_qty = scalar_float(row.get("Received Qty", 0))
+        gap_qty = outward_qty - received_qty
+        supplier = (
+            clean_text(row.get("Mapped Supplier", ""))
+            or clean_text(row.get("Outward Supplier", ""))
+            or clean_text(row.get("Inward Supplier", ""))
+            or "Unmapped supplier"
+        )
+        buyer = clean_text(row.get("Buyer", "")) or "Akshat Taparia, Abhiraj Koslia"
+        if received_qty <= 0:
+            severity = "Critical"
+            issue_action = "No same-week GRN receipt is visible. Check opening stock, pending inwarding, and supplier commitment before issuing to line."
+        elif gap_qty / max(outward_qty, 1) >= 0.5:
+            severity = "Critical"
+            issue_action = "Same-week inwarding covers less than half of outwarding. Confirm stock cover and pull-in requirement."
+        else:
+            severity = "Watch"
+            issue_action = "Outwarding is higher than same-week GRN. Validate opening stock or pending receipts before releasing calls."
+        records.append(
+            {
+                "Agent": "Inbound Coverage Agent",
+                "Severity": severity,
+                "Plan Week": row.get("Plan Week", ""),
+                "Buyer": buyer,
+                "Supplier": supplier,
+                "Part No.": row.get("Part No.", ""),
+                "Part Name": row.get("Part Name", ""),
+                "Outwarding Qty": outward_qty,
+                "GRN Received Qty": received_qty,
+                "Gap Qty": gap_qty,
+                "Last GRN Date": row.get("Last Arrival Date", ""),
+                "Recommended Action": issue_action,
+            }
+        )
+
+    alerts = pd.DataFrame(records, columns=columns)
+    severity_rank = {"Critical": 0, "Watch": 1}
+    alerts["_rank"] = alerts["Severity"].map(severity_rank).fillna(9)
+    return (
+        alerts.sort_values(["_rank", "Plan Week", "Gap Qty"], ascending=[True, False, False])
+        .drop(columns="_rank")
+        .reset_index(drop=True)
+    )
+
+
+def append_outwarding_alert_log(alerts: pd.DataFrame) -> pd.DataFrame:
+    if alerts.empty:
+        return load_outwarding_alert_log()
+    log_now = datetime.now().isoformat(timespec="seconds")
+    to_log = alerts.copy()
+    to_log.insert(0, "Logged At", log_now)
+    existing = load_outwarding_alert_log()
+    combined = pd.concat([existing, to_log], ignore_index=True) if not existing.empty else to_log
+    if "Alert ID" in combined.columns:
+        combined = combined.drop_duplicates("Alert ID", keep="last")
+    save_source_cache(OUTWARDING_ALERT_LOG_PATH, combined)
+    return combined
+
+
 def build_inventory_status(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
@@ -1464,6 +2223,63 @@ def render_editable_table(key: str) -> pd.DataFrame:
     return edited
 
 
+def render_google_oauth_controls(key_prefix: str, expanded: bool = False) -> Credentials | None:
+    oauth_settings = google_oauth_settings()
+    credentials = load_google_credentials()
+    with st.expander("Google Sheets authorization", expanded=expanded or credentials is None):
+        if credentials is not None:
+            st.success("Google account is connected for read-only Sheets access.")
+            if st.button("Disconnect Google Sheets account", key=f"{key_prefix}_disconnect_oauth"):
+                clear_google_oauth()
+                st.rerun()
+            return credentials
+
+        if oauth_settings:
+            st.success("Google OAuth client is saved.")
+            st.caption(f"Redirect URI: {oauth_settings['redirect_uri']}")
+        else:
+            st.warning("Google OAuth client is not saved yet.")
+
+        with st.form(f"{key_prefix}_oauth_settings_form"):
+            st.write("Use this to read private Google Sheets from your Google account.")
+            client_id = st.text_input(
+                "Google OAuth Client ID",
+                value=oauth_settings["client_id"] if oauth_settings else "",
+                key=f"{key_prefix}_oauth_client_id",
+            )
+            client_secret = st.text_input(
+                "Google OAuth Client Secret",
+                value=oauth_settings["client_secret"] if oauth_settings else "",
+                type="password",
+                key=f"{key_prefix}_oauth_client_secret",
+            )
+            redirect_uri = st.text_input(
+                "Redirect URI",
+                value=oauth_settings["redirect_uri"] if oauth_settings else "http://localhost:8501/",
+                help="This must exactly match the authorized redirect URI in Google Cloud.",
+                key=f"{key_prefix}_oauth_redirect_uri",
+            )
+            saved_oauth = st.form_submit_button("Save Google OAuth settings", type="primary")
+        if saved_oauth:
+            ok, message = save_google_oauth_settings(client_id, client_secret, redirect_uri)
+            if ok:
+                st.success(message)
+                st.rerun()
+            st.error(message)
+
+        oauth_settings = google_oauth_settings()
+        if oauth_settings:
+            authorization_url = begin_google_oauth(oauth_settings)
+            st.link_button(
+                "Connect Google account for Sheets",
+                authorization_url,
+                type="primary",
+            )
+            st.caption("Use a Google account that has Viewer access to the source sheets.")
+
+    return load_google_credentials()
+
+
 def render_part_inventory() -> None:
     st.header("Part Inventory")
     st.write("Current stock position by buyer, supplier, and part.")
@@ -1490,7 +2306,7 @@ def render_part_inventory() -> None:
 def render_live_google_sheet() -> None:
     st.header("Live Google Sheet")
     st.write("This page shows the saved copy of your Google Sheet. Press the button only when you want to pull the latest sheet into the app.")
-    source_label = "Google Sheets API" if google_sheets_credentials_configured() else "CSV export link"
+    source_label = google_sheet_read_method_label()
 
     sheet_url = st.text_input(
         "Google Sheet link",
@@ -1506,8 +2322,9 @@ def render_live_google_sheet() -> None:
             f"Saved copy: `{LIVE_GOOGLE_SHEET_SNAPSHOT_CSV.relative_to(APP_DIR)}`. "
             f"Last copied: {snapshot_age_label(LIVE_GOOGLE_SHEET_SNAPSHOT_CSV)}."
         )
-    if not google_sheets_credentials_configured():
-        st.info("No Google Sheets API credentials found. This button can read only sheets shared as Anyone with the link can view.")
+    if source_label == "CSV export link":
+        st.info("No Google Sheets authorization is connected yet. Connect OAuth here to read private live sheets.")
+        render_google_oauth_controls("live_google_sheet", expanded=True)
 
     if refresh_clicked:
         try:
@@ -1571,10 +2388,46 @@ def supplier_cards_html(summary: pd.DataFrame, limit: int = 24) -> str:
     return f"<div class='supplier-grid'>{''.join(cards)}</div>"
 
 
+def render_supplier_owner_agent(parts: pd.DataFrame) -> None:
+    st.subheader("Supplier Ownership Agent")
+    st.write("Flags supplier-owner pockets where buyer follow-up is needed.")
+    alerts = build_supplier_owner_alerts(parts)
+    total_groups = len(build_supplier_buyer_summary(parts))
+    critical_count = int(alerts["Severity"].eq("Critical").sum()) if not alerts.empty else 0
+    watch_count = int(alerts["Severity"].eq("Watch").sum()) if not alerts.empty else 0
+
+    cols = st.columns(4)
+    with cols[0]:
+        render_metric("Supplier groups", f"{total_groups:,}", "neutral")
+    with cols[1]:
+        render_metric("Need follow-up", f"{len(alerts):,}", "warn" if not alerts.empty else "ok")
+    with cols[2]:
+        render_metric("Critical owners", f"{critical_count:,}", "bad" if critical_count else "ok")
+    with cols[3]:
+        render_metric("Watch items", f"{watch_count:,}", "warn" if watch_count else "ok")
+
+    if alerts.empty:
+        st.success("No owner-level supplier follow-up is currently flagged.")
+        return
+
+    st.dataframe(
+        alerts.head(AGENT_TABLE_LIMIT),
+        use_container_width=True,
+        hide_index=True,
+        height=320,
+    )
+    st.download_button(
+        "Download supplier owner alerts CSV",
+        alerts.to_csv(index=False),
+        file_name="supplier_owner_alerts.csv",
+        mime="text/csv",
+    )
+
+
 def render_supplier_buyer_map() -> None:
     st.header("Supplier Buyer Map")
     st.write("Buyer-supplier ownership from the saved SPOC Summary copy.")
-    source_label = "Google Sheets API" if google_sheets_credentials_configured() else "CSV export link"
+    source_label = google_sheet_read_method_label()
 
     sheet_url = st.text_input(
         "SPOC Summary Sheet link",
@@ -1590,8 +2443,9 @@ def render_supplier_buyer_map() -> None:
             f"Saved copy: `{SPOC_SUMMARY_SNAPSHOT_CSV.relative_to(APP_DIR)}`. "
             f"Last copied: {snapshot_age_label(SPOC_SUMMARY_SNAPSHOT_CSV)}."
         )
-    if not google_sheets_credentials_configured():
-        st.info("No Google Sheets API credentials found. This button can read only sheets shared as Anyone with the link can view.")
+    if source_label == "CSV export link":
+        st.info("No Google Sheets authorization is connected yet. Connect OAuth here to read private live sheets.")
+        render_google_oauth_controls("supplier_buyer_map", expanded=True)
 
     if refresh_clicked:
         try:
@@ -1650,6 +2504,9 @@ def render_supplier_buyer_map() -> None:
     if copied_at:
         st.caption(f"Saved Google Sheet copy created at: {copied_at}. Source rows copied: {snapshot_meta.get('rows', 0):,}.")
 
+    render_supplier_owner_agent(parts)
+    st.divider()
+
     filter_cols = st.columns([1.2, 1.2, 1.2, 1.6])
     with filter_cols[0]:
         selected_buyer = st.selectbox("Buyer view", ["All buyers"] + buyers, index=0)
@@ -1699,40 +2556,95 @@ def render_supplier_buyer_map() -> None:
     )
 
 
+def render_grn_quality_agent(grn_df: pd.DataFrame) -> None:
+    st.subheader("GRN Data Quality Agent")
+    st.write("Checks whether inwarding rows are usable for stock math before they affect inventory.")
+    alerts = build_grn_quality_alerts(grn_df)
+    critical_count = int(alerts["Severity"].eq("Critical").sum()) if not alerts.empty else 0
+    watch_count = int(alerts["Severity"].eq("Watch").sum()) if not alerts.empty else 0
+    issue_types = alerts["Issue"].nunique() if not alerts.empty else 0
+
+    cols = st.columns(4)
+    with cols[0]:
+        render_metric("Rows checked", f"{len(grn_df):,}", "neutral")
+    with cols[1]:
+        render_metric("Issues", f"{len(alerts):,}", "warn" if not alerts.empty else "ok")
+    with cols[2]:
+        render_metric("Critical", f"{critical_count:,}", "bad" if critical_count else "ok")
+    with cols[3]:
+        render_metric("Issue types", f"{issue_types:,}", "warn" if watch_count else "ok")
+
+    if alerts.empty:
+        st.success("No GRN data quality issues found in the current filtered view.")
+        return
+
+    st.warning("Review these rows before using this GRN set as stock evidence.")
+    st.dataframe(
+        alerts.head(AGENT_TABLE_LIMIT),
+        use_container_width=True,
+        hide_index=True,
+        height=340,
+    )
+    if len(alerts) > AGENT_TABLE_LIMIT:
+        st.caption(f"Showing first {AGENT_TABLE_LIMIT:,} alerts out of {len(alerts):,}. Use filters above to narrow the GRN view.")
+    st.download_button(
+        "Download GRN quality alerts CSV",
+        alerts.to_csv(index=False),
+        file_name="grn_quality_alerts.csv",
+        mime="text/csv",
+    )
+
+
 def render_inwarding() -> None:
     st.header("Inwarding Parts")
     st.write(
-        "Live GRN inwarding from the Superset/Trino source. "
-        "This page does not use sample data or the previous app's files."
+        "GRN inwarding from the live gate-entry Google Sheet. "
+        "Receipt Qty is treated as the GRN received quantity."
     )
+    source_label = google_sheet_read_method_label()
 
-    top_left, top_right = st.columns([1, 4])
-    with top_left:
-        if st.button("Run live export now", type="primary"):
-            ok, message = run_grn_export()
-            if ok:
-                st.success(message)
-                st.rerun()
-            else:
-                st.error("Live Superset GRN export failed.")
-                st.code(message)
-    with top_right:
+    sheet_url = st.text_input(
+        "GRN Google Sheet link",
+        value=DEFAULT_GRN_SHEET_URL,
+        help="This sheet is used as the GRN source. The app saves a copy only when you press the update button.",
+    )
+    action_col, info_col = st.columns([1.4, 4.6])
+    with action_col:
+        refresh_clicked = st.button("Create / update GRN copy", type="primary")
+    with info_col:
         st.caption(
-            f"Source file for this new app: `{LIVE_GRN_CSV.relative_to(APP_DIR)}`. "
-            f"Last refreshed: {grn_file_age_label()}."
+            f"Current fetch method: {source_label}. "
+            f"Saved copy: `{GRN_SHEET_SNAPSHOT_CSV.relative_to(APP_DIR)}`. "
+            f"Last copied: {snapshot_age_label(GRN_SHEET_SNAPSHOT_CSV)}."
         )
+    if source_label == "CSV export link":
+        st.info("No Google Sheets authorization is connected yet. Connect OAuth here to read the private GRN sheet.")
+        render_google_oauth_controls("grn_inwarding", expanded=True)
 
-    if not LIVE_GRN_CSV.exists():
-        st.warning("No live Superset GRN export exists yet for this new app.")
-        st.write("Press **Run live export now** after `config/grn_export.env` is configured on this machine.")
-        st.code("python scripts/scheduled_grn_export.py", language="bash")
+    if refresh_clicked:
+        try:
+            create_sheet_snapshot(sheet_url, GRN_SHEET_SNAPSHOT_CSV, GRN_SHEET_SNAPSHOT_META)
+            st.success("Created a fresh GRN sheet copy.")
+            st.rerun()
+        except Exception as exc:
+            st.error("Could not create the GRN sheet copy.")
+            show_google_sheet_access_help(exc)
+            return
+
+    raw = load_sheet_snapshot(GRN_SHEET_SNAPSHOT_CSV)
+    if raw.empty:
+        st.warning("No saved GRN sheet copy exists yet.")
+        st.write(
+            "Click **Create / update GRN copy** once. "
+            "After that, this page will keep showing that saved copy until you click the button again."
+        )
         return
 
-    raw_df = load_live_grn()
-    meta = load_live_grn_meta()
+    meta = load_snapshot_meta(GRN_SHEET_SNAPSHOT_META)
+    raw_df = raw_sheet_to_table(raw)
     grn_df = build_grn_display_frame(raw_df)
     if grn_df.empty:
-        st.warning("The live Superset GRN export exists, but it has no rows.")
+        st.warning("The saved GRN sheet copy exists, but it has no readable rows.")
         return
 
     grn_dates = parse_grn_dates(grn_df["Arrival Date"])
@@ -1751,40 +2663,47 @@ def render_inwarding() -> None:
     with filter_row_1[1]:
         end_date = st.date_input("End date", value=default_end, key="grn_end_date")
     with filter_row_1[2]:
-        plants = sorted(value for value in grn_df["Plant"].unique() if value)
-        selected_plants = st.multiselect("Plant", plants, default=[], key="grn_plants")
+        suppliers = sorted(value for value in grn_df["Supplier"].unique() if value)
+        selected_suppliers = st.multiselect("Supplier", suppliers, default=[], key="grn_suppliers")
     with filter_row_1[3]:
-        locations = sorted(value for value in grn_df["Storage Location"].unique() if value)
-        selected_locations = st.multiselect("Storage location", locations, default=[], key="grn_locations")
-
-    filter_row_2 = st.columns(3)
-    with filter_row_2[0]:
         part_query = st.text_input("Part No. contains", key="grn_part_query")
-    with filter_row_2[1]:
+
+    filter_row_2 = st.columns(4)
+    with filter_row_2[0]:
         po_query = st.text_input("PO Number contains", key="grn_po_query")
+    with filter_row_2[1]:
+        invoice_query = st.text_input("Invoice Number contains", key="grn_invoice_query")
     with filter_row_2[2]:
-        movement_types = sorted(value for value in grn_df["Movement Type"].unique() if value)
-        selected_movements = st.multiselect("Movement type", movement_types, default=[], key="grn_movements")
+        gate_entry_query = st.text_input("Gate Entry No. contains", key="grn_gate_entry_query")
+    with filter_row_2[3]:
+        unloading_statuses = sorted(value for value in raw_df.get("Unloading Status", pd.Series(dtype=str)).fillna("").astype(str).unique() if value)
+        selected_unloading = st.multiselect("Unloading status", unloading_statuses, default=[], key="grn_unloading_status")
 
     filtered = grn_df.copy()
     filtered_dates = parse_grn_dates(filtered["Arrival Date"])
     if not valid_dates.empty:
         filtered = filtered[(filtered_dates.dt.date >= start_date) & (filtered_dates.dt.date <= end_date)]
-    if selected_plants:
-        filtered = filtered[filtered["Plant"].isin(selected_plants)]
-    if selected_locations:
-        filtered = filtered[filtered["Storage Location"].isin(selected_locations)]
-    if selected_movements:
-        filtered = filtered[filtered["Movement Type"].isin(selected_movements)]
+    if selected_suppliers:
+        filtered = filtered[filtered["Supplier"].isin(selected_suppliers)]
     if part_query.strip():
         filtered = filtered[filtered["Part No."].str.contains(part_query.strip(), case=False, na=False)]
     if po_query.strip():
         filtered = filtered[filtered["PO Number"].str.contains(po_query.strip(), case=False, na=False)]
+    if invoice_query.strip():
+        filtered = filtered[filtered["Invoice Number"].str.contains(invoice_query.strip(), case=False, na=False)]
+    if gate_entry_query.strip():
+        filtered = filtered[filtered["Gate Entry No."].str.contains(gate_entry_query.strip(), case=False, na=False)]
+    if selected_unloading and "Unloading Status" in raw_df.columns:
+        status_by_row = raw_df["Unloading Status"].reset_index(drop=True)
+        filtered_row_numbers = pd.to_numeric(filtered["Source Row"], errors="coerce").fillna(0).astype(int) - 1
+        matching_rows = status_by_row.iloc[
+            [index for index in filtered_row_numbers.tolist() if 0 <= index < len(status_by_row)]
+        ].isin(selected_unloading)
+        filtered = filtered.loc[matching_rows.to_numpy()]
 
     received_total = numeric(filtered["Rcvd Qty"]).sum()
     unique_parts = filtered["Part No."].replace("", pd.NA).dropna().nunique()
     latest_visible = parse_grn_dates(filtered["Arrival Date"]).max()
-    exported_at = str(meta.get("exported_at_utc", "") or "").replace("T", " ").replace("+00:00", " UTC")
 
     metrics = st.columns(4)
     with metrics[0]:
@@ -1797,12 +2716,15 @@ def render_inwarding() -> None:
         latest_label = latest_visible.strftime("%Y-%m-%d") if pd.notna(latest_visible) else "not available"
         render_metric("Latest date", latest_label, "neutral")
 
-    if exported_at:
-        st.caption(f"Exported at: {exported_at}. Raw Superset rows in file: {len(raw_df):,}.")
-    else:
-        st.caption(f"Raw Superset rows in file: {len(raw_df):,}.")
+    copied_at = str(meta.get("copied_at", "") or "")
+    if copied_at:
+        st.caption(f"Saved Google Sheet copy created at: {copied_at}. Source rows copied: {meta.get('rows', 0):,}.")
+    st.caption("GRN received quantity is read from the sheet column `Receipt Qty`.")
 
-    st.subheader("Live GRN Inwarding Table")
+    render_grn_quality_agent(filtered)
+    st.divider()
+
+    st.subheader("GRN Inwarding Table")
     st.dataframe(
         filtered,
         use_container_width=True,
@@ -1812,7 +2734,215 @@ def render_inwarding() -> None:
     st.download_button(
         "Download filtered GRN CSV",
         filtered.to_csv(index=False),
-        file_name="live_superset_grn_filtered.csv",
+        file_name="google_sheet_grn_filtered.csv",
+        mime="text/csv",
+    )
+
+
+def render_outwarding_flagging_agent(combined: pd.DataFrame) -> None:
+    st.subheader("Production Change Flagging Agent")
+    st.write(
+        "This agent compares the current production/BOM outwarding calculation against a saved baseline, "
+        "then flags weekly production drops, extra part demand, and reduced outwarding demand."
+    )
+
+    baseline = load_outwarding_baseline()
+    controls = st.columns([1.7, 1, 1, 1])
+    with controls[0]:
+        owners = st.text_input(
+            "Alert owners",
+            value=OUTWARDING_OWNER_DEFAULT,
+            key="outwarding_alert_owners",
+        )
+    with controls[1]:
+        reduction_pct_threshold = st.number_input(
+            "Production change %",
+            min_value=1.0,
+            max_value=100.0,
+            value=10.0,
+            step=1.0,
+            key="outwarding_alert_pct",
+            help="Minimum weekly production percentage change before an alert is raised.",
+        )
+    with controls[2]:
+        vehicle_delta_threshold = st.number_input(
+            "Vehicle delta",
+            min_value=1,
+            value=50,
+            step=10,
+            key="outwarding_alert_vehicle_delta",
+            help="Minimum weekly vehicle quantity change before an alert is raised.",
+        )
+    with controls[3]:
+        part_delta_threshold = st.number_input(
+            "Part qty delta",
+            min_value=1,
+            value=1000,
+            step=100,
+            key="outwarding_alert_part_delta",
+            help="Minimum weekly part outwarding quantity change before a part alert is raised.",
+        )
+
+    action_cols = st.columns([1.4, 4.6])
+    with action_cols[0]:
+        if st.button("Save current plan as baseline", type="primary"):
+            save_outwarding_baseline(combined)
+            st.success("Saved current outwarding plan as the comparison baseline.")
+            st.rerun()
+    with action_cols[1]:
+        if baseline.empty:
+            st.caption("No baseline saved yet. Save the current plan once; later refreshes will be compared against it.")
+        else:
+            st.caption(
+                f"Baseline: `{OUTWARDING_BASELINE_PATH.relative_to(APP_DIR)}`. "
+                f"Last saved: {snapshot_age_label(OUTWARDING_BASELINE_PATH)}."
+            )
+
+    if baseline.empty:
+        st.info(
+            "The agent needs one baseline before it can flag changes. "
+            "Click **Save current plan as baseline** after you trust the current production/BOM calculation."
+        )
+        return
+
+    alerts = build_outwarding_agent_alerts(
+        current_usage=combined,
+        baseline_usage=baseline,
+        owners=owners,
+        reduction_pct_threshold=float(reduction_pct_threshold),
+        vehicle_delta_threshold=float(vehicle_delta_threshold),
+        part_delta_threshold=float(part_delta_threshold),
+    )
+    log = load_outwarding_alert_log()
+    metric_cols = st.columns(4)
+    with metric_cols[0]:
+        render_metric("Active alerts", f"{len(alerts):,}", "warn" if not alerts.empty else "ok")
+    with metric_cols[1]:
+        critical_count = int(alerts["Severity"].eq("Critical").sum()) if not alerts.empty else 0
+        render_metric("Critical", f"{critical_count:,}", "bad" if critical_count else "ok")
+    with metric_cols[2]:
+        production_alerts = int(alerts["Agent"].str.contains("Production", case=False, na=False).sum()) if not alerts.empty else 0
+        render_metric("Production flags", f"{production_alerts:,}", "warn" if production_alerts else "ok")
+    with metric_cols[3]:
+        render_metric("Logged alerts", f"{len(log):,}", "neutral")
+
+    if alerts.empty:
+        st.success("No production or part outwarding changes crossed the selected thresholds.")
+    else:
+        st.warning(
+            f"{len(alerts):,} active alert(s) found for {owners}. "
+            "Review before releasing supplier calls or line-feed quantities."
+        )
+        st.dataframe(
+            alerts.head(250),
+            use_container_width=True,
+            hide_index=True,
+            height=420,
+            column_config={
+                "Baseline Qty": st.column_config.NumberColumn(format="%.0f"),
+                "Current Qty": st.column_config.NumberColumn(format="%.0f"),
+                "Delta Qty": st.column_config.NumberColumn(format="%.0f"),
+                "Delta %": st.column_config.NumberColumn(format="%.1f%%"),
+            },
+        )
+        log_cols = st.columns([1.3, 4.7])
+        with log_cols[0]:
+            if st.button("Log current alerts for owners", type="primary"):
+                updated_log = append_outwarding_alert_log(alerts)
+                st.success(f"Logged {len(alerts):,} alert(s). Alert log now has {len(updated_log):,} unique alert(s).")
+                st.rerun()
+        with log_cols[1]:
+            st.download_button(
+                "Download active alerts CSV",
+                alerts.to_csv(index=False),
+                file_name="outwarding_active_alerts.csv",
+                mime="text/csv",
+            )
+
+    latest_log = load_outwarding_alert_log()
+    if not latest_log.empty:
+        with st.expander("Owner alert log"):
+            st.dataframe(
+                latest_log.sort_values("Logged At", ascending=False).head(200),
+                use_container_width=True,
+                hide_index=True,
+                height=320,
+            )
+            st.download_button(
+                "Download alert log CSV",
+                latest_log.to_csv(index=False),
+                file_name="outwarding_alert_log.csv",
+                mime="text/csv",
+            )
+
+
+def render_inbound_coverage_agent(combined: pd.DataFrame) -> None:
+    st.subheader("Inbound Coverage Agent")
+    st.write(
+        "Compares weekly outwarding from production/BOM against the saved GRN sheet copy. "
+        "This is a supply-coverage warning, not a final closing-stock calculation."
+    )
+    grn_df = load_grn_sheet_display_snapshot()
+    if grn_df.empty:
+        st.info("No saved GRN copy is available yet. Open Inwarding Parts and press Create / update GRN copy.")
+        return
+
+    controls = st.columns([1.2, 4.8])
+    with controls[0]:
+        minimum_gap_qty = st.number_input(
+            "Minimum gap qty",
+            min_value=1,
+            value=100,
+            step=50,
+            key="inbound_coverage_min_gap",
+            help="Only show part-week rows where outwarding exceeds same-week GRN by at least this quantity, or where no GRN exists.",
+        )
+    with controls[1]:
+        st.caption(
+            f"GRN source: `{GRN_SHEET_SNAPSHOT_CSV.relative_to(APP_DIR)}`. "
+            f"Last copied: {snapshot_age_label(GRN_SHEET_SNAPSHOT_CSV)}."
+        )
+
+    alerts = build_inbound_coverage_alerts(
+        current_usage=combined,
+        grn_df=grn_df,
+        minimum_gap_qty=float(minimum_gap_qty),
+    )
+    critical_count = int(alerts["Severity"].eq("Critical").sum()) if not alerts.empty else 0
+    gap_total = numeric(alerts["Gap Qty"]).clip(lower=0).sum() if not alerts.empty else 0
+    parts_count = alerts["Part No."].nunique() if not alerts.empty else 0
+
+    cols = st.columns(4)
+    with cols[0]:
+        render_metric("Coverage alerts", f"{len(alerts):,}", "warn" if not alerts.empty else "ok")
+    with cols[1]:
+        render_metric("Critical", f"{critical_count:,}", "bad" if critical_count else "ok")
+    with cols[2]:
+        render_metric("Parts affected", f"{parts_count:,}", "warn" if parts_count else "ok")
+    with cols[3]:
+        render_metric("Open gap qty", f"{gap_total:,.0f}", "bad" if gap_total else "ok")
+
+    if alerts.empty:
+        st.success("No same-week inwarding coverage gaps crossed the selected threshold.")
+        return
+
+    st.dataframe(
+        alerts.head(AGENT_TABLE_LIMIT),
+        use_container_width=True,
+        hide_index=True,
+        height=380,
+        column_config={
+            "Outwarding Qty": st.column_config.NumberColumn(format="%.0f"),
+            "GRN Received Qty": st.column_config.NumberColumn(format="%.0f"),
+            "Gap Qty": st.column_config.NumberColumn(format="%.0f"),
+        },
+    )
+    if len(alerts) > AGENT_TABLE_LIMIT:
+        st.caption(f"Showing first {AGENT_TABLE_LIMIT:,} alerts out of {len(alerts):,}.")
+    st.download_button(
+        "Download inbound coverage alerts CSV",
+        alerts.to_csv(index=False),
+        file_name="inbound_coverage_alerts.csv",
         mime="text/csv",
     )
 
@@ -1824,29 +2954,12 @@ def render_outwarding_sources(manual_outwarding: pd.DataFrame) -> None:
         "The result is multiplied by the exploded BOM and grouped by part number."
     )
 
-    settings = google_oauth_settings()
-    credentials = None
-    if settings is None:
-        st.warning("Google OAuth is not configured yet.")
-        st.code(
-            '[google_oauth]\n'
-            'client_id = "YOUR_CLIENT_ID"\n'
-            'client_secret = "YOUR_CLIENT_SECRET"\n'
-            'redirect_uri = "http://localhost:8501/"',
-            language="toml",
-        )
+    credentials = load_google_credentials()
+    if credentials is None:
+        st.info("Connect Google Sheets OAuth here to refresh private production and BOM sheets.")
+        credentials = render_google_oauth_controls("outwarding", expanded=True)
     else:
-        credentials = load_google_credentials()
-        if credentials is None:
-            authorization_url = begin_google_oauth(settings)
-            st.link_button(
-                "Connect Google account",
-                authorization_url,
-                type="primary",
-            )
-            st.caption("Use an account that has Viewer access to both source sheets.")
-        else:
-            st.success("Google connected with read-only Sheets access.")
+        st.success("Google connected with read-only Sheets access.")
 
     refresh_clicked = st.button(
         "Refresh calculation from Google Sheets",
@@ -1931,6 +3044,11 @@ def render_outwarding_sources(manual_outwarding: pd.DataFrame) -> None:
             f"{latest_production_total:,.0f}",
             "ok",
         )
+
+    render_outwarding_flagging_agent(combined)
+    st.divider()
+    render_inbound_coverage_agent(combined)
+    st.divider()
 
     filtered = combined.copy()
     min_date = filtered["Usage Date"].min().date()
@@ -2074,60 +3192,24 @@ def render_agentic_flow() -> None:
     st.header("Agentic Flow")
     st.write("Simple operating logic for the inventory agent.")
     steps = [
-        ("1. Capture inwarding", "Record supplier receipts, arrival date/time, PO, plant, and storage location."),
-        ("2. Capture outwarding", "Record production usage, servicing usage, and other material movement."),
-        ("3. Update stock", "Maintain opening, system, physical, and closing stock by part."),
-        ("4. Flag risk", "Mark parts below required quantity or with missing requirement/stock data."),
-        ("5. Follow up", "Buyer uses the flagged list to follow up with the supplier or SCM owner."),
+        ("1. Capture inwarding", "Create a saved GRN sheet copy and read supplier receipts, quantity, PO, plant, and arrival time."),
+        ("2. Validate GRN", "GRN Data Quality Agent flags missing part numbers, bad quantities, missing dates, discrepancies, and duplicate receipt lines."),
+        ("3. Capture outwarding", "Read production and BOM sheets, then calculate part usage from vehicle production plus servicing/manual issues."),
+        ("4. Detect plan change", "Production Change Flagging Agent compares current outwarding against the saved baseline and alerts Akshat/Abhiraj."),
+        ("5. Check coverage", "Inbound Coverage Agent compares weekly outwarding against same-week GRN receipts to find supply pressure."),
+        ("6. Assign ownership", "Supplier Ownership Agent maps risky parts to buyer and supplier owners from the SPOC Summary copy."),
+        ("7. Follow up", "Buyer uses the flagged list to follow up with the supplier or SCM owner before stock becomes a line issue."),
     ]
     for title, text in steps:
         st.markdown(f"<div class='flow-step'><b>{title}</b><br>{text}</div>", unsafe_allow_html=True)
 
 
-def render_setup() -> None:
-    st.header("Setup")
-    st.write("This starter app stores manual tables as CSV files and reads live GRN inwarding through the Superset export.")
-
-    st.subheader("Google Sheets API")
-    saved_email = load_saved_service_account_email()
-    if saved_email:
-        st.success(f"Google API key is configured. Share the Google Sheet with: {saved_email}")
-    else:
-        st.warning("Google API key is not configured yet.")
-
-    uploaded_key = st.file_uploader(
-        "Upload Google service-account JSON",
-        type=["json"],
-        help="Download this from Google Cloud. The file stays local and is not committed to GitHub.",
-    )
-    if uploaded_key and st.button("Save Google API key", type="primary"):
-        ok, message = save_uploaded_service_account(uploaded_key)
-        if ok:
-            st.success(f"Saved Google API key. Now share the Google Sheet with this Viewer email: {message}")
-            st.rerun()
-        else:
-            st.error(message)
-
-    st.markdown(
-        """
-        For two people working together:
-
-        - Code changes should happen through GitHub branches.
-        - App usage can happen through one shared Streamlit URL.
-        - Use the Live Google Sheet page when you want to create a saved copy of a Google Sheet for the app.
-        - Use Supplier Buyer Map to create a saved SPOC Summary copy and build buyer-supplier ownership cards.
-        - The app keeps showing the previous saved copy until you click the copy/update button again.
-        - For private Google Sheets, copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml`, paste the service-account JSON values, and share the sheet with that service-account email.
-        - Use the Inwarding Parts page for live Superset GRN data.
-        - Configure `config/grn_export.env` locally; do not commit that file.
-        - The live GRN CSV is generated at `data/live/grn_live.csv` in this new app only.
-        - For private production data, move from public CSV export to a proper Google service account or database.
-        """
-    )
-
-
 oauth_callback_settings = google_oauth_settings()
-if oauth_callback_settings is not None and st.query_params.get("code"):
+if st.query_params.get("code"):
+    if oauth_callback_settings is None:
+        st.error("Google returned an authorization code, but OAuth settings are not configured.")
+        st.query_params.clear()
+        st.stop()
     if complete_google_oauth(oauth_callback_settings):
         st.session_state["google_oauth_connected_notice"] = True
         st.rerun()
@@ -2248,7 +3330,6 @@ with st.sidebar:
             "Inwarding Parts",
             "Outwarding Parts",
             "Agentic Flow",
-            "Setup",
         ],
         label_visibility="collapsed",
     )
@@ -2268,5 +3349,3 @@ elif page == "Outwarding Parts":
     render_outwarding()
 elif page == "Agentic Flow":
     render_agentic_flow()
-else:
-    render_setup()

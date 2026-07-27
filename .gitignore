@@ -5,6 +5,7 @@ __pycache__/
 .streamlit/secrets.toml
 .streamlit/google_oauth_token.json
 .streamlit/google_oauth_state.txt
+.streamlit/google_oauth.json
 .streamlit/google_service_account.json
 data/google_sheet_link.txt
 data/daily_production_source.csv
@@ -17,6 +18,8 @@ data/raw_bom.csv
 data/part_type_mapping.csv
 data/part_supplier_mapping.csv
 data/computed_part_usage.csv
+data/outwarding_plan_baseline.csv
+data/outwarding_alert_log.csv
 data/*.tmp
 config/grn_export.env
 config/*.env

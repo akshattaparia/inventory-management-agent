@@ -7,11 +7,15 @@ Clean Streamlit starter app for collaborative inventory work.
 - Part Inventory editable table
 - Supplier Buyer Map from a saved SPOC Summary sheet copy
 - Saved Google Sheet copy viewer
-- Inwarding Parts live Superset GRN viewer
+- Inwarding Parts GRN viewer from the live gate-entry Google Sheet
 - Outwarding Parts production/BOM consumption calculator and editable servicing table
+- GRN Data Quality Agent for missing receipt fields, quantity issues, discrepancies, and duplicate GRN lines
+- Production Change Flagging Agent for outwarding-plan fluctuations and owner alert logs
+- Inbound Coverage Agent comparing weekly outwarding demand against saved GRN receipts
+- Supplier Ownership Agent mapping risky supplier/part pockets to buyer follow-up owners
 - Basic stock risk flags
 - CSV-backed storage in `data/`
-- Local Superset/Trino GRN exporter in `scripts/scheduled_grn_export.py`
+- Local Superset/Trino exporter files kept for backend reference, not used by the app UI
 
 ## Run locally
 
@@ -24,55 +28,81 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Live Superset GRN inwarding
-
-The **Inwarding Parts** page reads only this new app's live GRN export:
+The app opens at:
 
 ```text
-data/live/grn_live.csv
+http://localhost:8501
 ```
 
-It does not read the previous app and it does not fall back to sample data.
+## Google Sheets OAuth authorization
 
-To configure it on your machine:
+Use this when the app needs to read private Google Sheets directly from your
+Google account. This is not an app login; it is only read-only authorization for
+Google Sheets data.
 
-```bash
-cp config/grn_export.env.example config/grn_export.env
-```
+First-time setup:
 
-Then fill `config/grn_export.env` with the Superset/Trino access details. Keep this file private; it is ignored by Git.
-
-To refresh once from the terminal:
-
-```bash
-python scripts/scheduled_grn_export.py
-```
-
-You can also press **Run live export now** inside the **Inwarding Parts** page.
-
-The exporter writes:
+1. Create a Google OAuth web client in Google Cloud.
+2. Add this authorized redirect URI:
 
 ```text
-data/live/grn_live.csv
-data/live/grn_live.json
+http://localhost:8501/
 ```
 
-Those generated files are also ignored by Git. Each laptop/server should generate its own current live file from Superset.
+If you run Streamlit on another port, use that exact URL instead.
 
-## Live Google Sheets API
+3. Start the app.
+4. Open **Supplier Buyer Map**, **Live Google Sheet**, or **Outwarding Parts**.
+5. Open the **Google Sheets authorization** panel.
+6. Paste the OAuth **Client ID** and **Client Secret**.
+7. Click **Save Google OAuth settings**.
+8. Click **Connect Google account for Sheets**.
 
-The app can create a saved copy of your SPOC / SCM Google Sheet through the Google Sheets API. This is better than public CSV export because the sheet can stay private.
+The app saves the OAuth client config locally at:
 
-Setup on the machine running Streamlit:
+```text
+.streamlit/google_oauth.json
+```
 
-Simple app setup:
+That file is ignored by Git and should not be pushed to GitHub.
 
-1. Open **Setup** in the app.
-2. Upload the Google service-account JSON.
-3. Press **Save Google API key**.
-4. Share the Google Sheet with the displayed `client_email` as **Viewer**.
+## Google Sheet GRN inwarding
 
-Manual file setup:
+The **Inwarding Parts** page reads GRN from this Google Sheet:
+
+```text
+https://docs.google.com/spreadsheets/d/1V3ic-5Dfcz0PoX-0Z0gXdIrFIIOB_lSh-gM20RzLUKs/edit?gid=2111379627#gid=2111379627
+```
+
+The app treats the sheet column `Receipt Qty` as GRN received quantity.
+
+Open **Inwarding Parts** and press:
+
+```text
+Create / update GRN copy
+```
+
+The app saves the current sheet copy into:
+
+```text
+data/live/grn_sheet_snapshot.csv
+```
+
+The website keeps showing this saved copy until you press **Create / update GRN copy** again. Superset GRN files may remain locally for backend checks, but the app UI does not use Superset GRN data.
+
+## Live Google Sheets
+
+The app can create a saved copy of your SPOC / SCM Google Sheet through Google authorization. This is better than public CSV export because the sheet can stay private.
+
+Recommended OAuth setup on the machine running Streamlit:
+
+1. Open **Supplier Buyer Map**, **Live Google Sheet**, or **Outwarding Parts**.
+2. Open the **Google Sheets authorization** panel.
+3. Save the Google OAuth Client ID and Client Secret.
+4. Click **Connect Google account for Sheets**.
+5. Sign in with a Google account that has Viewer access to the sheet.
+
+Optional service-account file setup:
 
 ```bash
 cp .streamlit/secrets.toml.example .streamlit/secrets.toml
@@ -102,14 +132,13 @@ The **Live Google Sheet** page works the same way. Press **Create / update sheet
 data/live/google_sheet_snapshot.csv
 ```
 
-If API credentials are not configured, the app can only use the fallback CSV export link. For that fallback, the sheet must be shared as **Anyone with the link can view**.
+If neither OAuth nor service-account credentials are configured, the app can only use the fallback CSV export link. For that fallback, the sheet must be shared as **Anyone with the link can view**.
 
 ## Production and BOM calculation
 
-The **Outwarding Parts** page can connect to the private production and BOM
-Google Sheets using read-only user OAuth. Add the `[google_oauth]` values from
-`.streamlit/secrets.toml.example`, configure `http://localhost:8501/` as the
-OAuth client redirect URI, and sign in with an account that can view both sheets.
+The **Outwarding Parts** page uses the same Google OAuth token with read-only
+Sheets access. Connect a Google account that can view both the production sheet
+and BOM sheet.
 
 The calculation uses:
 
@@ -118,7 +147,41 @@ daily production = P-VIN actual + VNA actual + Free VIN actual
 part usage = daily FG production × exploded BOM quantity
 ```
 
+The **Production Change Flagging Agent** compares the current outwarding
+calculation against a saved baseline. It flags:
+
+- weekly production increases or reductions,
+- part-level outwarding quantity changes from the BOM explosion,
+- new or removed part demand.
+
+Use **Save current plan as baseline** once when the current plan is trusted.
+After later refreshes, the agent shows active alerts for Akshat/Abhiraj and can
+write them to:
+
+```text
+data/outwarding_alert_log.csv
+```
+
+The comparison baseline is stored locally at:
+
+```text
+data/outwarding_plan_baseline.csv
+```
+
+The **Inbound Coverage Agent** then compares weekly outwarding quantity against
+the saved GRN sheet copy. It flags parts where same-week GRN receipt visibility
+does not cover the outwarding requirement. This is a warning signal only; final
+stock should still consider opening stock, physical stock, and approved
+adjustments.
+
 OAuth tokens and downloaded source caches remain local and are ignored by Git.
+
+## Agent summary
+
+- **GRN Data Quality Agent**: checks saved GRN rows before they affect stock.
+- **Production Change Flagging Agent**: compares the current outwarding plan to a saved baseline.
+- **Inbound Coverage Agent**: checks whether inwarding visibility covers outwarding pressure.
+- **Supplier Ownership Agent**: turns risky supplier/part groups into buyer follow-up rows.
 
 ## Let another person open your running app
 
@@ -159,8 +222,8 @@ The **Live Google Sheet** page reads this sheet by default:
 https://docs.google.com/spreadsheets/d/1V3ic-5Dfcz0PoX-0Z0gXdIrFIIOB_lSh-gM20RzLUKs/edit?gid=2111379627#gid=2111379627
 ```
 
-For the API method, share the sheet with the service-account email. For the fallback CSV method, the Google Sheet must be shared as **Anyone with the link can view** or published to the web. After someone edits the sheet, press the copy/update button to pull a new snapshot into the app.
+For the OAuth method, connect a Google account that can view the sheet. For the service-account method, share the sheet with the service-account email. For the fallback CSV method, the Google Sheet must be shared as **Anyone with the link can view** or published to the web. After someone edits the sheet, press the copy/update button to pull a new snapshot into the app.
 
-The **Inwarding Parts** page is different: it reads current GRN rows from the live Superset export. If Abhiraj runs the app locally, he must create his own local `config/grn_export.env`. If only one shared server runs the app, configure Superset once on that server.
+The **Inwarding Parts** page uses the same Google Sheet as the GRN source. Connect Google Sheets OAuth, then press **Create / update GRN copy** whenever you want to pull the latest sheet values into the app.
 
 For real two-person live data entry with private data, move the tables to authenticated Google Sheets access or a database so both users always see the same source of truth safely.
