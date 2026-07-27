@@ -161,6 +161,7 @@ TABLES = {
             "Opening Stock",
             "System Stock",
             "Physical Stock",
+            "SCM Stock Match",
             "Stock Data Status",
             "Closing Stock",
             "Status",
@@ -270,6 +271,11 @@ def stock_part_key(value: object) -> str:
     if re.fullmatch(r"\d+\.0", text):
         text = text[:-2]
     return text.upper()
+
+
+def scm_base_part_key(value: object) -> str:
+    """Remove one trailing revision/suffix solely for mismatch diagnostics."""
+    return re.sub(r"(?:/[A-Z0-9]+|_[A-Z0-9]+)$", "", stock_part_key(value))
 
 
 def display_qty(value: object) -> str:
@@ -1692,7 +1698,7 @@ def parse_scm_system_stock(
     df: pd.DataFrame,
 ) -> tuple[pd.DataFrame, str]:
     """Read part-level System Opening Stock from SCM Plan Working Revision 1."""
-    columns = ["Part Key", "SCM System Stock"]
+    columns = ["Part Key", "SCM System Stock", "SCM Stock Match"]
     if df.empty:
         return pd.DataFrame(columns=columns), ""
     rows = df.astype(str).to_numpy().tolist()
@@ -1729,11 +1735,22 @@ def parse_scm_system_stock(
             str(stock_value).replace(",", ""),
             errors="coerce",
         )
-        if part_no and pd.notna(stock):
+        if part_no:
+            raw_stock = clean_text(stock_value)
+            if pd.notna(stock):
+                match_status = "Exact SCM match"
+                parsed_stock: object = float(stock)
+            elif not raw_stock:
+                match_status = "System Opening Stock blank"
+                parsed_stock = pd.NA
+            else:
+                match_status = f"Invalid System Opening Stock: {raw_stock}"
+                parsed_stock = pd.NA
             records.append(
                 {
                     "Part Key": stock_part_key(part_no),
-                    "SCM System Stock": float(stock),
+                    "SCM System Stock": parsed_stock,
+                    "SCM Stock Match": match_status,
                 }
             )
     if not records:
@@ -1819,18 +1836,46 @@ def build_part_inventory_plan(
         sources.get("scm_stock_summary", pd.DataFrame())
     )
     if not scm_stock.empty:
-        scm_lookup = scm_stock.set_index("Part Key")["SCM System Stock"]
-        mapped_scm_stock = result["Part Key"].map(scm_lookup)
+        scm_index = scm_stock.set_index("Part Key")
+        mapped_scm_stock = result["Part Key"].map(
+            scm_index["SCM System Stock"]
+        )
+        result["SCM Stock Match"] = result["Part Key"].map(
+            scm_index["SCM Stock Match"]
+        ).fillna("")
+        no_exact_match = result["SCM Stock Match"].eq("")
+        scm_base_keys = set(scm_stock["Part Key"].map(scm_base_part_key))
+        result_base_keys = result["Part Key"].map(scm_base_part_key)
+        possible_revision_match = (
+            no_exact_match
+            & result_base_keys.ne(result["Part Key"])
+            & result_base_keys.isin(scm_base_keys)
+        )
+        result.loc[
+            possible_revision_match,
+            "SCM Stock Match",
+        ] = "Possible revision mismatch — base part exists in SCM"
+        result.loc[
+            no_exact_match & ~possible_revision_match,
+            "SCM Stock Match",
+        ] = "Part not found in SCM Summary"
         scm_mapped = mapped_scm_stock.notna()
         result.loc[scm_mapped, "System Stock"] = mapped_scm_stock.loc[scm_mapped]
         result.loc[scm_mapped, "Physical Stock"] = mapped_scm_stock.loc[scm_mapped]
         diagnostics["scm_stock_rows_mapped"] = int(scm_mapped.sum())
         diagnostics["scm_stock_rows_total"] = len(result)
         diagnostics["scm_stock_label"] = scm_stock_label
+        diagnostics["scm_stock_match_counts"] = (
+            result["SCM Stock Match"].value_counts().to_dict()
+        )
     else:
+        result["SCM Stock Match"] = "SCM Summary snapshot unavailable"
         diagnostics["scm_stock_rows_mapped"] = 0
         diagnostics["scm_stock_rows_total"] = len(result)
         diagnostics["scm_stock_label"] = ""
+        diagnostics["scm_stock_match_counts"] = {
+            "SCM Summary snapshot unavailable": len(result)
+        }
 
     buyer_mapping = clean_buyer_mapping_source(
         load_source_cache(BUYER_MAPPING_CACHE_PATH)
@@ -2019,9 +2064,37 @@ def build_rm_planning_views(
         base["Part No."].map(lambda value: part_variants.get(stock_part_key(value), ""))
     )
     missing_stock = base[~base["Stock Known"]].copy()
-    missing_stock["Data Issue"] = "Physical Stock not entered"
-    missing_stock["Recommended Data Action"] = (
-        "Enter the current physical count in Part Inventory, then save stock values."
+    match_reason = missing_stock.get(
+        "SCM Stock Match",
+        pd.Series("", index=missing_stock.index),
+    ).fillna("").astype(str)
+    missing_stock["Data Issue"] = match_reason.where(
+        match_reason.ne(""),
+        "Physical Stock not entered",
+    )
+
+    def stock_data_action(reason: object) -> str:
+        text = clean_text(reason)
+        if text.startswith("Possible revision mismatch"):
+            return (
+                "Verify the exact revision against the SCM base material. "
+                "Base-part stock is not used automatically."
+            )
+        if text == "Part not found in SCM Summary":
+            return (
+                "Add the part and System Opening Stock to SCM Summary, or correct "
+                "the BOM/master-data part number."
+            )
+        if text == "System Opening Stock blank":
+            return "Populate System Opening Stock for this part in SCM Summary."
+        if text.startswith("Invalid System Opening Stock"):
+            return "Correct the System Opening Stock value in SCM Summary."
+        return (
+            "Enter the current physical count in Part Inventory, then save stock values."
+        )
+
+    missing_stock["Recommended Data Action"] = missing_stock["Data Issue"].map(
+        stock_data_action
     )
 
     def build_horizon(
@@ -2623,8 +2696,22 @@ def render_rm_planning_agent() -> None:
     if missing_stock_count:
         st.warning(
             f"{missing_stock_count:,} parts are excluded from shortage alerts because "
-            "Physical Stock has not been entered. They appear in the Missing stock queue."
+            "verified stock is unavailable. They are separated by root cause in the "
+            "stock-data queues."
         )
+        missing_reasons = (
+            meta.get("missing_stock", pd.DataFrame())
+            .get("Data Issue", pd.Series(dtype=str))
+            .value_counts()
+        )
+        if not missing_reasons.empty:
+            st.caption(
+                "Stock-data flags: "
+                + " · ".join(
+                    f"{reason}: {count:,}"
+                    for reason, count in missing_reasons.items()
+                )
+            )
     scm_mapped = int(inventory_diagnostics.get("scm_stock_rows_mapped", 0))
     if scm_mapped:
         st.success(
@@ -2684,6 +2771,24 @@ def render_rm_planning_agent() -> None:
     )
     horizon_frame = views[horizon_name].copy()
     missing_stock = meta.get("missing_stock", pd.DataFrame()).copy()
+    possible_revision = missing_stock[
+        missing_stock.get("Data Issue", pd.Series("", index=missing_stock.index))
+        .astype(str)
+        .str.startswith("Possible revision mismatch")
+    ]
+    absent_from_scm = missing_stock[
+        missing_stock.get("Data Issue", pd.Series("", index=missing_stock.index))
+        .astype(str)
+        .eq("Part not found in SCM Summary")
+    ]
+    invalid_or_blank_stock = missing_stock[
+        missing_stock.get("Data Issue", pd.Series("", index=missing_stock.index))
+        .astype(str)
+        .str.contains(
+            r"System Opening Stock blank|Invalid System Opening Stock",
+            regex=True,
+        )
+    ]
     followup_due_mask = pd.to_datetime(
         horizon_frame.get("Next Follow-up", pd.Series(dtype=str)),
         errors="coerce",
@@ -2697,7 +2802,10 @@ def render_rm_planning_agent() -> None:
         "Supplier delayed": horizon_frame[
             horizon_frame["Supplier Status"].eq("Delayed")
         ],
-        "Missing stock": missing_stock,
+        "All stock-data gaps": missing_stock,
+        "Possible revision mismatch": possible_revision,
+        "Not found in SCM Summary": absent_from_scm,
+        "Blank / invalid SCM stock": invalid_or_blank_stock,
     }
     queue_labels = {
         name: f"{name} ({len(frame):,})"
@@ -2708,7 +2816,7 @@ def render_rm_planning_agent() -> None:
         list(queue_frames),
         format_func=lambda value: queue_labels[value],
         index=(
-            list(queue_frames).index("Missing stock")
+            list(queue_frames).index("All stock-data gaps")
             if horizon_frame.empty and not missing_stock.empty
             else 0
         ),
@@ -2717,7 +2825,8 @@ def render_rm_planning_agent() -> None:
     )
     queue = queue_frames[queue_name].copy()
 
-    if queue_name != "Missing stock":
+    is_stock_data_queue = "Data Issue" in queue.columns
+    if not is_stock_data_queue:
         st.markdown(rm_owner_cards_html(queue), unsafe_allow_html=True)
 
     buyers = sorted(
@@ -2797,7 +2906,7 @@ def render_rm_planning_agent() -> None:
     start = (int(page_number) - 1) * page_size
     page_frame = filtered.iloc[start : start + page_size].reset_index(drop=True)
 
-    if queue_name == "Missing stock":
+    if is_stock_data_queue:
         compact = page_frame[
             ["Buyer", "Supplier", "Part No.", "Part Name", "Data Issue"]
         ].copy()
@@ -2848,16 +2957,19 @@ def render_rm_planning_agent() -> None:
         f"{escape(clean_text(selected['Part Name']) or 'Part name unavailable')}"
     )
 
-    if queue_name == "Missing stock":
+    if is_stock_data_queue:
         info_columns = st.columns([2, 1])
         with info_columns[0]:
             st.warning(
-                "No shortage decision is made for this part until its current Physical "
-                "Stock is entered. This prevents missing data from becoming a false Critical alert."
+                "No shortage decision is made for this part until its stock mapping "
+                "is verified. This prevents missing data from becoming a false Critical alert."
             )
             st.write(
                 f"**Supplier:** {clean_text(selected['Supplier']) or 'Unmapped'}  \n"
                 f"**Buyer:** {clean_text(selected['Buyer']) or 'Unmapped'}  \n"
+                f"**Why unmatched:** {clean_text(selected['Data Issue'])}  \n"
+                f"**Recommended action:** "
+                f"{clean_text(selected['Recommended Data Action'])}  \n"
                 f"**Remaining part need today:** "
                 f"{display_qty(selected['Remaining Part Need'])}"
             )
@@ -5413,6 +5525,13 @@ def render_documentation() -> None:
         - The **exploded BOM** converts every FG into component quantities.
         - If today's colour mix is not populated yet, the app uses the most recent saved non-zero colour mix for that model and clearly states the fallback date above the table.
         - Whole-vehicle allocation is used, so a normalized plan never creates a fractional vehicle.
+        - SCM stock is joined only on an **exact part number**. The app never silently
+          assigns a base part's stock to a revision-coded BOM part.
+        - Unmatched stock is separated into **Possible revision mismatch** when a
+          suffix such as `/B` or `_002` differs but the base part exists, and
+          **Not found in SCM Summary** when no base candidate exists.
+        - Both groups are excluded from shortage alerts until the stock mapping is
+          verified, preventing missing master data from becoming a false line-risk alert.
         """
     )
 
