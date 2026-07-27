@@ -2563,16 +2563,13 @@ def rm_owner_cards_html(frame: pd.DataFrame, limit: int = 8) -> str:
     for _, row in summary.head(limit).iterrows():
         tone = "critical" if int(row["Critical"]) else "attention"
         cards.append(
-            f"""
-            <div class="rm-owner-card {tone}">
-                <div class="rm-owner-name">{escape(str(row['Buyer']))}</div>
-                <div class="rm-owner-grid">
-                    <div><b>{int(row['Issues']):,}</b><span>parts</span></div>
-                    <div><b>{int(row['Critical']):,}</b><span>critical</span></div>
-                    <div><b>{int(row['Suppliers']):,}</b><span>suppliers</span></div>
-                </div>
-            </div>
-            """
+            f'<div class="rm-owner-card {tone}">'
+            f'<div class="rm-owner-name">{escape(str(row["Buyer"]))}</div>'
+            '<div class="rm-owner-grid">'
+            f'<div><b>{int(row["Issues"]):,}</b><span>parts</span></div>'
+            f'<div><b>{int(row["Critical"]):,}</b><span>critical</span></div>'
+            f'<div><b>{int(row["Suppliers"]):,}</b><span>suppliers</span></div>'
+            "</div></div>"
         )
     return f"<div class='rm-owner-cards'>{''.join(cards)}</div>"
 
