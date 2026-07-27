@@ -6005,8 +6005,7 @@ with st.sidebar:
     page = st.radio(
         "Navigation",
         [
-            "Part Inventory",
-            "RM Planning Agent",
+            "Inventory Management",
             "Supplier Buyer Map",
             "Inwarding Parts",
             "Outwarding Parts",
@@ -6019,9 +6018,9 @@ with st.sidebar:
 
 st.title(APP_TITLE)
 
-if page == "Part Inventory":
+if page == "Inventory Management":
     render_part_inventory()
-elif page == "RM Planning Agent":
+    st.divider()
     render_rm_planning_agent()
 elif page == "Supplier Buyer Map":
     render_supplier_buyer_map()
