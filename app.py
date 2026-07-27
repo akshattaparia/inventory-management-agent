@@ -156,6 +156,7 @@ TABLES = {
             "Opening Stock",
             "System Stock",
             "Physical Stock",
+            "Stock Data Status",
             "Closing Stock",
             "Status",
             "Remarks",
@@ -1767,7 +1768,12 @@ def build_part_inventory_plan(
     result["Buyer"] = result["Buyer"].replace("", "Unmapped buyer")
     result["Supplier"] = result["Supplier"].replace("", "Unmapped supplier")
 
-    physical = numeric(result["Physical Stock"])
+    physical_raw = result["Physical Stock"].fillna("").astype(str).str.strip()
+    physical_numeric = pd.to_numeric(physical_raw, errors="coerce")
+    stock_available = physical_raw.ne("") & physical_numeric.notna()
+    physical = physical_numeric.fillna(0)
+    result["Stock Data Status"] = "Available"
+    result.loc[~stock_available, "Stock Data Status"] = "Missing"
     result["Required Qty"] = (
         result["Remaining Part Need"] - physical
     ).clip(lower=0).apply(lambda value: int(-(-value // 1)))
@@ -1778,6 +1784,9 @@ def build_part_inventory_plan(
     result["Status"] = "Healthy"
     result.loc[result["Required Qty"].gt(0), "Status"] = "Below required"
     result.loc[result["Required Qty"].gt(0) & physical.le(0), "Status"] = "Critical"
+    result.loc[~stock_available, "Required Qty"] = pd.NA
+    result.loc[~stock_available, "Closing Stock"] = pd.NA
+    result.loc[~stock_available, "Status"] = "Stock data missing"
 
     diagnostics["missing_plan_bom_fgs"] = missing_plan_fgs
     diagnostics["missing_actual_bom_fgs"] = missing_actual_fgs
@@ -1909,6 +1918,16 @@ def build_rm_planning_views(
     )
 
     base = inventory.copy()
+    physical_source = base["Physical Stock"].fillna("").astype(str).str.strip()
+    base["Stock Known"] = (
+        base.get("Stock Data Status", pd.Series("", index=base.index))
+        .astype(str)
+        .eq("Available")
+        | (
+            physical_source.ne("")
+            & pd.to_numeric(physical_source, errors="coerce").notna()
+        )
+    )
     base["Physical Stock"] = numeric(base["Physical Stock"])
     base["Remaining Part Need"] = numeric(base["Remaining Part Need"])
     base["Planned Part Consumption"] = numeric(base["Planned Part Consumption"])
@@ -1919,6 +1938,11 @@ def build_rm_planning_views(
     )
     base["Affected Variants"] = (
         base["Part No."].map(lambda value: part_variants.get(stock_part_key(value), ""))
+    )
+    missing_stock = base[~base["Stock Known"]].copy()
+    missing_stock["Data Issue"] = "Physical Stock not entered"
+    missing_stock["Recommended Data Action"] = (
+        "Enter the current physical count in Part Inventory, then save stock values."
     )
 
     def build_horizon(
@@ -1957,7 +1981,7 @@ def build_rm_planning_views(
         view.loc[days_to_shortage.eq(0), "Severity"] = "Critical"
         view.loc[days_to_shortage.between(1, 2), "Severity"] = "High"
         view.loc[days_to_shortage.ge(3), "Severity"] = "Medium"
-        view = view[view["RM Shortage"].gt(0)].copy()
+        view = view[view["Stock Known"] & view["RM Shortage"].gt(0)].copy()
 
         for column in RM_FOLLOWUP_COLUMNS[1:]:
             saved_values = (
@@ -2007,6 +2031,9 @@ def build_rm_planning_views(
         "month_coverage_end": saved_month_dates.max()
         if not saved_month_dates.empty
         else plan_date,
+        "missing_stock": missing_stock,
+        "missing_stock_count": len(missing_stock),
+        "unmapped_buyer_count": int(base["Buyer"].eq("Unmapped buyer").sum()),
     }
     return views, meta
 
@@ -2015,6 +2042,11 @@ def build_inventory_status(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     result = df.copy()
+    physical_raw = result["Physical Stock"].fillna("").astype(str).str.strip()
+    stock_available = physical_raw.ne("") & pd.to_numeric(
+        physical_raw,
+        errors="coerce",
+    ).notna()
     required = numeric(result["Required Qty"])
     closing = numeric(result["Closing Stock"])
     physical = numeric(result["Physical Stock"])
@@ -2023,6 +2055,9 @@ def build_inventory_status(df: pd.DataFrame) -> pd.DataFrame:
     result.loc[required <= 0, "Status"] = "Requirement missing"
     result.loc[(required > 0) & (stock < required), "Status"] = "Below required"
     result.loc[(required > 0) & (stock <= 0), "Status"] = "Critical"
+    result["Stock Data Status"] = "Available"
+    result.loc[~stock_available, "Stock Data Status"] = "Missing"
+    result.loc[~stock_available, "Status"] = "Stock data missing"
     return result
 
 
@@ -2147,7 +2182,7 @@ def render_part_inventory() -> None:
         if diagnostics.get("error"):
             st.warning(str(diagnostics["error"]))
 
-    cols = st.columns(4)
+    cols = st.columns(5)
 
     if diagnostics:
         plan_date = diagnostics.get("fallback_mix_date")
@@ -2235,7 +2270,15 @@ def render_part_inventory() -> None:
     stock_updates = edited_stock.set_index("Part No.", drop=False)
     for column in ["Physical Stock", "Opening Stock", "System Stock", "Remarks"]:
         recalculated.loc[stock_updates.index, column] = stock_updates[column]
-    current_physical = numeric(recalculated["Physical Stock"])
+    live_physical_raw = recalculated["Physical Stock"].fillna("").astype(str).str.strip()
+    live_stock_available = live_physical_raw.ne("") & pd.to_numeric(
+        live_physical_raw,
+        errors="coerce",
+    ).notna()
+    current_physical = pd.to_numeric(
+        live_physical_raw,
+        errors="coerce",
+    ).fillna(0)
     recalculated["Required Qty"] = (
         numeric(recalculated["Remaining Part Need"]) - current_physical
     ).clip(lower=0).apply(lambda value: int(-(-value // 1)))
@@ -2248,6 +2291,11 @@ def render_part_inventory() -> None:
         recalculated["Required Qty"].gt(0) & current_physical.le(0),
         "Status",
     ] = "Critical"
+    recalculated["Stock Data Status"] = "Available"
+    recalculated.loc[~live_stock_available, "Stock Data Status"] = "Missing"
+    recalculated.loc[~live_stock_available, "Required Qty"] = pd.NA
+    recalculated.loc[~live_stock_available, "Closing Stock"] = pd.NA
+    recalculated.loc[~live_stock_available, "Status"] = "Stock data missing"
     recalculated = recalculated.reset_index(drop=True)
 
     live_full = df.set_index("Part No.", drop=False)
@@ -2259,6 +2307,7 @@ def render_part_inventory() -> None:
         "Remarks",
         "Required Qty",
         "Closing Stock",
+        "Stock Data Status",
         "Status",
     ]:
         live_full.loc[live_updates.index, column] = live_updates[column]
@@ -2267,13 +2316,16 @@ def render_part_inventory() -> None:
     healthy = int(live_full["Status"].eq("Healthy").sum()) if total else 0
     below = int(live_full["Status"].eq("Below required").sum()) if total else 0
     critical = int(live_full["Status"].eq("Critical").sum()) if total else 0
+    stock_missing = int(live_full["Status"].eq("Stock data missing").sum()) if total else 0
     with cols[0]:
         render_metric("Parts tracked", total, "neutral")
     with cols[1]:
-        render_metric("Healthy", healthy, "ok")
+        render_metric("Stock data missing", stock_missing, "warn")
     with cols[2]:
-        render_metric("Below required", below, "warn")
+        render_metric("Healthy", healthy, "ok")
     with cols[3]:
+        render_metric("Below required", below, "warn")
+    with cols[4]:
         render_metric("Critical", critical, "bad")
 
     st.markdown("**2. Live recalculated requirement**")
@@ -2319,31 +2371,75 @@ def render_part_inventory() -> None:
         )
 
 
+def rm_owner_cards_html(frame: pd.DataFrame, limit: int = 8) -> str:
+    if frame.empty:
+        return "<div class='rm-empty'>No buyer-owned shortages in this queue.</div>"
+    summary = (
+        frame.groupby("Buyer", as_index=False)
+        .agg(
+            Issues=("Part No.", "nunique"),
+            Critical=("Severity", lambda values: values.eq("Critical").sum()),
+            Suppliers=("Supplier", "nunique"),
+            Shortage=("RM Shortage", "sum"),
+        )
+        .sort_values(["Critical", "Issues"], ascending=[False, False])
+    )
+    cards = []
+    for _, row in summary.head(limit).iterrows():
+        tone = "critical" if int(row["Critical"]) else "attention"
+        cards.append(
+            f"""
+            <div class="rm-owner-card {tone}">
+                <div class="rm-owner-name">{escape(str(row['Buyer']))}</div>
+                <div class="rm-owner-grid">
+                    <div><b>{int(row['Issues']):,}</b><span>parts</span></div>
+                    <div><b>{int(row['Critical']):,}</b><span>critical</span></div>
+                    <div><b>{int(row['Suppliers']):,}</b><span>suppliers</span></div>
+                </div>
+            </div>
+            """
+        )
+    return f"<div class='rm-owner-cards'>{''.join(cards)}</div>"
+
+
+def save_rm_followup_record(
+    part_no: str,
+    supplier_status: str,
+    expected_delivery: str,
+    next_followup: str,
+    owner: str,
+    notes: str,
+) -> None:
+    existing = load_rm_followups().set_index("Part No.", drop=False)
+    existing.loc[part_no, "Part No."] = part_no
+    existing.loc[part_no, "Supplier Status"] = supplier_status
+    existing.loc[part_no, "Expected Delivery"] = expected_delivery
+    existing.loc[part_no, "Next Follow-up"] = next_followup
+    existing.loc[part_no, "Follow-up Owner"] = owner
+    existing.loc[part_no, "Follow-up Notes"] = notes
+    save_rm_followups(existing.reset_index(drop=True))
+
+
 def render_rm_planning_agent() -> None:
     st.header("RM Planning Agent")
     st.write(
-        "Tracks raw-material stock against the production plan, identifies the first "
-        "possible line shortage, creates supplier follow-up schedules, and recommends "
-        "plan action for PPC and SCM."
-    )
-    st.caption(
-        "This agent uses the last saved source copies by default. Refresh only when you "
-        "want to pull a new plan, production-so-far, and BOM snapshot."
+        "A decision workspace for PPC and SCM: see the parts that can constrain the "
+        "plan, understand why, and assign the next supplier action."
     )
 
     credentials = load_google_credentials()
-    refresh_col, explanation_col = st.columns([1, 4])
-    with refresh_col:
+    action_col, context_col = st.columns([1, 4])
+    with action_col:
         refresh_clicked = st.button(
             "Refresh RM plan",
             type="primary",
             disabled=credentials is None,
-            help="Pull the latest production plan, actual production so far, SKU mapping, and BOM.",
+            help="Pull the latest plan, production-so-far, SKU mapping, and BOM.",
         )
-    with explanation_col:
-        st.info(
-            "Agent flow: demand plan → BOM demand → current Physical Stock → "
-            "shortage date → supplier follow-up → PPC plan recommendation."
+    with context_col:
+        st.caption(
+            "The last saved source copies remain visible until Refresh is clicked. "
+            "Physical Stock comes from Part Inventory."
         )
     if refresh_clicked:
         try:
@@ -2380,83 +2476,92 @@ def render_rm_planning_agent() -> None:
         return
 
     today_view = views["Today"]
-    seven_view = views["Rolling 7 Days"]
-    month_view = views["Remaining Month"]
+    followup_dates = pd.to_datetime(
+        today_view.get("Next Follow-up", pd.Series(dtype=str)),
+        errors="coerce",
+    )
+    open_followup = ~today_view.get(
+        "Supplier Status",
+        pd.Series("", index=today_view.index),
+    ).isin(["Received"])
+    followups_due = int(
+        (followup_dates.le(pd.Timestamp(meta["plan_date"])) & open_followup).sum()
+    )
+    suppliers_due = int(
+        today_view.loc[
+            followup_dates.le(pd.Timestamp(meta["plan_date"])) & open_followup,
+            "Supplier",
+        ].nunique()
+    )
+    vehicle_risk = 0
+    if not today_view.empty:
+        per_vehicle = numeric(today_view["Part per Planned Vehicle"]).replace(0, pd.NA)
+        risk_estimates = (
+            numeric(today_view["RM Shortage"]) / per_vehicle
+        ).replace([float("inf"), -float("inf")], pd.NA).dropna()
+        maximum_risk = float(risk_estimates.max()) if not risk_estimates.empty else 0
+        vehicle_risk = int(
+            min(float(meta["daily_target"]), maximum_risk)
+        )
+    missing_stock_count = int(meta.get("missing_stock_count", 0))
+
+    st.subheader("Management cockpit")
     metric_columns = st.columns(5)
     with metric_columns[0]:
-        render_metric(
-            "Today's vehicle plan",
-            display_qty(meta["daily_target"]),
-            "neutral",
-        )
+        render_metric("Immediate line-risk parts", f"{len(today_view):,}", "bad")
     with metric_columns[1]:
-        render_metric(
-            "Produced so far",
-            display_qty(meta["produced_so_far"]),
-            "ok",
-        )
+        render_metric("Vehicles potentially at risk", f"{vehicle_risk:,}", "warn")
     with metric_columns[2]:
-        render_metric("Today's shortage parts", f"{len(today_view):,}", "bad")
+        render_metric("Suppliers due today", f"{suppliers_due:,}", "warn")
     with metric_columns[3]:
-        render_metric("7-day shortage parts", f"{len(seven_view):,}", "warn")
+        render_metric("Follow-ups due", f"{followups_due:,}", "neutral")
     with metric_columns[4]:
-        render_metric("Monthly shortage parts", f"{len(month_view):,}", "warn")
+        render_metric("Stock counts missing", f"{missing_stock_count:,}", "neutral")
+
+    if missing_stock_count:
+        st.warning(
+            f"{missing_stock_count:,} parts are excluded from shortage alerts because "
+            "Physical Stock has not been entered. They appear in the Missing stock queue."
+        )
+    if int(meta.get("unmapped_buyer_count", 0)):
+        st.caption(
+            f"Data quality: {int(meta['unmapped_buyer_count']):,} parts still have no buyer mapping."
+        )
 
     coverage_end = pd.Timestamp(meta["seven_day_coverage_end"])
     month_coverage_end = pd.Timestamp(meta["month_coverage_end"])
-    st.caption(
-        f"Rolling plan: {display_qty(meta['seven_day_plan'])} remaining vehicles through "
-        f"{coverage_end:%d %b %Y}. Remaining monthly plan: "
-        f"{display_qty(meta['month_plan'])} vehicles through {month_coverage_end:%d %b %Y}."
-    )
-    st.caption(
-        "For future dates that do not yet have a detailed variant breakup, the agent "
-        "scales the current saved part-per-vehicle mix to that date's total vehicle plan."
-    )
-    if coverage_end < pd.Timestamp(meta["plan_date"]) + pd.Timedelta(days=6):
-        st.warning(
-            "The saved production sheet does not yet contain all seven future dates. "
-            "The 7-day view uses only the plan dates currently available."
-        )
-    fallback_mix_date = inventory_diagnostics.get("fallback_mix_date")
-    if pd.notna(fallback_mix_date):
+    plan_summary = st.columns(3)
+    with plan_summary[0]:
         st.info(
-            f"Variant colour mix fallback: {pd.Timestamp(fallback_mix_date):%d %b %Y}. "
-            "The agent uses this saved mix for plan dates without a detailed colour split."
+            f"**Today**  \n{display_qty(meta['daily_target'])} planned · "
+            f"{display_qty(meta['produced_so_far'])} produced so far"
+        )
+    with plan_summary[1]:
+        st.info(
+            f"**Rolling 7 days**  \n{display_qty(meta['seven_day_plan'])} remaining "
+            f"through {coverage_end:%d %b}"
+        )
+    with plan_summary[2]:
+        st.info(
+            f"**Remaining month**  \n{display_qty(meta['month_plan'])} vehicles "
+            f"through {month_coverage_end:%d %b}"
         )
 
-    buyers = sorted(
-        inventory["Buyer"].replace("", pd.NA).dropna().unique().tolist()
-    )
-    suppliers = sorted(
-        inventory["Supplier"].replace("", pd.NA).dropna().unique().tolist()
-    )
-    filter_columns = st.columns(3)
-    with filter_columns[0]:
-        selected_buyer = st.selectbox(
-            "Buyer",
-            ["All buyers"] + buyers,
-            key="rm_agent_buyer",
+    fallback_mix_date = inventory_diagnostics.get("fallback_mix_date")
+    with st.expander("Planning assumptions and data confidence"):
+        st.markdown(
+            "- Known Physical Stock is required before a part can be called a shortage.\n"
+            "- Future total vehicle plans use the current saved part-per-vehicle mix "
+            "when a detailed future mix is unavailable.\n"
+            "- Supplier messages are scheduled and tracked here but are not sent automatically."
         )
-    with filter_columns[1]:
-        selected_supplier = st.selectbox(
-            "Supplier",
-            ["All suppliers"] + suppliers,
-            key="rm_agent_supplier",
-        )
-    with filter_columns[2]:
-        selected_severities = st.multiselect(
-            "Severity",
-            ["Critical", "High", "Medium"],
-            default=[],
-            key="rm_agent_severity",
-        )
+        if pd.notna(fallback_mix_date):
+            st.write(
+                f"Current variant-colour mix fallback: "
+                f"**{pd.Timestamp(fallback_mix_date):%d %b %Y}**."
+            )
 
-    severity_tone = {
-        "Critical": "🔴",
-        "High": "🟠",
-        "Medium": "🟡",
-    }
+    st.subheader("Priority workspace")
     horizon_labels = {
         name: f"{name} ({len(frame):,})"
         for name, frame in views.items()
@@ -2467,118 +2572,291 @@ def render_rm_planning_agent() -> None:
         format_func=lambda value: horizon_labels[value],
         horizontal=True,
         key="rm_agent_horizon",
-        help="Only one horizon is rendered at a time to keep the large shortage schedule fast.",
     )
-    filtered = views[horizon_name].copy()
+    horizon_frame = views[horizon_name].copy()
+    missing_stock = meta.get("missing_stock", pd.DataFrame()).copy()
+    followup_due_mask = pd.to_datetime(
+        horizon_frame.get("Next Follow-up", pd.Series(dtype=str)),
+        errors="coerce",
+    ).le(pd.Timestamp(meta["plan_date"]))
+    queue_frames = {
+        "All actionable": horizon_frame,
+        "Critical today": horizon_frame[horizon_frame["Severity"].eq("Critical")],
+        "High · 1–2 days": horizon_frame[horizon_frame["Severity"].eq("High")],
+        "Upcoming": horizon_frame[horizon_frame["Severity"].eq("Medium")],
+        "Follow-ups due": horizon_frame[followup_due_mask.fillna(False)],
+        "Supplier delayed": horizon_frame[
+            horizon_frame["Supplier Status"].eq("Delayed")
+        ],
+        "Missing stock": missing_stock,
+    }
+    queue_labels = {
+        name: f"{name} ({len(frame):,})"
+        for name, frame in queue_frames.items()
+    }
+    queue_name = st.selectbox(
+        "Work queue",
+        list(queue_frames),
+        format_func=lambda value: queue_labels[value],
+        index=(
+            list(queue_frames).index("Missing stock")
+            if horizon_frame.empty and not missing_stock.empty
+            else 0
+        ),
+        key="rm_agent_queue",
+        help="Choose one focused queue instead of scanning a single giant table.",
+    )
+    queue = queue_frames[queue_name].copy()
+
+    if queue_name != "Missing stock":
+        st.markdown(rm_owner_cards_html(queue), unsafe_allow_html=True)
+
+    buyers = sorted(
+        queue.get("Buyer", pd.Series(dtype=str))
+        .replace("", pd.NA)
+        .dropna()
+        .unique()
+        .tolist()
+    )
+    suppliers = sorted(
+        queue.get("Supplier", pd.Series(dtype=str))
+        .replace("", pd.NA)
+        .dropna()
+        .unique()
+        .tolist()
+    )
+    filters = st.columns([1.5, 1, 1, 0.7])
+    with filters[0]:
+        search = st.text_input(
+            "Search",
+            placeholder="part number, part name, supplier",
+            key="rm_agent_search",
+        )
+    with filters[1]:
+        selected_buyer = st.selectbox(
+            "Buyer",
+            ["All buyers"] + buyers,
+            key="rm_agent_buyer",
+        )
+    with filters[2]:
+        selected_supplier = st.selectbox(
+            "Supplier",
+            ["All suppliers"] + suppliers,
+            key="rm_agent_supplier",
+        )
+    with filters[3]:
+        page_size = st.selectbox(
+            "Rows",
+            [25, 50, 100],
+            key="rm_agent_page_size",
+        )
+
+    filtered = queue.copy()
     if selected_buyer != "All buyers":
         filtered = filtered[filtered["Buyer"].eq(selected_buyer)]
     if selected_supplier != "All suppliers":
         filtered = filtered[filtered["Supplier"].eq(selected_supplier)]
-    if selected_severities:
-        filtered = filtered[filtered["Severity"].isin(selected_severities)]
+    if search.strip():
+        term = search.strip().lower()
+        search_columns = ["Part No.", "Part Name", "Supplier", "Buyer"]
+        filtered = filtered[
+            filtered[search_columns]
+            .astype(str)
+            .apply(lambda column: column.str.lower().str.contains(term, na=False))
+            .any(axis=1)
+        ]
     if filtered.empty:
-        st.success("No shortages match these filters.")
+        st.success("No items match this queue and filter combination.")
         return
 
-    critical_count = int(filtered["Severity"].eq("Critical").sum())
-    st.markdown(
-        f"**{len(filtered):,} shortage parts** · "
-        f"🔴 {critical_count:,} could affect the line on the first plan day."
-    )
-    st.caption(
-        "Update Supplier Status or ETA and save the schedule; the plan recommendation "
-        "will refresh using the saved delivery information."
-    )
-    display_columns = [
-        "Severity",
-        "Buyer",
-        "Supplier",
-        "Part No.",
-        "Part Name",
-        "Affected Variants",
-        "Physical Stock",
-        "Gross RM Need",
-        "RM Shortage",
-        "Required By",
-        "Supplier Status",
-        "Expected Delivery",
-        "Next Follow-up",
-        "Follow-up Owner",
-        "Recommended Plan Action",
-        "Follow-up Notes",
-    ]
-    schedule = filtered[display_columns].copy()
-    schedule["Severity"] = schedule["Severity"].map(
-        lambda value: f"{severity_tone.get(value, '')} {value}".strip()
-    )
-    edited_schedule = st.data_editor(
-        schedule,
+    total_pages = max((len(filtered) + page_size - 1) // page_size, 1)
+    page_columns = st.columns([1, 4])
+    with page_columns[0]:
+        page_number = st.number_input(
+            "Page",
+            min_value=1,
+            max_value=total_pages,
+            value=1,
+            step=1,
+            key=f"rm_page_{normalize_column_name(queue_name)}",
+        )
+    with page_columns[1]:
+        st.caption(
+            f"{len(filtered):,} items · page {page_number} of {total_pages}. "
+            "Select one row to open its evidence and action controls."
+        )
+    start = (int(page_number) - 1) * page_size
+    page_frame = filtered.iloc[start : start + page_size].reset_index(drop=True)
+
+    if queue_name == "Missing stock":
+        compact = page_frame[
+            ["Buyer", "Supplier", "Part No.", "Part Name", "Data Issue"]
+        ].copy()
+    else:
+        compact = page_frame[
+            [
+                "Severity",
+                "Part No.",
+                "Part Name",
+                "Supplier",
+                "Buyer",
+                "Physical Stock",
+                "RM Shortage",
+                "Required By",
+                "Supplier Status",
+            ]
+        ].copy()
+        compact["Severity"] = compact["Severity"].map(
+            {"Critical": "🔴 Critical", "High": "🟠 High", "Medium": "🟡 Medium"}
+        )
+    selection = st.dataframe(
+        compact,
         use_container_width=True,
         hide_index=True,
-        disabled=[
-            "Severity",
-            "Buyer",
-            "Supplier",
-            "Part No.",
-            "Part Name",
-            "Affected Variants",
-            "Physical Stock",
-            "Gross RM Need",
-            "RM Shortage",
-            "Required By",
-            "Recommended Plan Action",
-        ],
-        key=f"rm_schedule_{normalize_column_name(horizon_name)}",
-        column_config={
-            "Supplier Status": st.column_config.SelectboxColumn(
-                options=[
-                    "Awaiting confirmation",
-                    "Confirmed",
-                    "In transit",
-                    "Delayed",
-                    "Received",
-                ],
-                required=True,
-            ),
-            "Expected Delivery": st.column_config.TextColumn(
-                help="Use YYYY-MM-DD."
-            ),
-            "Next Follow-up": st.column_config.TextColumn(
-                help="Auto-scheduled two days before need; edit if required."
-            ),
-            "RM Shortage": st.column_config.NumberColumn(format="%.0f"),
-        },
-        height=min(620, 70 + len(schedule) * 35),
+        height=min(510, 42 + len(compact) * 35),
+        on_select="rerun",
+        selection_mode="single-row",
+        key=f"rm_queue_{normalize_column_name(horizon_name)}_{normalize_column_name(queue_name)}_{page_number}",
     )
-    button_columns = st.columns([1, 1, 4])
-    with button_columns[0]:
-        if st.button(
-            "Save follow-up schedule",
-            key=f"save_rm_{normalize_column_name(horizon_name)}",
-            type="primary",
-        ):
-            existing = load_rm_followups().set_index("Part No.", drop=False)
-            updates = edited_schedule.copy()
-            updates = updates.set_index("Part No.", drop=False)
-            for part_no, row in updates.iterrows():
-                existing.loc[part_no, "Part No."] = part_no
-                for column in RM_FOLLOWUP_COLUMNS[1:]:
-                    existing.loc[part_no, column] = row.get(column, "")
-            save_rm_followups(existing.reset_index(drop=True))
-            st.success("Supplier follow-up schedule saved.")
-            st.rerun()
-    with button_columns[1]:
+    if hasattr(selection, "selection"):
+        selected_rows = selection.selection.rows
+    else:
+        selected_rows = selection.get("selection", {}).get("rows", [])
+    if not selected_rows:
+        st.info("Select a row above to inspect the calculation and take action.")
         st.download_button(
-            "Download schedule",
-            data=edited_schedule.to_csv(index=False),
-            file_name=f"rm_followup_{normalize_column_name(horizon_name)}.csv",
+            "Download this filtered queue",
+            filtered.to_csv(index=False),
+            file_name=f"rm_{normalize_column_name(queue_name)}.csv",
             mime="text/csv",
-            key=f"download_rm_{normalize_column_name(horizon_name)}",
         )
-    st.caption(
-        "The app creates and tracks the schedule; supplier emails/messages are not "
-        "sent automatically."
+        return
+
+    selected = page_frame.iloc[selected_rows[0]].copy()
+    st.subheader("Selected issue")
+    st.markdown(
+        f"### {escape(clean_text(selected['Part No.']))} · "
+        f"{escape(clean_text(selected['Part Name']) or 'Part name unavailable')}"
     )
+
+    if queue_name == "Missing stock":
+        info_columns = st.columns([2, 1])
+        with info_columns[0]:
+            st.warning(
+                "No shortage decision is made for this part until its current Physical "
+                "Stock is entered. This prevents missing data from becoming a false Critical alert."
+            )
+            st.write(
+                f"**Supplier:** {clean_text(selected['Supplier']) or 'Unmapped'}  \n"
+                f"**Buyer:** {clean_text(selected['Buyer']) or 'Unmapped'}  \n"
+                f"**Remaining part need today:** "
+                f"{display_qty(selected['Remaining Part Need'])}"
+            )
+        with info_columns[1]:
+            physical_entry = st.number_input(
+                "Current Physical Stock",
+                min_value=0.0,
+                value=0.0,
+                key=f"rm_missing_stock_{stock_part_key(selected['Part No.'])}",
+                help="Enter the physical count available now, after production so far.",
+            )
+            if st.button("Save physical stock", type="primary"):
+                updated = inventory.copy()
+                updated.loc[
+                    updated["Part No."].eq(selected["Part No."]),
+                    "Physical Stock",
+                ] = physical_entry
+                save_table("part_inventory", updated)
+                st.success("Physical Stock saved. The agent will recalculate this part.")
+                st.rerun()
+        return
+
+    evidence_columns = st.columns(4)
+    with evidence_columns[0]:
+        render_metric("Physical stock", display_qty(selected["Physical Stock"]), "neutral")
+    with evidence_columns[1]:
+        render_metric("RM needed", display_qty(selected["Gross RM Need"]), "neutral")
+    with evidence_columns[2]:
+        render_metric("Shortage", display_qty(selected["RM Shortage"]), "bad")
+    with evidence_columns[3]:
+        render_metric("Required by", clean_text(selected["Required By"]) or "—", "warn")
+
+    details, actions = st.columns([1.25, 1])
+    with details:
+        st.markdown("#### Why the agent flagged it")
+        st.write(
+            f"The {horizon_name.lower()} plan needs "
+            f"**{display_qty(selected['Gross RM Need'])}** units. Current Physical Stock "
+            f"is **{display_qty(selected['Physical Stock'])}**, leaving a shortage of "
+            f"**{display_qty(selected['RM Shortage'])}**."
+        )
+        st.markdown("#### Production impact")
+        st.write(
+            f"**Affected variants:** "
+            f"{clean_text(selected['Affected Variants']) or 'Variant mapping unavailable'}"
+        )
+        confidence = (
+            "High — physical stock and plan are available."
+            if horizon_name == "Today"
+            else "Planning estimate — future totals use the current saved variant mix."
+        )
+        st.caption(f"Data confidence: {confidence}")
+
+    with actions:
+        st.markdown("#### Supplier action")
+        statuses = [
+            "Awaiting confirmation",
+            "Confirmed",
+            "In transit",
+            "Delayed",
+            "Received",
+        ]
+        current_status = clean_text(selected["Supplier Status"]) or statuses[0]
+        supplier_status = st.selectbox(
+            "Supplier status",
+            statuses,
+            index=statuses.index(current_status)
+            if current_status in statuses
+            else 0,
+            key=f"rm_detail_status_{stock_part_key(selected['Part No.'])}",
+        )
+        expected_delivery = st.text_input(
+            "Expected delivery",
+            value=clean_text(selected["Expected Delivery"]),
+            placeholder="YYYY-MM-DD",
+            key=f"rm_detail_eta_{stock_part_key(selected['Part No.'])}",
+        )
+        next_followup = st.text_input(
+            "Next follow-up",
+            value=clean_text(selected["Next Follow-up"]),
+            placeholder="YYYY-MM-DD",
+            key=f"rm_detail_followup_{stock_part_key(selected['Part No.'])}",
+        )
+        owner = st.text_input(
+            "Follow-up owner",
+            value=clean_text(selected["Follow-up Owner"]) or clean_text(selected["Buyer"]),
+            key=f"rm_detail_owner_{stock_part_key(selected['Part No.'])}",
+        )
+        notes = st.text_area(
+            "Notes",
+            value=clean_text(selected["Follow-up Notes"]),
+            key=f"rm_detail_notes_{stock_part_key(selected['Part No.'])}",
+        )
+        recommendation_row = selected.copy()
+        recommendation_row["Supplier Status"] = supplier_status
+        recommendation_row["Expected Delivery"] = expected_delivery
+        st.info("**Agent recommendation**  \n" + rm_recommendation(recommendation_row))
+        if st.button("Save supplier action", type="primary"):
+            save_rm_followup_record(
+                clean_text(selected["Part No."]),
+                supplier_status,
+                expected_delivery,
+                next_followup,
+                owner,
+                notes,
+            )
+            st.success("Supplier action saved.")
+            st.rerun()
 
 
 def render_live_google_sheet() -> None:
@@ -5107,8 +5385,10 @@ def render_documentation() -> None:
         - **Rolling 7 Days** adds the saved vehicle plans for the next six calendar days.
         - **Remaining Month** adds every remaining positive daily plan available through month-end.
         - When a future date has only a total vehicle plan, the current saved variant/part mix is scaled to that total and is treated as a planning estimate.
+        - Blank Physical Stock is classified as **Stock data missing** and is excluded from shortage counts; it is never treated as zero stock.
         - The first date when cumulative RM demand exceeds Physical Stock becomes **Required By**.
         - Critical means a possible shortage on the first plan day; High means within two days; Medium means later.
+        - Use the focused work queues, then select one row to see calculation evidence, production impact, and supplier controls.
         - The agent creates a supplier follow-up schedule two days before the required date by default.
         - Mark a supplier **Delayed** or enter an ETA after Required By to receive a PPC plan-adjustment recommendation.
         - Follow-up schedules are saved locally. The app does not send supplier emails or messages automatically.
@@ -5264,11 +5544,61 @@ st.markdown(
         color: #64748b;
         background: #ffffff;
     }
+    .rm-owner-cards {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 12px;
+        margin: 12px 0 20px;
+    }
+    .rm-owner-card {
+        background: #ffffff;
+        border: 1px solid #dbe3ef;
+        border-left: 5px solid #f59e0b;
+        border-radius: 10px;
+        padding: 14px 15px;
+    }
+    .rm-owner-card.critical { border-left-color: #dc2626; }
+    .rm-owner-name {
+        color: #0f172a;
+        font-size: 0.92rem;
+        font-weight: 800;
+        margin-bottom: 12px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+    .rm-owner-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 8px;
+    }
+    .rm-owner-grid b {
+        color: #0f172a;
+        display: block;
+        font-size: 1.05rem;
+    }
+    .rm-owner-grid span {
+        color: #64748b;
+        display: block;
+        font-size: 0.68rem;
+        font-weight: 700;
+        text-transform: uppercase;
+    }
+    .rm-empty {
+        background: #f8fafc;
+        border: 1px solid #dbe3ef;
+        border-radius: 10px;
+        color: #64748b;
+        margin: 12px 0 20px;
+        padding: 16px;
+    }
     @media (max-width: 1000px) {
         .supplier-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .rm-owner-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
     @media (max-width: 720px) {
         .supplier-grid { grid-template-columns: 1fr; }
+        .rm-owner-cards { grid-template-columns: 1fr; }
     }
     </style>
     """,
