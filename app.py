@@ -110,6 +110,7 @@ RM_FOLLOWUPS_PATH = DATA_DIR / "rm_followups.csv"
 RM_FOLLOWUP_COLUMNS = [
     "Part No.",
     "Supplier Status",
+    "Next Expected Qty",
     "Expected Delivery",
     "Next Follow-up",
     "Follow-up Owner",
@@ -1980,22 +1981,63 @@ def rm_recommendation(row: pd.Series) -> str:
     required_by = pd.to_datetime(row.get("Required By", ""), errors="coerce")
     expected = pd.to_datetime(row.get("Expected Delivery", ""), errors="coerce")
     affected = clean_text(row.get("Affected Variants", "")) or "affected variants"
+    quantity = pd.to_numeric(
+        pd.Series([row.get("Next Expected Qty", "")]),
+        errors="coerce",
+    ).fillna(
+        pd.to_numeric(
+            pd.Series([row.get("RM Shortage", 0)]),
+            errors="coerce",
+        ).fillna(0)
+    ).iloc[0]
+    owner = (
+        clean_text(row.get("Follow-up Owner", ""))
+        or clean_text(row.get("Buyer", ""))
+        or "mapped buyer"
+    )
+    followup = pd.to_datetime(row.get("Next Follow-up", ""), errors="coerce")
+    followup_label = (
+        followup.strftime("%d %b")
+        if pd.notna(followup)
+        else "the next follow-up"
+    )
+    quantity_label = display_qty(quantity)
+    required_label = (
+        required_by.strftime("%d %b")
+        if pd.notna(required_by)
+        else "the required date"
+    )
+    owner_point = f"- **Owner:** {owner} · follow up on **{followup_label}**."
     if status == "delayed":
         eta = expected.strftime("%d %b") if pd.notna(expected) else "confirmed ETA"
         return (
-            f"Protect unaffected builds; move {affected} after {eta} or secure an "
-            "alternate/expedite supply."
+            f"- Expedite or secure alternate supply for **{quantity_label} parts**.\n"
+            f"- Move **{affected}** after **{eta}** unless supply is recovered.\n"
+            f"{owner_point}"
         )
     if pd.notna(expected) and pd.notna(required_by) and expected > required_by:
         return (
-            f"ETA is after line need. Reschedule {affected}, expedite the shortage, "
-            "or approve an alternate source."
+            f"- Pull in **{quantity_label} parts** by **{required_label}**.\n"
+            f"- Protect or resequence **{affected}** until the late ETA is resolved.\n"
+            f"{owner_point}"
         )
     if status in {"confirmed", "in transit"}:
-        return "No plan change yet; monitor delivery against the required-by date."
+        eta = expected.strftime("%d %b") if pd.notna(expected) else required_label
+        return (
+            f"- Track **{quantity_label} parts** against the **{eta}** delivery.\n"
+            f"- Escalate immediately if ETA slips beyond **{required_label}**.\n"
+            f"{owner_point}"
+        )
+    if status == "received":
+        return (
+            f"- Verify receipt and stock posting for **{quantity_label} parts**.\n"
+            "- Close the shortage only after Physical Stock reflects the receipt.\n"
+            f"{owner_point}"
+        )
     return (
-        "Get supplier quantity and ETA confirmation by the next follow-up; "
-        "keep an alternate build sequence ready."
+        f"- Get supplier confirmation for **{quantity_label} parts** and delivery date.\n"
+        f"- Keep an alternate sequence ready for **{affected}** until confirmed.\n"
+        f"{owner_point}"
     )
 
 
@@ -2577,6 +2619,7 @@ def rm_owner_cards_html(frame: pd.DataFrame, limit: int = 8) -> str:
 def save_rm_followup_record(
     part_no: str,
     supplier_status: str,
+    next_expected_qty: float,
     expected_delivery: str,
     next_followup: str,
     owner: str,
@@ -2585,6 +2628,7 @@ def save_rm_followup_record(
     existing = load_rm_followups().set_index("Part No.", drop=False)
     existing.loc[part_no, "Part No."] = part_no
     existing.loc[part_no, "Supplier Status"] = supplier_status
+    existing.loc[part_no, "Next Expected Qty"] = next_expected_qty
     existing.loc[part_no, "Expected Delivery"] = expected_delivery
     existing.loc[part_no, "Next Follow-up"] = next_followup
     existing.loc[part_no, "Follow-up Owner"] = owner
@@ -3031,43 +3075,107 @@ def render_rm_planning_agent() -> None:
         ]
         current_status = clean_text(selected["Supplier Status"]) or statuses[0]
         supplier_status = st.selectbox(
-            "Supplier status",
+            "Supplier status *",
             statuses,
             index=statuses.index(current_status)
             if current_status in statuses
             else 0,
             key=f"rm_detail_status_{stock_part_key(selected['Part No.'])}",
         )
-        expected_delivery = st.text_input(
-            "Expected delivery",
-            value=clean_text(selected["Expected Delivery"]),
-            placeholder="YYYY-MM-DD",
+        saved_qty = pd.to_numeric(
+            pd.Series([selected.get("Next Expected Qty", "")]),
+            errors="coerce",
+        ).iloc[0]
+        default_qty = (
+            float(saved_qty)
+            if pd.notna(saved_qty) and float(saved_qty) > 0
+            else float(numeric(pd.Series([selected["RM Shortage"]])).iloc[0])
+        )
+        next_expected_qty = st.number_input(
+            "Next expected qty *",
+            min_value=0.0,
+            value=max(default_qty, 0.0),
+            step=1.0,
+            help="Quantity the supplier is expected to deliver in the next receipt.",
+            key=f"rm_detail_qty_{stock_part_key(selected['Part No.'])}",
+        )
+        saved_expected = pd.to_datetime(
+            selected["Expected Delivery"],
+            errors="coerce",
+        )
+        default_expected = (
+            saved_expected
+            if pd.notna(saved_expected)
+            else pd.to_datetime(selected["Required By"], errors="coerce")
+        )
+        if pd.isna(default_expected):
+            default_expected = pd.Timestamp(meta["plan_date"])
+        expected_delivery_date = st.date_input(
+            "Expected delivery *",
+            value=pd.Timestamp(default_expected).date(),
             key=f"rm_detail_eta_{stock_part_key(selected['Part No.'])}",
         )
-        next_followup = st.text_input(
-            "Next follow-up",
-            value=clean_text(selected["Next Follow-up"]),
-            placeholder="YYYY-MM-DD",
+        saved_followup = pd.to_datetime(
+            selected["Next Follow-up"],
+            errors="coerce",
+        )
+        if pd.isna(saved_followup):
+            saved_followup = pd.Timestamp(meta["plan_date"])
+        next_followup_date = st.date_input(
+            "Next follow-up *",
+            value=pd.Timestamp(saved_followup).date(),
             key=f"rm_detail_followup_{stock_part_key(selected['Part No.'])}",
         )
+        expected_delivery = expected_delivery_date.isoformat()
+        next_followup = next_followup_date.isoformat()
+        owner_value = clean_text(selected["Buyer"])
         owner = st.text_input(
-            "Follow-up owner",
-            value=clean_text(selected["Follow-up Owner"]) or clean_text(selected["Buyer"]),
+            "Follow-up owner *",
+            value=owner_value,
+            disabled=True,
+            help="Locked to the buyer mapped to this part.",
             key=f"rm_detail_owner_{stock_part_key(selected['Part No.'])}",
         )
         notes = st.text_area(
-            "Notes",
+            "Notes *",
             value=clean_text(selected["Follow-up Notes"]),
+            placeholder="Record supplier commitment, escalation, or next action.",
             key=f"rm_detail_notes_{stock_part_key(selected['Part No.'])}",
         )
         recommendation_row = selected.copy()
         recommendation_row["Supplier Status"] = supplier_status
+        recommendation_row["Next Expected Qty"] = next_expected_qty
         recommendation_row["Expected Delivery"] = expected_delivery
-        st.info("**Agent recommendation**  \n" + rm_recommendation(recommendation_row))
-        if st.button("Save supplier action", type="primary"):
+        recommendation_row["Next Follow-up"] = next_followup
+        recommendation_row["Follow-up Owner"] = owner
+        st.info(
+            "**Agent recommendation**\n\n"
+            + rm_recommendation(recommendation_row)
+        )
+        missing_fields = []
+        if next_expected_qty <= 0:
+            missing_fields.append("Next expected qty")
+        if not expected_delivery:
+            missing_fields.append("Expected delivery")
+        if not next_followup:
+            missing_fields.append("Next follow-up")
+        if not owner or owner in {"Unmapped buyer", "Not mapped"}:
+            missing_fields.append("Mapped follow-up owner")
+        if not notes.strip():
+            missing_fields.append("Notes")
+        if missing_fields:
+            st.caption(
+                "Complete before saving: " + ", ".join(missing_fields) + "."
+            )
+        if st.button(
+            "Save supplier action",
+            type="primary",
+            disabled=bool(missing_fields),
+        ):
             save_rm_followup_record(
                 clean_text(selected["Part No."]),
                 supplier_status,
+                next_expected_qty,
                 expected_delivery,
                 next_followup,
                 owner,
@@ -5621,6 +5729,9 @@ def render_documentation() -> None:
         - Critical means a possible shortage on the first plan day; High means within two days; Medium means later.
         - Use the focused work queues, then select one row to see calculation evidence, production impact, and supplier controls.
         - The agent creates a supplier follow-up schedule two days before the required date by default.
+        - Every saved supplier action requires Supplier Status, Next Expected Qty, Expected Delivery, Next Follow-up, a mapped buyer, and Notes.
+        - Expected Delivery and Next Follow-up use calendar dates. Follow-up Owner is locked to the buyer mapped to the selected part.
+        - Agent recommendations are action bullets that state the quantity, timing/plan response, and accountable owner.
         - Mark a supplier **Delayed** or enter an ETA after Required By to receive a PPC plan-adjustment recommendation.
         - Follow-up schedules are saved locally. The app does not send supplier emails or messages automatically.
         """
