@@ -58,6 +58,14 @@ def sheet_url(spreadsheet_id: str, gid: int) -> str:
 
 
 SOURCE_SHEETS = {
+    "daily_plan_summary": {
+        "url": sheet_url(PRODUCTION_SHEET_ID, 1380714334),
+        "cache": DATA_DIR / "daily_plan_summary.csv",
+    },
+    "production_plan_breakup": {
+        "url": sheet_url(PRODUCTION_SHEET_ID, 643919697),
+        "cache": DATA_DIR / "production_plan_breakup.csv",
+    },
     "vin_details": {
         "url": sheet_url(PRODUCTION_SHEET_ID, 1559707768),
         "cache": DATA_DIR / "vin_details_daily.csv",
@@ -129,6 +137,12 @@ TABLES = {
             "Supplier",
             "Part No.",
             "Part Name",
+            "Plan Date",
+            "Daily Production Plan",
+            "Produced So Far",
+            "Planned Part Consumption",
+            "Consumed So Far",
+            "Remaining Part Need",
             "Required Qty",
             "Opening Stock",
             "System Stock",
@@ -1041,12 +1055,138 @@ def parse_sku_map(df: pd.DataFrame) -> dict[tuple[str, str], str]:
     return mapping
 
 
-def parse_vin_detail_production(
+def parse_sheet_date(value: object) -> pd.Timestamp:
+    text = clean_text(value)
+    if not text:
+        return pd.NaT
+    current_year = pd.Timestamp.now(tz="Asia/Kolkata").year
+    return pd.to_datetime(f"{text}-{current_year}", errors="coerce", dayfirst=True)
+
+
+def parse_daily_plan_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """Read the repeated weekly blocks in Weekly_Plan & Results_Rev.1."""
+    columns = ["Plan Date", "Daily Production Plan", "Produced So Far"]
+    if df.empty:
+        return pd.DataFrame(columns=columns)
+
+    records: list[dict[str, object]] = []
+    header_map: dict[str, int] = {}
+    for row in df.astype(str).to_numpy().tolist():
+        normalized = [normalize_column_name(value) for value in row]
+        if "date" in normalized and "plan" in normalized:
+            header_map = {
+                name: normalized.index(name)
+                for name in ["date", "plan", "actual"]
+                if name in normalized
+            }
+            continue
+        if not header_map:
+            continue
+        date_index = header_map["date"]
+        if date_index >= len(row):
+            continue
+        plan_date = parse_sheet_date(row[date_index])
+        if pd.isna(plan_date):
+            continue
+        plan_value = (
+            pd.to_numeric(str(row[header_map["plan"]]).replace(",", ""), errors="coerce")
+            if header_map["plan"] < len(row)
+            else pd.NA
+        )
+        actual_value = (
+            pd.to_numeric(str(row[header_map["actual"]]).replace(",", ""), errors="coerce")
+            if "actual" in header_map and header_map["actual"] < len(row)
+            else pd.NA
+        )
+        records.append(
+            {
+                "Plan Date": plan_date.normalize(),
+                "Daily Production Plan": float(plan_value) if pd.notna(plan_value) else 0.0,
+                "Produced So Far": float(actual_value) if pd.notna(actual_value) else 0.0,
+            }
+        )
+    if not records:
+        return pd.DataFrame(columns=columns)
+    return (
+        pd.DataFrame(records, columns=columns)
+        .drop_duplicates("Plan Date", keep="last")
+        .sort_values("Plan Date")
+        .reset_index(drop=True)
+    )
+
+
+def parse_production_plan_breakup(df: pd.DataFrame) -> pd.DataFrame:
+    """Read model-level Daily Plan values from Production Plan Breakup_Rev.1."""
+    columns = ["Plan Date", "Model", "Planned Qty"]
+    if df.empty:
+        return pd.DataFrame(columns=columns)
+
+    rows = df.astype(str).to_numpy().tolist()
+    plan_header = next(
+        (
+            index
+            for index, row in enumerate(rows)
+            if row
+            and normalize_column_name(row[0]) == "variant"
+            and any(normalize_column_name(value) == "plan" for value in row[1:])
+        ),
+        None,
+    )
+    if plan_header is None or plan_header + 2 >= len(rows):
+        return pd.DataFrame(columns=columns)
+
+    date_row = rows[plan_header + 1]
+    label_row = rows[plan_header + 2]
+    date_columns: list[tuple[int, pd.Timestamp]] = []
+    for index, label in enumerate(label_row):
+        if normalize_column_name(label) != "daily_plan":
+            continue
+        plan_date = parse_sheet_date(date_row[index] if index < len(date_row) else "")
+        if pd.notna(plan_date):
+            date_columns.append((index, plan_date.normalize()))
+
+    records: list[dict[str, object]] = []
+    for row in rows[plan_header + 3 :]:
+        model = clean_text(row[0] if row else "")
+        if normalize_column_name(model) in {"total_auto", "variant"}:
+            if normalize_column_name(model) == "total_auto":
+                break
+            continue
+        if not model:
+            continue
+        for column_index, plan_date in date_columns:
+            value = row[column_index] if column_index < len(row) else ""
+            quantity = pd.to_numeric(str(value).replace(",", ""), errors="coerce")
+            if pd.notna(quantity) and float(quantity) > 0:
+                records.append(
+                    {
+                        "Plan Date": plan_date,
+                        "Model": model,
+                        "Planned Qty": float(quantity),
+                    }
+                )
+    return pd.DataFrame(records, columns=columns)
+
+
+def parse_vin_detail_plan_actual(
     df: pd.DataFrame,
     sku_map: dict[tuple[str, str], str],
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    columns = ["Usage Date", "FG", "Produced Qty", "Production Source"]
-    unmatched_columns = ["Usage Date", "Model", "Color", "Produced Qty"]
+    columns = [
+        "Plan Date",
+        "Model",
+        "Color",
+        "FG",
+        "Detailed Plan Qty",
+        "Produced Qty",
+    ]
+    unmatched_columns = [
+        "Plan Date",
+        "Model",
+        "Color",
+        "Detailed Plan Qty",
+        "Produced Qty",
+    ]
     if df.empty:
         return pd.DataFrame(columns=columns), pd.DataFrame(columns=unmatched_columns)
 
@@ -1059,22 +1199,22 @@ def parse_vin_detail_production(
         return pd.DataFrame(columns=columns), pd.DataFrame(columns=unmatched_columns)
 
     date_header = rows[header_index]
-    date_columns: list[tuple[list[int], pd.Timestamp]] = []
-    current_year = pd.Timestamp.now(tz="Asia/Kolkata").year
+    date_columns: list[tuple[list[int], list[int], pd.Timestamp]] = []
     for index, value in enumerate(date_header):
-        if re.fullmatch(r"\d{1,2}-[A-Za-z]{3}", value.strip()):
-            parsed_date = pd.to_datetime(
-                f"{value.strip()}-{current_year}",
-                format="%d-%b-%Y",
-                errors="coerce",
-            )
-            if pd.notna(parsed_date) and index + 7 < len(date_header):
-                date_columns.append(
-                    ([index + 1, index + 3, index + 5], parsed_date.normalize())
+        if not re.fullmatch(r"\d{1,2}-[A-Za-z]{3}", value.strip()):
+            continue
+        plan_date = parse_sheet_date(value)
+        if pd.notna(plan_date) and index + 7 < len(date_header):
+            date_columns.append(
+                (
+                    [index, index + 2, index + 4],
+                    [index + 1, index + 3, index + 5],
+                    plan_date.normalize(),
                 )
+            )
 
-    production_rows: list[dict[str, object]] = []
-    unmatched_rows: list[dict[str, object]] = []
+    mapped: list[dict[str, object]] = []
+    unmatched: list[dict[str, object]] = []
     current_model = ""
     for row in rows[header_index + 3 :]:
         if len(row) < 2:
@@ -1085,38 +1225,59 @@ def parse_vin_detail_production(
         if not current_model or not color:
             continue
         fg = sku_map.get((canonical_model(current_model), canonical_color(color)))
-        for actual_columns, usage_date in date_columns:
-            actual_values = [
-                pd.to_numeric(
-                    str(row[column]).replace(",", ""),
-                    errors="coerce",
+        for plan_columns, actual_columns, plan_date in date_columns:
+            plan_qty = sum(
+                float(value)
+                for value in (
+                    pd.to_numeric(
+                        str(row[column]).replace(",", ""),
+                        errors="coerce",
+                    )
+                    for column in plan_columns
                 )
-                for column in actual_columns
-            ]
-            quantity = sum(
-                float(value) for value in actual_values if pd.notna(value)
+                if pd.notna(value)
             )
-            if quantity <= 0:
+            actual_qty = sum(
+                float(value)
+                for value in (
+                    pd.to_numeric(
+                        str(row[column]).replace(",", ""),
+                        errors="coerce",
+                    )
+                    for column in actual_columns
+                )
+                if pd.notna(value)
+            )
+            if plan_qty <= 0 and actual_qty <= 0:
                 continue
-            values = {
-                "Usage Date": usage_date,
+            record = {
+                "Plan Date": plan_date,
                 "Model": current_model,
                 "Color": color,
-                "Produced Qty": float(quantity),
+                "Detailed Plan Qty": plan_qty,
+                "Produced Qty": actual_qty,
             }
             if fg:
-                production_rows.append(
-                    {
-                        "Usage Date": usage_date,
-                        "FG": fg,
-                        "Produced Qty": float(quantity),
-                        "Production Source": "VIN Details Daily",
-                    }
-                )
+                mapped.append({**record, "FG": fg})
             else:
-                unmatched_rows.append(values)
+                unmatched.append(record)
+    return (
+        pd.DataFrame(mapped, columns=columns),
+        pd.DataFrame(unmatched, columns=unmatched_columns),
+    )
 
-    production = pd.DataFrame(production_rows, columns=columns)
+
+def parse_vin_detail_production(
+    df: pd.DataFrame,
+    sku_map: dict[tuple[str, str], str],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    columns = ["Usage Date", "FG", "Produced Qty", "Production Source"]
+    unmatched_columns = ["Usage Date", "Model", "Color", "Produced Qty"]
+    detail, unmatched = parse_vin_detail_plan_actual(df, sku_map)
+    production = detail[["Plan Date", "FG", "Produced Qty"]].copy()
+    production = production[production["Produced Qty"] > 0]
+    production = production.rename(columns={"Plan Date": "Usage Date"})
+    production["Production Source"] = "VIN Details Daily"
     if not production.empty:
         production = (
             production.groupby(
@@ -1125,7 +1286,10 @@ def parse_vin_detail_production(
             )["Produced Qty"]
             .sum()
         )
-    return production, pd.DataFrame(unmatched_rows, columns=unmatched_columns)
+    unmatched = unmatched[unmatched["Produced Qty"] > 0].rename(
+        columns={"Plan Date": "Usage Date"}
+    )
+    return production, unmatched[unmatched_columns]
 
 
 def build_daily_production(
@@ -1377,6 +1541,247 @@ def combine_manual_outwarding(
     )
 
 
+def allocate_integer_quantities(weights: pd.Series, total: float) -> pd.Series:
+    """Allocate a whole-vehicle total without creating fractional vehicles."""
+    target = max(int(round(float(total))), 0)
+    clean_weights = pd.to_numeric(weights, errors="coerce").fillna(0).clip(lower=0)
+    if target == 0 or clean_weights.sum() <= 0:
+        return pd.Series(0, index=weights.index, dtype=int)
+    raw = clean_weights / clean_weights.sum() * target
+    allocated = raw.apply(lambda value: int(value // 1))
+    remainder = target - int(allocated.sum())
+    if remainder:
+        order = (raw - allocated).sort_values(ascending=False).index[:remainder]
+        allocated.loc[order] += 1
+    return allocated.astype(int)
+
+
+def build_planned_and_actual_production(
+    daily_summary: pd.DataFrame,
+    plan_breakup: pd.DataFrame,
+    vin_details: pd.DataFrame,
+    sku_mapping: pd.DataFrame,
+) -> tuple[pd.Timestamp | None, pd.DataFrame, pd.DataFrame, dict[str, object]]:
+    """Build FG-level plan and actuals while keeping the weekly total authoritative."""
+    diagnostics: dict[str, object] = {}
+    summary = parse_daily_plan_summary(daily_summary)
+    if summary.empty:
+        return None, pd.DataFrame(), pd.DataFrame(), {"error": "Daily plan summary is empty."}
+
+    today = pd.Timestamp.now(tz="Asia/Kolkata").tz_localize(None).normalize()
+    eligible = summary[
+        summary["Plan Date"].le(today) & summary["Daily Production Plan"].gt(0)
+    ]
+    if eligible.empty:
+        eligible = summary[summary["Daily Production Plan"].gt(0)]
+    if eligible.empty:
+        return None, pd.DataFrame(), pd.DataFrame(), {"error": "No positive daily plan was found."}
+    selected = eligible.sort_values("Plan Date").iloc[-1]
+    plan_date = pd.Timestamp(selected["Plan Date"]).normalize()
+    daily_target = float(selected["Daily Production Plan"])
+    produced_target = float(selected["Produced So Far"])
+
+    detail, unmatched = parse_vin_detail_plan_actual(
+        vin_details,
+        parse_sku_map(sku_mapping),
+    )
+    model_plan = parse_production_plan_breakup(plan_breakup)
+    model_plan = model_plan[model_plan["Plan Date"].eq(plan_date)].copy()
+    if model_plan.empty:
+        return plan_date, pd.DataFrame(), pd.DataFrame(), {
+            "error": f"No variant plan was found for {plan_date:%d %b %Y}.",
+            "daily_target": daily_target,
+            "produced_target": produced_target,
+        }
+    model_plan["Planned Qty"] = allocate_integer_quantities(
+        model_plan["Planned Qty"],
+        daily_target,
+    )
+
+    plan_rows: list[pd.DataFrame] = []
+    fallback_dates: list[pd.Timestamp] = []
+    missing_models: list[str] = []
+    for _, model_row in model_plan.iterrows():
+        model = str(model_row["Model"])
+        model_key = canonical_model(model)
+        quantity = float(model_row["Planned Qty"])
+        candidates = detail[
+            detail["Model"].map(canonical_model).eq(model_key)
+            & detail["Plan Date"].eq(plan_date)
+            & detail["Detailed Plan Qty"].gt(0)
+        ].copy()
+        if candidates.empty:
+            historical = detail[
+                detail["Model"].map(canonical_model).eq(model_key)
+                & detail["Plan Date"].lt(plan_date)
+                & detail["Detailed Plan Qty"].gt(0)
+            ].copy()
+            if not historical.empty:
+                fallback_date = historical["Plan Date"].max()
+                fallback_dates.append(fallback_date)
+                candidates = historical[historical["Plan Date"].eq(fallback_date)].copy()
+        if candidates.empty:
+            missing_models.append(model)
+            continue
+        candidates = (
+            candidates.groupby("FG", as_index=False)["Detailed Plan Qty"].sum()
+        )
+        candidates["Produced Qty"] = allocate_integer_quantities(
+            candidates["Detailed Plan Qty"],
+            quantity,
+        )
+        plan_rows.append(candidates[["FG", "Produced Qty"]])
+
+    planned = (
+        pd.concat(plan_rows, ignore_index=True)
+        if plan_rows
+        else pd.DataFrame(columns=["FG", "Produced Qty"])
+    )
+    if not planned.empty:
+        planned = planned.groupby("FG", as_index=False)["Produced Qty"].sum()
+        planned["Usage Date"] = plan_date
+        planned["Production Source"] = "Daily plan × variant mix"
+
+    actual = detail[
+        detail["Plan Date"].eq(plan_date) & detail["Produced Qty"].gt(0)
+    ].groupby("FG", as_index=False)["Produced Qty"].sum()
+    if not actual.empty and produced_target >= 0:
+        actual["Produced Qty"] = allocate_integer_quantities(
+            actual["Produced Qty"],
+            produced_target,
+        )
+        actual = actual[actual["Produced Qty"].gt(0)]
+    if not actual.empty:
+        actual["Usage Date"] = plan_date
+        actual["Production Source"] = "P-VIN + VNA + Free VIN actuals so far"
+
+    diagnostics.update(
+        {
+            "daily_target": daily_target,
+            "produced_target": produced_target,
+            "fallback_mix_date": max(fallback_dates) if fallback_dates else None,
+            "missing_models": sorted(set(missing_models)),
+            "unmatched_variants": len(unmatched),
+        }
+    )
+    ordered = ["Usage Date", "FG", "Produced Qty", "Production Source"]
+    return (
+        plan_date,
+        planned[ordered] if not planned.empty else pd.DataFrame(columns=ordered),
+        actual[ordered] if not actual.empty else pd.DataFrame(columns=ordered),
+        diagnostics,
+    )
+
+
+def build_part_inventory_plan(
+    saved_inventory: pd.DataFrame,
+    sources: dict[str, pd.DataFrame],
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    plan_date, planned, actual, diagnostics = build_planned_and_actual_production(
+        sources.get("daily_plan_summary", pd.DataFrame()),
+        sources.get("production_plan_breakup", pd.DataFrame()),
+        sources.get("vin_details", pd.DataFrame()),
+        sources.get("sku_map", pd.DataFrame()),
+    )
+    if plan_date is None or planned.empty:
+        return build_inventory_status(saved_inventory), diagnostics
+
+    common_args = (
+        sources.get("exploded_bom", pd.DataFrame()),
+        sources.get("raw_bom", pd.DataFrame()),
+        sources.get("part_types", pd.DataFrame()),
+        sources.get("suppliers", pd.DataFrame()),
+    )
+    planned_usage, missing_plan_fgs = compute_production_part_usage(
+        planned,
+        *common_args,
+    )
+    actual_usage, missing_actual_fgs = compute_production_part_usage(
+        actual,
+        *common_args,
+    )
+    planned_usage = planned_usage.rename(
+        columns={"Production Used Qty": "Planned Part Consumption"}
+    )
+    actual_usage = actual_usage.rename(
+        columns={"Production Used Qty": "Consumed So Far"}
+    )
+    metadata = ["Part No.", "Part Name", "Supplier"]
+    plan_columns = metadata + ["Planned Part Consumption"]
+    actual_columns = ["Part No.", "Consumed So Far"]
+    result = planned_usage[plan_columns].merge(
+        actual_usage[actual_columns] if not actual_usage.empty else pd.DataFrame(columns=actual_columns),
+        on="Part No.",
+        how="left",
+    )
+    result["Consumed So Far"] = numeric(result["Consumed So Far"])
+    result["Planned Part Consumption"] = numeric(result["Planned Part Consumption"])
+    result["Remaining Part Need"] = (
+        result["Planned Part Consumption"] - result["Consumed So Far"]
+    ).clip(lower=0)
+
+    saved = saved_inventory.copy()
+    saved["Part Key"] = saved.get("Part No.", pd.Series(dtype=str)).map(stock_part_key)
+    saved = saved.drop_duplicates("Part Key", keep="last").set_index("Part Key")
+    result["Part Key"] = result["Part No."].map(stock_part_key)
+    preserved = [
+        "Buyer",
+        "Supplier",
+        "Part Name",
+        "Opening Stock",
+        "System Stock",
+        "Physical Stock",
+        "Remarks",
+    ]
+    for column in preserved:
+        if column in saved:
+            saved_values = result["Part Key"].map(saved[column]).fillna("")
+            if column in {"Supplier", "Part Name"}:
+                result[column] = saved_values.where(saved_values.ne(""), result[column])
+            else:
+                result[column] = saved_values
+        elif column not in result:
+            result[column] = ""
+
+    buyer_mapping = clean_buyer_mapping_source(
+        load_source_cache(BUYER_MAPPING_CACHE_PATH)
+    )
+    if not buyer_mapping.empty:
+        part_buyers = (
+            buyer_mapping[buyer_mapping["Part Number"].ne("")]
+            .assign(**{"Part Key": lambda frame: frame["Part Number"].map(stock_part_key)})
+            .drop_duplicates("Part Key")
+            .set_index("Part Key")["Buyer Name"]
+        )
+        mapped_buyers = result["Part Key"].map(part_buyers).fillna("")
+        result["Buyer"] = result["Buyer"].where(result["Buyer"].astype(str).str.strip().ne(""), mapped_buyers)
+    result["Buyer"] = result["Buyer"].replace("", "Unmapped buyer")
+    result["Supplier"] = result["Supplier"].replace("", "Unmapped supplier")
+
+    physical = numeric(result["Physical Stock"])
+    result["Required Qty"] = (
+        result["Remaining Part Need"] - physical
+    ).clip(lower=0).apply(lambda value: int(-(-value // 1)))
+    result["Closing Stock"] = physical - result["Remaining Part Need"]
+    result["Plan Date"] = plan_date.strftime("%Y-%m-%d")
+    result["Daily Production Plan"] = diagnostics.get("daily_target", 0)
+    result["Produced So Far"] = diagnostics.get("produced_target", 0)
+    result["Status"] = "Healthy"
+    result.loc[result["Required Qty"].gt(0), "Status"] = "Below required"
+    result.loc[result["Required Qty"].gt(0) & physical.le(0), "Status"] = "Critical"
+
+    diagnostics["missing_plan_bom_fgs"] = missing_plan_fgs
+    diagnostics["missing_actual_bom_fgs"] = missing_actual_fgs
+    ordered = TABLES["part_inventory"]["columns"]
+    for column in ordered:
+        if column not in result:
+            result[column] = ""
+    return result[ordered].sort_values(
+        ["Required Qty", "Supplier", "Part No."],
+        ascending=[False, True, True],
+    ).reset_index(drop=True), diagnostics
+
+
 def build_inventory_status(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
@@ -1461,8 +1866,58 @@ def render_editable_table(key: str) -> pd.DataFrame:
 
 def render_part_inventory() -> None:
     st.header("Part Inventory")
-    st.write("Current stock position by buyer, supplier, and part.")
-    df = build_inventory_status(load_table("part_inventory"))
+    st.write(
+        "Part requirement for the selected production day. Actual production means "
+        "production completed **so far**, while Physical Stock means stock available now."
+    )
+
+    credentials = load_google_credentials()
+    refresh_col, note_col = st.columns([1, 4])
+    with refresh_col:
+        refresh_clicked = st.button(
+            "Refresh production plan",
+            type="primary",
+            disabled=credentials is None,
+            help="Pulls a new saved copy of the production-plan, actual-production, and BOM source tabs.",
+        )
+    with note_col:
+        st.caption(
+            "The page keeps showing the previous saved source copies until Refresh is clicked."
+        )
+    if credentials is None:
+        st.info("Connect Google in Setup once to refresh. Existing saved data remains available.")
+    if refresh_clicked:
+        try:
+            with st.spinner("Refreshing daily plan, production so far, variant mix, and BOM..."):
+                for source in SOURCE_SHEETS.values():
+                    source_df, _ = load_google_sheet_oauth(source["url"], credentials)
+                    save_source_cache(source["cache"], source_df)
+            st.success("Production planning data refreshed.")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Could not refresh production planning data: {exc}")
+
+    missing_sources = [
+        source["cache"] for source in SOURCE_SHEETS.values() if not source["cache"].exists()
+    ]
+    if missing_sources:
+        st.warning(
+            "Planning data has not been saved yet. Click Refresh production plan once."
+        )
+        df = build_inventory_status(load_table("part_inventory"))
+        diagnostics: dict[str, object] = {}
+    else:
+        sources = {
+            key: load_source_cache(source["cache"])
+            for key, source in SOURCE_SHEETS.items()
+        }
+        df, diagnostics = build_part_inventory_plan(
+            load_table("part_inventory"),
+            sources,
+        )
+        if diagnostics.get("error"):
+            st.warning(str(diagnostics["error"]))
+
     total = len(df)
     healthy = int((df["Status"] == "Healthy").sum()) if total else 0
     below = int((df["Status"] == "Below required").sum()) if total else 0
@@ -1478,8 +1933,125 @@ def render_part_inventory() -> None:
     with cols[3]:
         render_metric("Critical", critical, "bad")
 
-    st.subheader("Editable Inventory Table")
-    render_editable_table("part_inventory")
+    if diagnostics:
+        plan_date = diagnostics.get("fallback_mix_date")
+        message = (
+            f"Daily target: {display_qty(diagnostics.get('daily_target', 0))} vehicles · "
+            f"Produced so far: {display_qty(diagnostics.get('produced_target', 0))} vehicles."
+        )
+        if pd.notna(plan_date):
+            message += (
+                f" Current-day colour mix was unavailable, so the latest saved mix "
+                f"from {pd.Timestamp(plan_date):%d %b %Y} was used to distribute the model plan."
+            )
+        st.info(message)
+        if diagnostics.get("missing_models"):
+            st.warning(
+                "No usable variant/colour mix was found for: "
+                + ", ".join(diagnostics["missing_models"])
+                + ". Their parts are excluded until the source mapping is available."
+            )
+
+    st.subheader("Part Requirement Table")
+    st.caption(
+        "Required Qty = max(Planned Part Consumption − Consumed So Far − current Physical Stock, 0). "
+        "Enter current Physical Stock and save; blue/grey calculated columns are refreshed from source data."
+    )
+    filter_columns = st.columns([2, 1.3])
+    with filter_columns[0]:
+        search = st.text_input(
+            "Search part",
+            placeholder="part number, part name, buyer, or supplier",
+            key="part_inventory_search",
+        )
+    suppliers = sorted(
+        df.get("Supplier", pd.Series(dtype=str)).replace("", pd.NA).dropna().unique().tolist()
+    )
+    with filter_columns[1]:
+        supplier_filter = st.selectbox(
+            "Supplier",
+            ["All suppliers"] + suppliers,
+            key="part_inventory_supplier",
+        )
+    filtered = df.copy()
+    if search.strip():
+        term = search.strip().lower()
+        searchable = ["Part No.", "Part Name", "Buyer", "Supplier"]
+        filtered = filtered[
+            filtered[searchable]
+            .astype(str)
+            .apply(lambda column: column.str.lower().str.contains(term, na=False))
+            .any(axis=1)
+        ]
+    if supplier_filter != "All suppliers":
+        filtered = filtered[filtered["Supplier"].eq(supplier_filter)]
+
+    computed_columns = [
+        "Buyer",
+        "Supplier",
+        "Part No.",
+        "Part Name",
+        "Plan Date",
+        "Daily Production Plan",
+        "Produced So Far",
+        "Planned Part Consumption",
+        "Consumed So Far",
+        "Remaining Part Need",
+        "Required Qty",
+        "Closing Stock",
+        "Status",
+    ]
+    st.caption(f"{len(filtered):,} of {len(df):,} parts shown.")
+    edited = st.data_editor(
+        filtered,
+        use_container_width=True,
+        hide_index=True,
+        disabled=computed_columns,
+        key="part_inventory_editor",
+        column_config={
+            "Physical Stock": st.column_config.NumberColumn(
+                "Physical Stock",
+                help="Stock physically available now, after production completed so far.",
+                min_value=0.0,
+            ),
+            "Produced So Far": st.column_config.NumberColumn(
+                "Produced So Far",
+                help="P-VIN + VNA + Free VIN actual production completed so far today.",
+            ),
+            "Remaining Part Need": st.column_config.NumberColumn(
+                "Remaining Part Need",
+                help="Planned part consumption minus parts already consumed by production so far.",
+            ),
+            "Required Qty": st.column_config.NumberColumn(
+                "Required Qty",
+                help="Additional parts needed after subtracting current Physical Stock.",
+            ),
+        },
+        height=620,
+    )
+    action_columns = st.columns([1, 1, 4])
+    with action_columns[0]:
+        if st.button("Save stock values", type="primary"):
+            merged = df.set_index("Part No.", drop=False)
+            updates = edited.set_index("Part No.", drop=False)
+            editable_columns = [
+                "Opening Stock",
+                "System Stock",
+                "Physical Stock",
+                "Remarks",
+            ]
+            for column in editable_columns:
+                merged.loc[updates.index, column] = updates[column]
+            save_table("part_inventory", merged.reset_index(drop=True))
+            st.success("Current stock values saved.")
+            st.rerun()
+    with action_columns[1]:
+        st.download_button(
+            "Download CSV",
+            filtered.to_csv(index=False),
+            file_name="part_inventory_requirements.csv",
+            mime="text/csv",
+        )
 
 
 def render_live_google_sheet() -> None:
@@ -3867,6 +4439,141 @@ def render_setup() -> None:
     )
 
 
+def render_documentation() -> None:
+    st.header("Documentation")
+    st.write(
+        "A plain-language guide to the data sources, refresh rules, calculations, "
+        "and discrepancy workflow used by this app."
+    )
+
+    st.subheader("1. The two refresh rules")
+    st.markdown(
+        """
+        - **No automatic overwrite:** every page continues to show its last saved copy.
+        - **Refresh means pull now:** a Google-backed page changes only after its Refresh button is clicked.
+        - **Read-only access:** the app reads source sheets; it does not edit them.
+        - **Produced so far is not final production:** it is the live total completed up to the latest source update.
+        """
+    )
+
+    st.subheader("2. Part requirement calculation")
+    st.info(
+        "Physical Stock is the stock available now, after production completed so far. "
+        "This timing is essential: consumed parts must not be subtracted from Physical Stock a second time."
+    )
+    st.markdown(
+        """
+        For each finished-good variant and every BOM component:
+
+        1. **Planned Part Consumption** = sum of `(planned variant quantity × BOM quantity per variant)`.
+        2. **Consumed So Far** = sum of `(actual variant quantity produced so far × BOM quantity per variant)`.
+        3. **Remaining Part Need** = `max(Planned Part Consumption − Consumed So Far, 0)`.
+        4. **Required Qty** = `max(Remaining Part Need − current Physical Stock, 0)`.
+
+        Shared parts are first summed across **all variants**. Physical Stock is subtracted only once, after that aggregation.
+        Required Qty is rounded up to a whole part so the recommendation never under-orders.
+        """
+    )
+    with st.expander("Worked example", expanded=True):
+        st.markdown(
+            """
+            A shared part is needed 1 per vehicle. The daily plan is 850 vehicles,
+            300 vehicles have been produced so far, and current Physical Stock is 400.
+
+            - Planned Part Consumption = `850 × 1 = 850`
+            - Consumed So Far = `300 × 1 = 300`
+            - Remaining Part Need = `850 − 300 = 550`
+            - Required Qty = `max(550 − 400, 0) = 150`
+
+            The app recommends 150 additional parts.
+            """
+        )
+
+    st.subheader("3. How the production plan is mapped to the BOM")
+    st.markdown(
+        """
+        - The **weekly plan/results tab** supplies the authoritative daily total and actual production so far.
+        - The **production plan breakup** supplies the model-level daily plan.
+        - The **VIN detail** supplies P-VIN + VNA + Free VIN actuals and the model/colour mix.
+        - The **SKU map** converts model + colour to a finished-good (FG) number.
+        - The **exploded BOM** converts every FG into component quantities.
+        - If today's colour mix is not populated yet, the app uses the most recent saved non-zero colour mix for that model and clearly states the fallback date above the table.
+        - Whole-vehicle allocation is used, so a normalized plan never creates a fractional vehicle.
+        """
+    )
+
+    source_rows = [
+        {
+            "Purpose": "Daily plan and actual total",
+            "Sheet / tab": "Weekly_Plan & Results_Rev.1",
+            "Link": sheet_url(PRODUCTION_SHEET_ID, 1380714334),
+        },
+        {
+            "Purpose": "Model-level plan breakup",
+            "Sheet / tab": "Production Plan Breakup_Rev.1",
+            "Link": sheet_url(PRODUCTION_SHEET_ID, 643919697),
+        },
+        {
+            "Purpose": "P-VIN, VNA, Free VIN and colour mix",
+            "Sheet / tab": "VIN_Details_Daily",
+            "Link": sheet_url(PRODUCTION_SHEET_ID, 1559707768),
+        },
+        {
+            "Purpose": "Model + colour to FG",
+            "Sheet / tab": "Daywise SKU Plan",
+            "Link": sheet_url(PRODUCTION_SHEET_ID, 514997806),
+        },
+        {
+            "Purpose": "FG to part quantity",
+            "Sheet / tab": "Exploded BOM",
+            "Link": sheet_url(BOM_SHEET_ID, 1116146509),
+        },
+        {
+            "Purpose": "Inwarding / direct gate entry",
+            "Sheet / tab": "Inwarding snapshot",
+            "Link": INWARDING_SHEET_URL,
+        },
+        {
+            "Purpose": "Part/supplier to buyer ownership",
+            "Sheet / tab": "Buyer mapping",
+            "Link": BUYER_MAPPING_SHEET_URL,
+        },
+    ]
+    st.dataframe(
+        pd.DataFrame(source_rows),
+        use_container_width=True,
+        hide_index=True,
+        column_config={"Link": st.column_config.LinkColumn("Source link")},
+    )
+
+    st.subheader("4. Inwarding and discrepancy agent")
+    st.markdown(
+        """
+        - Inwarding rows are mapped to a buyer by part number first and supplier second.
+        - Gate Entry No is retained so every issue can be checked against the main inwarding table.
+        - Issues are grouped buyer-by-buyer and ordered by **Critical, High, Medium**, then age.
+        - A problem is shown as **Verified resolved** only when a later refreshed snapshot no longer satisfies the discrepancy rule. Merely adding a note does not resolve it.
+        - The action log keeps first-detected, last-checked, acknowledgement, resolution, notes, and escalation state.
+        """
+    )
+
+    st.subheader("5. Column glossary")
+    glossary = pd.DataFrame(
+        [
+            ("Daily Production Plan", "Vehicle target for the selected production date."),
+            ("Produced So Far", "Vehicles completed so far: P-VIN + VNA + Free VIN, reconciled to the daily results total."),
+            ("Planned Part Consumption", "Total part units needed for the complete daily variant plan."),
+            ("Consumed So Far", "Part units already consumed by vehicles produced so far."),
+            ("Remaining Part Need", "Part units still needed to finish the plan before considering current stock."),
+            ("Physical Stock", "Count physically available now, after production so far."),
+            ("Required Qty", "Additional part units required after subtracting Physical Stock."),
+            ("Closing Stock", "Projected Physical Stock after completing the remaining plan; a negative value is a shortage."),
+        ],
+        columns=["Column", "Meaning"],
+    )
+    st.dataframe(glossary, use_container_width=True, hide_index=True)
+
+
 oauth_callback_settings = google_oauth_settings()
 if oauth_callback_settings is not None and st.query_params.get("code"):
     if complete_google_oauth(oauth_callback_settings):
@@ -4036,6 +4743,7 @@ with st.sidebar:
             "Supplier Buyer Map",
             "Inwarding Parts",
             "Outwarding Parts",
+            "Documentation",
             "Setup",
         ],
         label_visibility="collapsed",
@@ -4052,5 +4760,7 @@ elif page == "Inwarding Parts":
     render_inwarding()
 elif page == "Outwarding Parts":
     render_outwarding()
+elif page == "Documentation":
+    render_documentation()
 else:
     render_setup()
