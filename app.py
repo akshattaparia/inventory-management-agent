@@ -48,6 +48,7 @@ GOOGLE_TOKEN_PATH = APP_DIR / ".streamlit" / "google_oauth_token.json"
 GOOGLE_STATE_PATH = APP_DIR / ".streamlit" / "google_oauth_state.txt"
 PRODUCTION_SHEET_ID = "1KLvkeqE71PwJN6keLuIqQYLywfFvvQa7sCq9bo-Ii6I"
 BOM_SHEET_ID = "1dXeJ6dkDoxgyLlkapGFyws75i3ck2-TYeemvq-dKZ9Y"
+SCM_REV_SHEET_ID = "147vIBFZxf6aQddMG-cpQmuFtcM-6nH0pjn0HDHMyLhE"
 
 
 def sheet_url(spreadsheet_id: str, gid: int) -> str:
@@ -58,6 +59,10 @@ def sheet_url(spreadsheet_id: str, gid: int) -> str:
 
 
 SOURCE_SHEETS = {
+    "scm_stock_summary": {
+        "url": sheet_url(SCM_REV_SHEET_ID, 0),
+        "cache": DATA_DIR / "scm_stock_summary.csv",
+    },
     "daily_plan_summary": {
         "url": sheet_url(PRODUCTION_SHEET_ID, 1380714334),
         "cache": DATA_DIR / "daily_plan_summary.csv",
@@ -97,7 +102,7 @@ INWARDING_SNAPSHOT_PATH = DATA_DIR / "inwarding_sheet_snapshot.csv"
 INWARDING_SNAPSHOT_META_PATH = DATA_DIR / "inwarding_sheet_snapshot.json"
 BUYER_MAPPING_SHEET_URL = (
     "https://docs.google.com/spreadsheets/d/"
-    "147vIBFZxf6aQddMG-cpQmuFtcM-6nH0pjn0HDHMyLhE/edit?gid=0#gid=0"
+    f"{SCM_REV_SHEET_ID}/edit?gid=0#gid=0"
 )
 BUYER_MAPPING_CACHE_PATH = DATA_DIR / "buyer_mapping_source.csv"
 AGENT_ACTIONS_PATH = DATA_DIR / "agent_actions.csv"
@@ -1683,6 +1688,63 @@ def build_planned_and_actual_production(
     )
 
 
+def parse_scm_system_stock(
+    df: pd.DataFrame,
+) -> tuple[pd.DataFrame, str]:
+    """Read part-level System Opening Stock from SCM Plan Working Revision 1."""
+    columns = ["Part Key", "SCM System Stock"]
+    if df.empty:
+        return pd.DataFrame(columns=columns), ""
+    rows = df.astype(str).to_numpy().tolist()
+    header_index = None
+    part_index = None
+    stock_index = None
+    stock_label = ""
+    for row_index, row in enumerate(rows):
+        normalized = [normalize_column_name(value) for value in row]
+        component_indexes = [
+            index
+            for index, value in enumerate(normalized)
+            if value in {"component", "part_no", "part_number"}
+        ]
+        stock_indexes = [
+            index
+            for index, value in enumerate(normalized)
+            if value.startswith("system_opening_stock")
+        ]
+        if component_indexes and stock_indexes:
+            header_index = row_index
+            part_index = component_indexes[0]
+            stock_index = stock_indexes[0]
+            stock_label = clean_text(row[stock_index])
+            break
+    if header_index is None or part_index is None or stock_index is None:
+        return pd.DataFrame(columns=columns), ""
+
+    records: list[dict[str, object]] = []
+    for row in rows[header_index + 1 :]:
+        part_no = clean_text(row[part_index] if part_index < len(row) else "")
+        stock_value = row[stock_index] if stock_index < len(row) else ""
+        stock = pd.to_numeric(
+            str(stock_value).replace(",", ""),
+            errors="coerce",
+        )
+        if part_no and pd.notna(stock):
+            records.append(
+                {
+                    "Part Key": stock_part_key(part_no),
+                    "SCM System Stock": float(stock),
+                }
+            )
+    if not records:
+        return pd.DataFrame(columns=columns), stock_label
+    return (
+        pd.DataFrame(records, columns=columns)
+        .drop_duplicates("Part Key", keep="last"),
+        stock_label,
+    )
+
+
 def build_part_inventory_plan(
     saved_inventory: pd.DataFrame,
     sources: dict[str, pd.DataFrame],
@@ -1752,6 +1814,23 @@ def build_part_inventory_plan(
                 result[column] = saved_values
         elif column not in result:
             result[column] = ""
+
+    scm_stock, scm_stock_label = parse_scm_system_stock(
+        sources.get("scm_stock_summary", pd.DataFrame())
+    )
+    if not scm_stock.empty:
+        scm_lookup = scm_stock.set_index("Part Key")["SCM System Stock"]
+        mapped_scm_stock = result["Part Key"].map(scm_lookup)
+        scm_mapped = mapped_scm_stock.notna()
+        result.loc[scm_mapped, "System Stock"] = mapped_scm_stock.loc[scm_mapped]
+        result.loc[scm_mapped, "Physical Stock"] = mapped_scm_stock.loc[scm_mapped]
+        diagnostics["scm_stock_rows_mapped"] = int(scm_mapped.sum())
+        diagnostics["scm_stock_rows_total"] = len(result)
+        diagnostics["scm_stock_label"] = scm_stock_label
+    else:
+        diagnostics["scm_stock_rows_mapped"] = 0
+        diagnostics["scm_stock_rows_total"] = len(result)
+        diagnostics["scm_stock_label"] = ""
 
     buyer_mapping = clean_buyer_mapping_source(
         load_source_cache(BUYER_MAPPING_CACHE_PATH)
@@ -2202,6 +2281,14 @@ def render_part_inventory() -> None:
                 + ", ".join(diagnostics["missing_models"])
                 + ". Their parts are excluded until the source mapping is available."
             )
+        scm_mapped = int(diagnostics.get("scm_stock_rows_mapped", 0))
+        if scm_mapped:
+            stock_label = clean_text(diagnostics.get("scm_stock_label", ""))
+            st.success(
+                f"SCM stock synced for {scm_mapped:,} parts from Summary → "
+                f"{stock_label or 'System Opening Stock'}. The same value is used for "
+                "System Stock and Physical Stock for now."
+            )
 
     st.subheader("Part Requirement Table")
     st.caption(
@@ -2246,16 +2333,31 @@ def render_part_inventory() -> None:
         "Remarks",
     ]
     st.markdown("**1. Update current stock**")
-    st.caption(
-        "Changing Physical Stock below immediately recalculates the requirement view in step 2."
-    )
+    scm_stock_active = int(diagnostics.get("scm_stock_rows_mapped", 0)) > 0
+    if scm_stock_active:
+        st.caption(
+            "System Stock and Physical Stock are source-controlled from SCM Summary. "
+            "Use the Missing stock queue in RM Planning Agent only for parts not found there."
+        )
+    else:
+        st.caption(
+            "Changing Physical Stock below immediately recalculates the requirement view in step 2."
+        )
     st.caption(f"{len(filtered):,} of {len(df):,} parts shown.")
     edited_stock = st.data_editor(
         filtered[stock_input_columns],
         use_container_width=True,
         hide_index=True,
-        disabled=["Part No.", "Part Name"],
-        key="part_inventory_editor",
+        disabled=(
+            ["Part No.", "Part Name", "System Stock", "Physical Stock"]
+            if scm_stock_active
+            else ["Part No.", "Part Name"]
+        ),
+        key=(
+            "part_inventory_editor_scm"
+            if scm_stock_active
+            else "part_inventory_editor"
+        ),
         column_config={
             "Physical Stock": st.column_config.NumberColumn(
                 "Physical Stock",
@@ -2522,6 +2624,13 @@ def render_rm_planning_agent() -> None:
         st.warning(
             f"{missing_stock_count:,} parts are excluded from shortage alerts because "
             "Physical Stock has not been entered. They appear in the Missing stock queue."
+        )
+    scm_mapped = int(inventory_diagnostics.get("scm_stock_rows_mapped", 0))
+    if scm_mapped:
+        st.success(
+            f"{scm_mapped:,} parts use SCM Summary → "
+            f"{clean_text(inventory_diagnostics.get('scm_stock_label', '')) or 'System Opening Stock'} "
+            "for both System Stock and Physical Stock."
         )
     if int(meta.get("unmapped_buyer_count", 0)):
         st.caption(
@@ -5334,6 +5443,11 @@ def render_documentation() -> None:
             "Link": sheet_url(BOM_SHEET_ID, 1116146509),
         },
         {
+            "Purpose": "System and temporary Physical Stock",
+            "Sheet / tab": "SCM Plan Working Revision 1 · Summary · System Opening Stock",
+            "Link": sheet_url(SCM_REV_SHEET_ID, 0),
+        },
+        {
             "Purpose": "Inwarding / direct gate entry",
             "Sheet / tab": "Inwarding snapshot",
             "Link": INWARDING_SHEET_URL,
@@ -5386,6 +5500,7 @@ def render_documentation() -> None:
         - **Remaining Month** adds every remaining positive daily plan available through month-end.
         - When a future date has only a total vehicle plan, the current saved variant/part mix is scaled to that total and is treated as a planning estimate.
         - Blank Physical Stock is classified as **Stock data missing** and is excluded from shortage counts; it is never treated as zero stock.
+        - For now, the app copies **Summary → System Opening Stock** into both System Stock and Physical Stock for every mapped part.
         - The first date when cumulative RM demand exceeds Physical Stock becomes **Required By**.
         - Critical means a possible shortage on the first plan day; High means within two days; Medium means later.
         - Use the focused work queues, then select one row to see calculation evidence, production impact, and supplier controls.

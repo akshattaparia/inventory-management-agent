@@ -11,6 +11,7 @@ data/bom_source.csv
 data/vin_details_daily.csv
 data/daily_plan_summary.csv
 data/production_plan_breakup.csv
+data/scm_stock_summary.csv
 data/daywise_sku_map.csv
 data/physical_vins.csv
 data/exploded_bom.csv
