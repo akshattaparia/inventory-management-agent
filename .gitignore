@@ -22,6 +22,8 @@ data/inwarding_sheet_snapshot.csv
 data/inwarding_sheet_snapshot.json
 data/buyer_mapping_source.csv
 data/agent_actions.csv
+data/rm_followups.csv
+data/part_inventory.csv
 data/*.tmp
 config/grn_export.env
 config/*.env
