@@ -673,6 +673,41 @@ def snapshot_age_label(snapshot_path: Path) -> str:
     return f"{hours // 24} days ago"
 
 
+def data_file_health_row(label: str, path: Path, note: str = "") -> dict[str, object]:
+    if not path.exists():
+        return {
+            "Input source": label,
+            "Status": "Missing",
+            "Rows": "",
+            "Columns": "",
+            "Last refreshed": "no copy yet",
+            "Feeds": note,
+        }
+
+    row_count: object = ""
+    column_count: object = ""
+    try:
+        with path.open("rb") as handle:
+            row_count = max(sum(1 for _ in handle) - 1, 0)
+    except OSError:
+        row_count = ""
+
+    try:
+        column_count = len(pd.read_csv(path, dtype=str, nrows=0).columns)
+    except Exception:
+        column_count = ""
+
+    modified_at = datetime.fromtimestamp(path.stat().st_mtime)
+    return {
+        "Input source": label,
+        "Status": "Ready",
+        "Rows": row_count,
+        "Columns": column_count,
+        "Last refreshed": f"{modified_at:%d %b %I:%M %p} ({snapshot_age_label(path)})",
+        "Feeds": note,
+    }
+
+
 def parse_report_date(value: object) -> pd.Timestamp:
     text = clean_text(value)
     if not text:
@@ -753,6 +788,115 @@ def raw_cell(raw: pd.DataFrame, row: int, col: int | None) -> object:
     if col is None or row >= len(raw) or col >= raw.shape[1]:
         return ""
     return raw.iat[row, col]
+
+
+def value_to_right_of_label(raw: pd.DataFrame, label: str) -> str:
+    wanted = normalize_column_name(label)
+    for row in range(raw.shape[0]):
+        for col in range(raw.shape[1]):
+            if normalize_column_name(raw.iat[row, col]) != wanted:
+                continue
+            for next_col in range(col + 1, min(col + 5, raw.shape[1])):
+                value = clean_text(raw.iat[row, next_col])
+                if value:
+                    return value
+    return ""
+
+
+def find_spoc_onsite_header_row(raw: pd.DataFrame) -> int | None:
+    for row_index in range(min(len(raw), 80)):
+        headers = {normalize_column_name(value) for value in raw.iloc[row_index].tolist() if clean_text(value)}
+        if "part_no" in headers and "opening_stock" in headers:
+            return row_index
+    return None
+
+
+def parse_spoc_onsite_stock_raw(raw: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "Part No.",
+        "Part Name",
+        "Stock Qty",
+        "Stock Basis",
+        "Stock Date",
+        "Supplier",
+        "Buyer",
+        "MRP / Requirement",
+        "Closing Stock",
+    ]
+    if raw.empty:
+        return pd.DataFrame(columns=columns)
+
+    header_row = find_spoc_onsite_header_row(raw)
+    if header_row is None:
+        return pd.DataFrame(columns=columns)
+
+    headers = [clean_text(value) for value in raw.iloc[header_row].tolist()]
+    date_col = sheet_col(headers, "date")
+    part_col = sheet_col(headers, "part_no", "part_number", "component")
+    part_name_col = sheet_col(headers, "part_description", "description", "part_name", "object_description")
+    opening_col = sheet_col_contains(headers, "opening", "stock")
+    requirement_col = sheet_col(headers, "mrp_requirement", "mrp requirement", "requirement")
+    closing_col = sheet_col_contains(headers, "closing", "stock")
+
+    supplier = normalize_supplier_name(value_to_right_of_label(raw, "Supplier Name :"))
+    buyer = normalize_buyer_name(
+        value_to_right_of_label(raw, "SCM SPOC :")
+        or value_to_right_of_label(raw, "On Site SPOC :")
+    )
+
+    current_date = pd.NaT
+    records: list[dict[str, object]] = []
+    for row_index in range(header_row + 1, len(raw)):
+        parsed_date = parse_report_date(raw_cell(raw, row_index, date_col))
+        if pd.notna(parsed_date):
+            current_date = parsed_date
+
+        part_no = stock_part_key(raw_cell(raw, row_index, part_col))
+        if not part_no or part_no in {"#N/A", "N/A", "NA", "NONE", "-"}:
+            continue
+
+        opening_raw = raw_cell(raw, row_index, opening_col)
+        closing_raw = raw_cell(raw, row_index, closing_col)
+        requirement_raw = raw_cell(raw, row_index, requirement_col)
+        opening_stock = pd.to_numeric(opening_raw, errors="coerce")
+        closing_stock = pd.to_numeric(closing_raw, errors="coerce")
+        requirement = pd.to_numeric(requirement_raw, errors="coerce")
+        has_opening_stock = pd.notna(opening_stock)
+        has_closing_stock = pd.notna(closing_stock)
+        has_requirement = pd.notna(requirement)
+        if not (has_opening_stock or has_closing_stock or has_requirement):
+            continue
+
+        stock_qty = float(opening_stock) if has_opening_stock else 0.0
+        part_name = clean_text(raw_cell(raw, row_index, part_name_col)).upper()
+        stock_date = current_date.strftime("%Y-%m-%d") if pd.notna(current_date) else ""
+        records.append(
+            {
+                "Part No.": part_no,
+                "Part Name": part_name,
+                "Stock Qty": stock_qty,
+                "Stock Basis": f"SPOC opening stock {stock_date}".strip(),
+                "Stock Date": stock_date,
+                "Supplier": supplier,
+                "Buyer": buyer,
+                "MRP / Requirement": 0.0 if pd.isna(requirement) else float(requirement),
+                "Closing Stock": 0.0 if pd.isna(closing_stock) else float(closing_stock),
+            }
+        )
+
+    if not records:
+        return pd.DataFrame(columns=columns)
+
+    stock = pd.DataFrame(records, columns=columns)
+    stock["_date"] = pd.to_datetime(stock["Stock Date"], errors="coerce")
+    stock["_row"] = range(len(stock))
+    stock = (
+        stock.sort_values(["Part No.", "_date", "_row"])
+        .drop_duplicates("Part No.", keep="last")
+        .drop(columns=["_date", "_row"])
+        .reset_index(drop=True)
+    )
+    return stock[columns]
 
 
 def parse_spoc_summary_raw(raw: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, str]]:
@@ -1165,6 +1309,17 @@ def parse_sku_map(df: pd.DataFrame) -> dict[tuple[str, str], str]:
     return mapping
 
 
+def production_bucket(value: object) -> str:
+    text = str(value).upper().replace(" ", "")
+    if "P-VIN" in text or "PVIN" in text:
+        return "P-VIN"
+    if "VNA" in text:
+        return "VNA"
+    if "FREE" in text:
+        return "Free VIN"
+    return "Other"
+
+
 def parse_sheet_date(value: object) -> pd.Timestamp:
     text = clean_text(value)
     if not text:
@@ -1382,24 +1537,86 @@ def parse_vin_detail_production(
     sku_map: dict[tuple[str, str], str],
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     columns = ["Usage Date", "FG", "Produced Qty", "Production Source"]
-    unmatched_columns = ["Usage Date", "Model", "Color", "Produced Qty"]
-    detail, unmatched = parse_vin_detail_plan_actual(df, sku_map)
-    production = detail[["Plan Date", "FG", "Produced Qty"]].copy()
-    production = production[production["Produced Qty"] > 0]
-    production = production.rename(columns={"Plan Date": "Usage Date"})
-    production["Production Source"] = "VIN Details Daily"
+    unmatched_columns = ["Usage Date", "Model", "Color", "Produced Qty", "Production Source"]
+    if df.empty:
+        return pd.DataFrame(columns=columns), pd.DataFrame(columns=unmatched_columns)
+
+    rows = df.astype(str).to_numpy().tolist()
+    header_index = next(
+        (index for index, row in enumerate(rows) if row and row[0].strip() == "Model"),
+        None,
+    )
+    if header_index is None or header_index + 3 >= len(rows):
+        return pd.DataFrame(columns=columns), pd.DataFrame(columns=unmatched_columns)
+
+    date_header = rows[header_index]
+    date_columns: list[tuple[list[tuple[int, str]], pd.Timestamp]] = []
+    for index, value in enumerate(date_header):
+        if not re.fullmatch(r"\d{1,2}-[A-Za-z]{3}", value.strip()):
+            continue
+        usage_date = parse_sheet_date(value)
+        if pd.notna(usage_date) and index + 7 < len(date_header):
+            date_columns.append(
+                (
+                    [
+                        (index + 1, "P-VIN actuals"),
+                        (index + 3, "VNA actuals"),
+                        (index + 5, "Free VIN actuals"),
+                    ],
+                    usage_date.normalize(),
+                )
+            )
+
+    production_rows: list[dict[str, object]] = []
+    unmatched_rows: list[dict[str, object]] = []
+    current_model = ""
+    for row in rows[header_index + 3 :]:
+        if len(row) < 2:
+            continue
+        if row[0].strip():
+            current_model = row[0].strip()
+        color = row[1].strip()
+        if not current_model or not color:
+            continue
+        fg = sku_map.get((canonical_model(current_model), canonical_color(color)))
+        for actual_columns, usage_date in date_columns:
+            for column, source_label in actual_columns:
+                if column >= len(row):
+                    continue
+                quantity = pd.to_numeric(
+                    str(row[column]).replace(",", ""),
+                    errors="coerce",
+                )
+                if pd.isna(quantity) or float(quantity) <= 0:
+                    continue
+                values = {
+                    "Usage Date": usage_date,
+                    "Model": current_model,
+                    "Color": color,
+                    "Produced Qty": float(quantity),
+                    "Production Source": source_label,
+                }
+                if fg:
+                    production_rows.append(
+                        {
+                            "Usage Date": usage_date,
+                            "FG": fg,
+                            "Produced Qty": float(quantity),
+                            "Production Source": source_label,
+                        }
+                    )
+                else:
+                    unmatched_rows.append(values)
+
+    production = pd.DataFrame(production_rows, columns=columns)
     if not production.empty:
         production = (
-            production.groupby(
-                ["Usage Date", "FG", "Production Source"],
-                as_index=False,
-            )["Produced Qty"]
+            production.groupby(["Usage Date", "FG", "Production Source"], as_index=False)[
+                "Produced Qty"
+            ]
             .sum()
         )
-    unmatched = unmatched[unmatched["Produced Qty"] > 0].rename(
-        columns={"Plan Date": "Usage Date"}
-    )
-    return production, unmatched[unmatched_columns]
+    return production, pd.DataFrame(unmatched_rows, columns=unmatched_columns)
 
 
 def build_daily_production(
@@ -1413,15 +1630,10 @@ def build_daily_production(
     if production.empty:
         return production, unmatched
     production = (
-        production.groupby(["Usage Date", "FG"], as_index=False)
-        .agg(
-            {
-                "Produced Qty": "sum",
-                "Production Source": lambda values: ", ".join(
-                    sorted(set(map(str, values)))
-                ),
-            }
-        )
+        production.groupby(["Usage Date", "FG", "Production Source"], as_index=False)[
+            "Produced Qty"
+        ]
+        .sum()
         .sort_values(["Usage Date", "FG"], ascending=[False, True])
     )
     return production, unmatched
@@ -1446,10 +1658,16 @@ def compute_production_part_usage(
     output_columns = [
         "Usage Date",
         "Daily Total Production",
+        "P-VIN Produced Qty",
+        "VNA Produced Qty",
+        "Free VIN Produced Qty",
         "Part No.",
         "Part Name",
         "Material Type",
         "Supplier",
+        "P-VIN Production Used Qty",
+        "VNA Production Used Qty",
+        "Free VIN Production Used Qty",
         "Production Used Qty",
     ]
     required_bom = {"FG", "Component", "Qty per FG (exploded)"}
@@ -1480,6 +1698,7 @@ def compute_production_part_usage(
     detail["Production Used Qty"] = (
         detail["Produced Qty"] * detail["Qty per FG"]
     )
+    detail["Production Bucket"] = detail["Production Source"].map(production_bucket)
     usage = (
         detail.groupby(["Usage Date", "Component"], as_index=False)[
             "Production Used Qty"
@@ -1487,12 +1706,81 @@ def compute_production_part_usage(
         .sum()
         .rename(columns={"Component": "Part No."})
     )
+    source_usage = (
+        detail.pivot_table(
+            index=["Usage Date", "Component"],
+            columns="Production Bucket",
+            values="Production Used Qty",
+            aggfunc="sum",
+            fill_value=0,
+        )
+        .rename(
+            columns={
+                "P-VIN": "P-VIN Production Used Qty",
+                "VNA": "VNA Production Used Qty",
+                "Free VIN": "Free VIN Production Used Qty",
+            }
+        )
+        .reset_index()
+        .rename(columns={"Component": "Part No."})
+    )
+    for column in [
+        "P-VIN Production Used Qty",
+        "VNA Production Used Qty",
+        "Free VIN Production Used Qty",
+    ]:
+        if column not in source_usage.columns:
+            source_usage[column] = 0.0
+    usage = usage.merge(
+        source_usage[
+            [
+                "Usage Date",
+                "Part No.",
+                "P-VIN Production Used Qty",
+                "VNA Production Used Qty",
+                "Free VIN Production Used Qty",
+            ]
+        ],
+        on=["Usage Date", "Part No."],
+        how="left",
+    )
     daily_totals = (
         production.groupby("Usage Date", as_index=False)["Produced Qty"]
         .sum()
         .rename(columns={"Produced Qty": "Daily Total Production"})
     )
     usage = usage.merge(daily_totals, on="Usage Date", how="left")
+    production_with_bucket = production.copy()
+    production_with_bucket["Production Bucket"] = production_with_bucket[
+        "Production Source"
+    ].map(production_bucket)
+    source_daily_totals = (
+        production_with_bucket.pivot_table(
+            index="Usage Date",
+            columns="Production Bucket",
+            values="Produced Qty",
+            aggfunc="sum",
+            fill_value=0,
+        )
+        .rename(
+            columns={
+                "P-VIN": "P-VIN Produced Qty",
+                "VNA": "VNA Produced Qty",
+                "Free VIN": "Free VIN Produced Qty",
+            }
+        )
+        .reset_index()
+    )
+    for column in ["P-VIN Produced Qty", "VNA Produced Qty", "Free VIN Produced Qty"]:
+        if column not in source_daily_totals.columns:
+            source_daily_totals[column] = 0.0
+    usage = usage.merge(
+        source_daily_totals[
+            ["Usage Date", "P-VIN Produced Qty", "VNA Produced Qty", "Free VIN Produced Qty"]
+        ],
+        on="Usage Date",
+        how="left",
+    )
 
     if {"Component number", "Material type"}.issubset(part_types.columns):
         type_map = part_types[["Component number", "Material type"]].copy()
@@ -1627,9 +1915,17 @@ def combine_manual_outwarding(
     combined["Supplier"] = combined["Supplier"].replace("", "Not mapped")
     for column in [
         "Daily Total Production",
+        "P-VIN Produced Qty",
+        "VNA Produced Qty",
+        "Free VIN Produced Qty",
+        "P-VIN Production Used Qty",
+        "VNA Production Used Qty",
+        "Free VIN Production Used Qty",
         "Production Used Qty",
         "Servicing Used Qty",
     ]:
+        if column not in combined.columns:
+            combined[column] = 0.0
         combined[column] = numeric(combined[column])
     combined["Total Outwarding Qty"] = (
         combined["Production Used Qty"] + combined["Servicing Used Qty"]
@@ -1637,10 +1933,16 @@ def combine_manual_outwarding(
     ordered = [
         "Usage Date",
         "Daily Total Production",
+        "P-VIN Produced Qty",
+        "VNA Produced Qty",
+        "Free VIN Produced Qty",
         "Part No.",
         "Part Name",
         "Material Type",
         "Supplier",
+        "P-VIN Production Used Qty",
+        "VNA Production Used Qty",
+        "Free VIN Production Used Qty",
         "Production Used Qty",
         "Servicing Used Qty",
         "Total Outwarding Qty",
@@ -1649,6 +1951,103 @@ def combine_manual_outwarding(
         ["Usage Date", "Part No."],
         ascending=[False, True],
     )
+
+
+def enrich_outwarding_buyer_supplier(outwarding: pd.DataFrame) -> pd.DataFrame:
+    if outwarding.empty:
+        result = outwarding.copy()
+        if "Buyer" not in result.columns:
+            result["Buyer"] = ""
+        return result
+
+    mapping = load_current_buyer_mapping()
+    result = outwarding.copy()
+    if "Buyer" not in result.columns:
+        result["Buyer"] = ""
+    if mapping.empty:
+        result["Buyer"] = result["Buyer"].replace("", "Not mapped")
+        return result
+
+    mapping = mapping.copy()
+    mapping["Part Key"] = mapping["Part Number"].map(stock_part_key)
+    mapping["Supplier Key"] = mapping["Mapped Supplier"].map(supplier_match_key)
+    mapping["Supplier Prefix"] = mapping["Supplier Key"].str[:20]
+    mapping["Canonical Supplier Key"] = mapping["Mapped Supplier"].map(
+        canonical_supplier_key
+    )
+
+    part_supplier_map = (
+        mapping[mapping["Part Key"].ne("")]
+        .groupby("Part Key")["Mapped Supplier"]
+        .agg(joined_text)
+    )
+    part_buyer_map = (
+        mapping[mapping["Part Key"].ne("")]
+        .groupby("Part Key")["Buyer Name"]
+        .agg(joined_text)
+    )
+    supplier_buyer_map = (
+        mapping[mapping["Supplier Key"].ne("")]
+        .groupby("Supplier Key")["Buyer Name"]
+        .agg(joined_text)
+    )
+    supplier_prefix_buyer_map = (
+        mapping[mapping["Supplier Prefix"].ne("")]
+        .groupby("Supplier Prefix")["Buyer Name"]
+        .agg(joined_text)
+    )
+    canonical_supplier_buyer_map = (
+        mapping[mapping["Canonical Supplier Key"].ne("")]
+        .groupby("Canonical Supplier Key")["Buyer Name"]
+        .agg(joined_text)
+    )
+
+    part_keys = result["Part No."].map(stock_part_key)
+    mapped_suppliers = part_keys.map(part_supplier_map).fillna("")
+    result["Supplier"] = result["Supplier"].where(
+        mapped_suppliers.eq(""),
+        mapped_suppliers,
+    )
+
+    supplier_keys = result["Supplier"].map(supplier_match_key)
+    buyers = part_keys.map(part_buyer_map).fillna("")
+    buyers = buyers.where(
+        buyers.ne(""),
+        supplier_keys.map(supplier_buyer_map).fillna(""),
+    )
+    buyers = buyers.where(
+        buyers.ne(""),
+        supplier_keys.str[:20].map(supplier_prefix_buyer_map).fillna(""),
+    )
+    canonical_supplier_keys = result["Supplier"].map(canonical_supplier_key)
+    buyers = buyers.where(
+        buyers.ne(""),
+        canonical_supplier_keys.map(canonical_supplier_buyer_map).fillna(""),
+    )
+    result["Buyer"] = buyers.replace("", "Not mapped")
+
+    ordered = [
+        "Usage Date",
+        "Daily Total Production",
+        "P-VIN Produced Qty",
+        "VNA Produced Qty",
+        "Free VIN Produced Qty",
+        "Buyer",
+        "Part No.",
+        "Part Name",
+        "Material Type",
+        "Supplier",
+        "P-VIN Production Used Qty",
+        "VNA Production Used Qty",
+        "Free VIN Production Used Qty",
+        "Production Used Qty",
+        "Servicing Used Qty",
+        "Total Outwarding Qty",
+    ]
+    for column in ordered:
+        if column not in result.columns:
+            result[column] = ""
+    return result[ordered]
 
 
 def grn_reference(row: pd.Series) -> str:
@@ -1865,9 +2264,16 @@ def prepare_usage_for_agent(usage: pd.DataFrame) -> pd.DataFrame:
     columns = [
         "Usage Date",
         "Daily Total Production",
+        "P-VIN Produced Qty",
+        "VNA Produced Qty",
+        "Free VIN Produced Qty",
+        "Buyer",
         "Part No.",
         "Part Name",
         "Supplier",
+        "P-VIN Production Used Qty",
+        "VNA Production Used Qty",
+        "Free VIN Production Used Qty",
         "Production Used Qty",
         "Servicing Used Qty",
         "Total Outwarding Qty",
@@ -1883,12 +2289,19 @@ def prepare_usage_for_agent(usage: pd.DataFrame) -> pd.DataFrame:
     result = result[result["Usage Date"].notna()].copy()
     for column in [
         "Daily Total Production",
+        "P-VIN Produced Qty",
+        "VNA Produced Qty",
+        "Free VIN Produced Qty",
+        "P-VIN Production Used Qty",
+        "VNA Production Used Qty",
+        "Free VIN Production Used Qty",
         "Production Used Qty",
         "Servicing Used Qty",
         "Total Outwarding Qty",
     ]:
         result[column] = numeric(result[column])
     result["Part No."] = result["Part No."].astype(str).str.strip()
+    result["Buyer"] = result["Buyer"].fillna("").astype(str).str.strip()
     result["Part Name"] = result["Part Name"].fillna("").astype(str).str.strip()
     result["Supplier"] = result["Supplier"].fillna("").astype(str).str.strip()
     iso = result["Usage Date"].dt.isocalendar()
@@ -1949,8 +2362,12 @@ def weekly_part_usage_summary(usage: pd.DataFrame) -> pd.DataFrame:
     columns = [
         "Plan Week",
         "Part No.",
+        "Buyer",
         "Part Name",
         "Supplier",
+        "P-VIN Production Used Qty",
+        "VNA Production Used Qty",
+        "Free VIN Production Used Qty",
         "Production Used Qty",
         "Servicing Used Qty",
         "Total Outwarding Qty",
@@ -1961,8 +2378,12 @@ def weekly_part_usage_summary(usage: pd.DataFrame) -> pd.DataFrame:
         prepared.groupby(["Plan Week", "Part No."], as_index=False)
         .agg(
             **{
+                "Buyer": ("Buyer", joined_text),
                 "Part Name": ("Part Name", joined_text),
                 "Supplier": ("Supplier", joined_text),
+                "P-VIN Production Used Qty": ("P-VIN Production Used Qty", "sum"),
+                "VNA Production Used Qty": ("VNA Production Used Qty", "sum"),
+                "Free VIN Production Used Qty": ("Free VIN Production Used Qty", "sum"),
                 "Production Used Qty": ("Production Used Qty", "sum"),
                 "Servicing Used Qty": ("Servicing Used Qty", "sum"),
                 "Total Outwarding Qty": ("Total Outwarding Qty", "sum"),
@@ -2156,6 +2577,7 @@ def build_inbound_coverage_alerts(
 
     outward = weekly_part_usage_summary(current_usage).rename(
         columns={
+            "Buyer": "Outward Buyer",
             "Supplier": "Outward Supplier",
             "Total Outwarding Qty": "Outwarding Qty",
         }
@@ -2178,7 +2600,7 @@ def build_inbound_coverage_alerts(
         if column not in merged.columns:
             merged[column] = 0
         merged[column] = numeric(merged[column])
-    for column in ["Buyer", "Mapped Supplier", "Outward Supplier", "Inward Supplier", "Part Name", "Last Arrival Date"]:
+    for column in ["Buyer", "Mapped Supplier", "Outward Buyer", "Outward Supplier", "Inward Supplier", "Part Name", "Last Arrival Date"]:
         if column not in merged.columns:
             merged[column] = ""
         merged[column] = merged[column].fillna("").astype(str)
@@ -2205,7 +2627,11 @@ def build_inbound_coverage_alerts(
             or clean_text(row.get("Inward Supplier", ""))
             or "Unmapped supplier"
         )
-        buyer = clean_text(row.get("Buyer", "")) or "Akshat Taparia, Abhiraj Koslia"
+        buyer = (
+            clean_text(row.get("Buyer", ""))
+            or clean_text(row.get("Outward Buyer", ""))
+            or "Akshat Taparia, Abhiraj Koslia"
+        )
         if received_qty <= 0:
             severity = "Critical"
             issue_action = "No same-week GRN receipt is visible. Check opening stock, pending inwarding, and supplier commitment before issuing to line."
@@ -2238,6 +2664,301 @@ def build_inbound_coverage_alerts(
     return (
         alerts.sort_values(["_rank", "Plan Week", "Gap Qty"], ascending=[True, False, False])
         .drop(columns="_rank")
+        .reset_index(drop=True)
+    )
+
+
+def build_part_available_stock() -> pd.DataFrame:
+    columns = ["Part No.", "Stock Qty", "Stock Basis"]
+    spoc_stock = parse_spoc_onsite_stock_raw(load_sheet_snapshot(SPOC_SUMMARY_SNAPSHOT_CSV))
+    if not spoc_stock.empty:
+        spoc_result = spoc_stock[columns].copy()
+    else:
+        spoc_result = pd.DataFrame(columns=columns)
+
+    inventory = load_table("part_inventory")
+    if inventory.empty:
+        return spoc_result
+
+    stock_candidates = [
+        ("Physical Stock", "Physical stock"),
+        ("Closing Stock", "Closing stock"),
+        ("System Stock", "SAP/system stock"),
+        ("Opening Stock", "Opening stock"),
+    ]
+    records: list[dict[str, object]] = []
+    for _, row in inventory.iterrows():
+        part_no = stock_part_key(row.get("Part No.", ""))
+        if not part_no:
+            continue
+        stock_qty = 0.0
+        stock_basis = "No stock source"
+        for column, label in stock_candidates:
+            value = clean_text(row.get(column, ""))
+            if value:
+                stock_qty = scalar_float(value)
+                stock_basis = label
+                break
+        records.append(
+            {
+                "Part No.": part_no,
+                "Stock Qty": stock_qty,
+                "Stock Basis": stock_basis,
+            }
+        )
+
+    inventory_stock = pd.DataFrame(records, columns=columns) if records else pd.DataFrame(columns=columns)
+    if inventory_stock.empty:
+        return spoc_result
+
+    if not spoc_result.empty:
+        inventory_stock = inventory_stock[
+            ~inventory_stock["Part No."].isin(spoc_result["Part No."])
+        ]
+    combined = pd.concat([spoc_result, inventory_stock], ignore_index=True)
+    if combined.empty:
+        return pd.DataFrame(columns=columns)
+    return (
+        combined.groupby("Part No.", as_index=False)
+        .agg(
+            **{
+                "Stock Qty": ("Stock Qty", "sum"),
+                "Stock Basis": ("Stock Basis", joined_text),
+            }
+        )
+        .sort_values("Part No.")
+        .reset_index(drop=True)
+    )
+
+
+def allocation_recommendation(
+    production_shortfall: float,
+    servicing_shortfall: float,
+    surplus_qty: float,
+) -> tuple[str, str, str]:
+    if production_shortfall > 0:
+        return (
+            "Critical",
+            "Production constrained",
+            "Reserve the production allocation first, pull in supplier/GRN support, and avoid releasing uncovered line demand.",
+        )
+    if servicing_shortfall > 0:
+        return (
+            "Watch",
+            "Servicing constrained",
+            "Release the allocated servicing quantity only and keep the balance as pending/backorder until more stock is received.",
+        )
+    if surplus_qty > 0:
+        return (
+            "OK",
+            "Fully covered with surplus",
+            "Allocate full production and servicing demand; hold surplus in store or keep it visible for the next call-off.",
+        )
+    return (
+        "OK",
+        "Fully covered",
+        "Allocate full production and servicing demand.",
+    )
+
+
+def build_allocation_optimizer(
+    current_usage: pd.DataFrame,
+    grn_df: pd.DataFrame,
+    production_guard_pct: float,
+    servicing_guard_pct: float,
+    production_priority_weight: float,
+    servicing_priority_weight: float,
+) -> pd.DataFrame:
+    columns = [
+        "Severity",
+        "Plan Week",
+        "Buyer",
+        "Supplier",
+        "Part No.",
+        "Part Name",
+        "Starting Stock Qty",
+        "Starting Stock Source",
+        "GRN Received Qty",
+        "Available Qty",
+        "Production Demand",
+        "Servicing Demand",
+        "Production Allocation",
+        "Servicing Allocation",
+        "Production Shortfall",
+        "Servicing Shortfall",
+        "Projected Closing Stock",
+        "Decision",
+        "Recommended Action",
+    ]
+    usage = weekly_part_usage_summary(current_usage)
+    if usage.empty:
+        return pd.DataFrame(columns=columns)
+
+    usage = usage.rename(
+        columns={
+            "Buyer": "Outward Buyer",
+            "Supplier": "Outward Supplier",
+            "Production Used Qty": "Production Demand",
+            "Servicing Used Qty": "Servicing Demand",
+        }
+    )
+    usage["Part No."] = usage["Part No."].apply(stock_part_key)
+    usage = usage[usage["Part No."].ne("")].copy()
+    if usage.empty:
+        return pd.DataFrame(columns=columns)
+
+    inward = weekly_grn_receipts_summary(grn_df).rename(
+        columns={"Received Qty": "GRN Received Qty"}
+    )
+    stock = build_part_available_stock()
+    owners = load_part_owner_lookup()
+
+    allocation = usage.merge(
+        inward[["Plan Week", "Part No.", "Inward Supplier", "GRN Received Qty"]],
+        on=["Plan Week", "Part No."],
+        how="left",
+    )
+    if not stock.empty:
+        allocation = allocation.merge(stock, on="Part No.", how="left")
+    else:
+        allocation["Stock Qty"] = 0
+    if not owners.empty:
+        allocation = allocation.merge(owners, on="Part No.", how="left")
+    else:
+        allocation["Buyer"] = ""
+        allocation["Mapped Supplier"] = ""
+
+    for column in [
+        "Stock Qty",
+        "GRN Received Qty",
+        "Production Demand",
+        "Servicing Demand",
+    ]:
+        if column not in allocation.columns:
+            allocation[column] = 0
+        allocation[column] = numeric(allocation[column])
+    for column in ["Buyer", "Mapped Supplier", "Outward Buyer", "Outward Supplier", "Inward Supplier", "Part Name", "Stock Basis"]:
+        if column not in allocation.columns:
+            allocation[column] = ""
+        allocation[column] = allocation[column].fillna("").astype(str)
+
+    production_guard = max(float(production_guard_pct), 0) / 100
+    servicing_guard = max(float(servicing_guard_pct), 0) / 100
+    production_weight = max(float(production_priority_weight), 0.1)
+    servicing_weight = max(float(servicing_priority_weight), 0.1)
+
+    allocation = allocation.sort_values(["Part No.", "Plan Week"]).reset_index(drop=True)
+    records: list[dict[str, object]] = []
+    for _, part_rows in allocation.groupby("Part No.", sort=False):
+        carryover_stock = scalar_float(part_rows.iloc[0].get("Stock Qty", 0))
+        for _, row in part_rows.iterrows():
+            production_demand = scalar_float(row.get("Production Demand", 0))
+            servicing_demand = scalar_float(row.get("Servicing Demand", 0))
+            grn_received = scalar_float(row.get("GRN Received Qty", 0))
+            starting_stock = carryover_stock
+            available_qty = max(starting_stock, 0) + max(grn_received, 0)
+            if production_demand <= 0 and servicing_demand <= 0:
+                carryover_stock = available_qty
+                continue
+
+            remaining = max(available_qty, 0)
+            production_allocation = 0.0
+            servicing_allocation = 0.0
+
+            protected_production = min(production_demand, production_demand * production_guard)
+            protected_servicing = min(servicing_demand, servicing_demand * servicing_guard)
+
+            take = min(remaining, protected_production)
+            production_allocation += take
+            remaining -= take
+
+            take = min(remaining, protected_servicing)
+            servicing_allocation += take
+            remaining -= take
+
+            production_gap = max(production_demand - production_allocation, 0)
+            servicing_gap = max(servicing_demand - servicing_allocation, 0)
+            if remaining > 0 and (production_gap > 0 or servicing_gap > 0):
+                weighted_production = production_gap * production_weight
+                weighted_servicing = servicing_gap * servicing_weight
+                total_weight = weighted_production + weighted_servicing
+                if total_weight > 0:
+                    extra_production = min(
+                        production_gap,
+                        remaining * weighted_production / total_weight,
+                    )
+                    extra_servicing = min(
+                        servicing_gap,
+                        remaining * weighted_servicing / total_weight,
+                    )
+                    leftover = remaining - extra_production - extra_servicing
+                    if leftover > 0:
+                        production_more = min(production_gap - extra_production, leftover)
+                        extra_production += production_more
+                        leftover -= production_more
+                    if leftover > 0:
+                        extra_servicing += min(servicing_gap - extra_servicing, leftover)
+
+                    production_allocation += extra_production
+                    servicing_allocation += extra_servicing
+
+            production_shortfall = max(production_demand - production_allocation, 0)
+            servicing_shortfall = max(servicing_demand - servicing_allocation, 0)
+            projected_closing = max(
+                available_qty - production_allocation - servicing_allocation,
+                0,
+            )
+            carryover_stock = projected_closing
+            severity, decision, recommended_action = allocation_recommendation(
+                production_shortfall,
+                servicing_shortfall,
+                projected_closing,
+            )
+            supplier = (
+                clean_text(row.get("Mapped Supplier", ""))
+                or clean_text(row.get("Outward Supplier", ""))
+                or clean_text(row.get("Inward Supplier", ""))
+                or "Unmapped supplier"
+            )
+            buyer = (
+                clean_text(row.get("Buyer", ""))
+                or clean_text(row.get("Outward Buyer", ""))
+                or "Akshat Taparia, Abhiraj Koslia"
+            )
+
+            records.append(
+                {
+                    "Severity": severity,
+                    "Plan Week": row.get("Plan Week", ""),
+                    "Buyer": buyer,
+                    "Supplier": supplier,
+                    "Part No.": row.get("Part No.", ""),
+                    "Part Name": row.get("Part Name", ""),
+                    "Starting Stock Qty": starting_stock,
+                    "Starting Stock Source": clean_text(row.get("Stock Basis", "")) or "No stock source",
+                    "GRN Received Qty": grn_received,
+                    "Available Qty": available_qty,
+                    "Production Demand": production_demand,
+                    "Servicing Demand": servicing_demand,
+                    "Production Allocation": production_allocation,
+                    "Servicing Allocation": servicing_allocation,
+                    "Production Shortfall": production_shortfall,
+                    "Servicing Shortfall": servicing_shortfall,
+                    "Projected Closing Stock": projected_closing,
+                    "Decision": decision,
+                    "Recommended Action": recommended_action,
+                }
+            )
+
+    if not records:
+        return pd.DataFrame(columns=columns)
+    result = pd.DataFrame(records, columns=columns)
+    severity_rank = {"Critical": 0, "Watch": 1, "OK": 2}
+    result["_rank"] = result["Severity"].map(severity_rank).fillna(9)
+    result["_shortfall"] = result["Production Shortfall"] + result["Servicing Shortfall"]
+    return (
+        result.sort_values(["_rank", "Plan Week", "_shortfall"], ascending=[True, False, False])
+        .drop(columns=["_rank", "_shortfall"])
         .reset_index(drop=True)
     )
 
@@ -2294,14 +3015,56 @@ def weekly_grn_receipts_summary(grn_df: pd.DataFrame) -> pd.DataFrame:
     return grouped[columns]
 
 
+def load_current_buyer_mapping() -> pd.DataFrame:
+    columns = ["Part Number", "Mapped Supplier", "Buyer Name"]
+    mapping = clean_buyer_mapping_source(load_source_cache(BUYER_MAPPING_CACHE_PATH))
+    if not mapping.empty:
+        return mapping
+
+    inwarding = load_source_cache(INWARDING_SNAPSHOT_PATH)
+    required_columns = {"Part Number", "Supplier Name", "Buyer Name"}
+    if required_columns.issubset(inwarding.columns):
+        fallback = inwarding[["Part Number", "Supplier Name", "Buyer Name"]].copy()
+        fallback.columns = columns
+        fallback = fallback[fallback["Buyer Name"].ne("Not mapped")]
+        mapping = clean_buyer_mapping_source(fallback)
+        if not mapping.empty:
+            return mapping
+
+    return pd.DataFrame(columns=columns)
+
+
 def load_part_owner_lookup() -> pd.DataFrame:
+    columns = ["Part No.", "Buyer", "Mapped Supplier"]
+    mapping = load_current_buyer_mapping()
+    if not mapping.empty:
+        part_lookup = mapping[mapping["Part Number"].ne("")].copy()
+        if not part_lookup.empty:
+            part_lookup = part_lookup.rename(
+                columns={
+                    "Part Number": "Part No.",
+                    "Buyer Name": "Buyer",
+                }
+            )
+            return (
+                part_lookup.groupby("Part No.", as_index=False)
+                .agg(
+                    **{
+                        "Buyer": ("Buyer", joined_text),
+                        "Mapped Supplier": ("Mapped Supplier", joined_text),
+                    }
+                )
+                .sort_values("Part No.")
+                .reset_index(drop=True)
+            )
+
     raw = load_sheet_snapshot(SPOC_SUMMARY_SNAPSHOT_CSV)
     if raw.empty:
-        return pd.DataFrame(columns=["Part No.", "Buyer", "Mapped Supplier"])
+        return pd.DataFrame(columns=columns)
     try:
         parts, _ = parse_spoc_summary_raw(raw)
     except Exception:
-        return pd.DataFrame(columns=["Part No.", "Buyer", "Mapped Supplier"])
+        return pd.DataFrame(columns=columns)
     return build_part_owner_lookup(parts)
 
 
@@ -5167,6 +5930,277 @@ def render_inbound_coverage_agent(combined: pd.DataFrame) -> None:
     )
 
 
+def render_allocation_optimizer_agent(combined: pd.DataFrame) -> None:
+    st.subheader("Production vs Servicing Allocation Optimizer")
+    st.write(
+        "Allocates available part quantity across production and servicing demand. "
+        "Available quantity is treated as current stock plus same-week GRN receipts."
+    )
+
+    grn_df = load_grn_sheet_display_snapshot()
+    if grn_df.empty:
+        st.info("No saved GRN copy is available yet. Open Inwarding Parts and refresh the inwarding snapshot.")
+        return
+
+    controls = st.columns(4)
+    with controls[0]:
+        production_guard_pct = st.slider(
+            "Production guard %",
+            min_value=0,
+            max_value=100,
+            value=90,
+            step=5,
+            help="Minimum share of production demand to protect before weighted allocation starts.",
+        )
+    with controls[1]:
+        servicing_guard_pct = st.slider(
+            "Servicing guard %",
+            min_value=0,
+            max_value=100,
+            value=20,
+            step=5,
+            help="Minimum share of servicing demand to protect so servicing is not starved.",
+        )
+    with controls[2]:
+        production_priority_weight = st.number_input(
+            "Production weight",
+            min_value=0.1,
+            value=3.0,
+            step=0.5,
+            help="Higher weight sends more remaining constrained stock to production.",
+        )
+    with controls[3]:
+        servicing_priority_weight = st.number_input(
+            "Servicing weight",
+            min_value=0.1,
+            value=1.0,
+            step=0.5,
+            help="Higher weight sends more remaining constrained stock to servicing.",
+        )
+
+    allocation = build_allocation_optimizer(
+        current_usage=combined,
+        grn_df=grn_df,
+        production_guard_pct=float(production_guard_pct),
+        servicing_guard_pct=float(servicing_guard_pct),
+        production_priority_weight=float(production_priority_weight),
+        servicing_priority_weight=float(servicing_priority_weight),
+    )
+    if allocation.empty:
+        st.info("No production or servicing demand is available for allocation.")
+        return
+
+    critical_count = int(allocation["Severity"].eq("Critical").sum())
+    watch_count = int(allocation["Severity"].eq("Watch").sum())
+    production_shortfall = numeric(allocation["Production Shortfall"]).sum()
+    servicing_shortfall = numeric(allocation["Servicing Shortfall"]).sum()
+    cols = st.columns(4)
+    with cols[0]:
+        render_metric("Critical allocations", f"{critical_count:,}", "bad" if critical_count else "ok")
+    with cols[1]:
+        render_metric("Watch allocations", f"{watch_count:,}", "warn" if watch_count else "ok")
+    with cols[2]:
+        render_metric("Production shortfall", f"{production_shortfall:,.0f}", "bad" if production_shortfall else "ok")
+    with cols[3]:
+        render_metric("Servicing shortfall", f"{servicing_shortfall:,.0f}", "warn" if servicing_shortfall else "ok")
+
+    st.caption(
+        "Algorithm: starting stock + same-week GRN is allocated to production and servicing; "
+        "projected closing stock carries forward as the next week's starting stock for that part."
+    )
+    st.dataframe(
+        allocation.head(AGENT_TABLE_LIMIT),
+        use_container_width=True,
+        hide_index=True,
+        height=420,
+        column_config={
+            "Starting Stock Qty": st.column_config.NumberColumn(format="%.0f"),
+            "GRN Received Qty": st.column_config.NumberColumn(format="%.0f"),
+            "Available Qty": st.column_config.NumberColumn(format="%.0f"),
+            "Production Demand": st.column_config.NumberColumn(format="%.0f"),
+            "Servicing Demand": st.column_config.NumberColumn(format="%.0f"),
+            "Production Allocation": st.column_config.NumberColumn(format="%.0f"),
+            "Servicing Allocation": st.column_config.NumberColumn(format="%.0f"),
+            "Production Shortfall": st.column_config.NumberColumn(format="%.0f"),
+            "Servicing Shortfall": st.column_config.NumberColumn(format="%.0f"),
+            "Projected Closing Stock": st.column_config.NumberColumn(format="%.0f"),
+        },
+    )
+    if len(allocation) > AGENT_TABLE_LIMIT:
+        st.caption(f"Showing first {AGENT_TABLE_LIMIT:,} allocations out of {len(allocation):,}.")
+    st.download_button(
+        "Download allocation recommendations CSV",
+        allocation.to_csv(index=False),
+        file_name="production_servicing_allocation.csv",
+        mime="text/csv",
+    )
+
+
+def render_outwarding_data_timeline(
+    production: pd.DataFrame,
+    manual_outwarding: pd.DataFrame,
+    combined: pd.DataFrame,
+) -> None:
+    source_rows = [
+        data_file_health_row(
+            "Production planning weekly report",
+            SOURCE_SHEETS["vin_details"]["cache"],
+            "finished-goods output by day/shift",
+        ),
+        data_file_health_row(
+            "FG / SKU mapping",
+            SOURCE_SHEETS["sku_map"]["cache"],
+            "maps produced variants to FG codes",
+        ),
+        data_file_health_row(
+            "Exploded BOM",
+            SOURCE_SHEETS["exploded_bom"]["cache"],
+            "converts FG production into part demand",
+        ),
+        data_file_health_row(
+            "Raw BOM",
+            SOURCE_SHEETS["raw_bom"]["cache"],
+            "fallback component attributes",
+        ),
+        data_file_health_row(
+            "Part supplier mapping",
+            SOURCE_SHEETS["suppliers"]["cache"],
+            "supplier names for consumed parts",
+        ),
+        data_file_health_row(
+            "Current buyer mapping",
+            BUYER_MAPPING_CACHE_PATH,
+            "buyer/supplier ownership",
+        ),
+        data_file_health_row(
+            "GRN / gate entry snapshot",
+            INWARDING_SNAPSHOT_PATH,
+            "same-week incoming quantity",
+        ),
+        data_file_health_row(
+            "SPOC onsite opening stock",
+            SPOC_SUMMARY_SNAPSHOT_CSV,
+            "opening stock for allocation",
+        ),
+        data_file_health_row(
+            "Saved servicing input",
+            TABLES["outwarding_parts"]["file"],
+            "manual servicing demand",
+        ),
+        data_file_health_row(
+            "Computed outwarding cache",
+            COMPUTED_USAGE_CACHE_PATH,
+            "last calculated production + servicing demand",
+        ),
+    ]
+
+    production_demand = numeric(
+        combined.get("Production Used Qty", pd.Series(index=combined.index))
+    ).sum()
+    production_split = pd.Series(dtype=float)
+    if not production.empty and {"Production Source", "Produced Qty"}.issubset(production.columns):
+        production_split = (
+            production.assign(
+                _bucket=production["Production Source"].map(production_bucket)
+            )
+            .groupby("_bucket")["Produced Qty"]
+            .sum()
+        )
+    servicing_demand = numeric(
+        combined.get("Servicing Used Qty", pd.Series(index=combined.index))
+    ).sum()
+    total_outwarding = numeric(
+        combined.get("Total Outwarding Qty", pd.Series(index=combined.index))
+    ).sum()
+    valid_servicing_rows = pd.DataFrame()
+    if {"Part No.", "Used Qty"}.issubset(manual_outwarding.columns):
+        valid_servicing_rows = manual_outwarding[
+            manual_outwarding["Part No."].astype(str).str.strip().ne("")
+            & numeric(manual_outwarding["Used Qty"]).gt(0)
+        ]
+
+    stock_source = build_part_available_stock()
+    spoc_stock_rows = 0
+    if not stock_source.empty and "Stock Basis" in stock_source.columns:
+        spoc_stock_rows = int(
+            stock_source["Stock Basis"]
+            .astype(str)
+            .str.contains("SPOC", case=False, na=False)
+            .sum()
+        )
+
+    with st.expander("Data timeline and source health", expanded=True):
+        st.caption(
+            "Use this before trusting the agent output. If a source was changed in "
+            "Google Sheets, the app will not use it until that source is refreshed "
+            "or the servicing table is saved."
+        )
+        st.dataframe(
+            pd.DataFrame(source_rows),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        metric_columns = st.columns(5)
+        with metric_columns[0]:
+            render_metric(
+                "Production rows",
+                f"{len(production):,}",
+                "ok" if len(production) else "bad",
+            )
+        with metric_columns[1]:
+            render_metric(
+                "Production demand",
+                f"{production_demand:,.0f}",
+                "ok" if production_demand else "bad",
+            )
+        with metric_columns[2]:
+            render_metric(
+                "Servicing rows",
+                f"{len(valid_servicing_rows):,}",
+                "ok" if len(valid_servicing_rows) else "warn",
+            )
+        with metric_columns[3]:
+            render_metric(
+                "Servicing demand",
+                f"{servicing_demand:,.0f}",
+                "ok" if servicing_demand else "warn",
+            )
+        with metric_columns[4]:
+            render_metric(
+                "Stock sources",
+                f"{len(stock_source):,}",
+                "ok" if len(stock_source) else "bad",
+            )
+
+        st.caption(
+            f"Total outwarding demand currently calculated: {total_outwarding:,.0f}. "
+            f"SPOC opening-stock rows feeding allocation: {spoc_stock_rows:,}."
+        )
+        st.caption(
+            "Production split feeding BOM: "
+            f"P-VIN {production_split.get('P-VIN', 0):,.0f}, "
+            f"VNA {production_split.get('VNA', 0):,.0f}, "
+            f"Free VIN {production_split.get('Free VIN', 0):,.0f}."
+        )
+        if servicing_demand <= 0:
+            st.warning(
+                "Servicing demand is currently zero. Add part-level servicing rows "
+                "with Part No., Used Qty, and Usage Date in the Servicing outwarding "
+                "input table, then press Save changes."
+            )
+        if not TABLES["outwarding_parts"]["file"].exists():
+            st.info(
+                "No saved servicing input file exists yet. Unsaved table edits are "
+                "not treated as a stable data pipeline input."
+            )
+        if stock_source.empty:
+            st.warning(
+                "No opening-stock source is available, so allocation will behave "
+                "like all parts start from zero stock plus GRN."
+            )
+
+
 def render_outwarding_sources(manual_outwarding: pd.DataFrame) -> None:
     st.subheader("Computed Daily Part Usage")
     st.write(
@@ -5229,6 +6263,7 @@ def render_outwarding_sources(manual_outwarding: pd.DataFrame) -> None:
         sources["suppliers"],
     )
     combined = combine_manual_outwarding(production_usage, manual_outwarding)
+    combined = enrich_outwarding_buyer_supplier(combined)
     if combined.empty:
         st.warning("No computable production or manual outwarding rows were found.")
         return
@@ -5265,15 +6300,19 @@ def render_outwarding_sources(manual_outwarding: pd.DataFrame) -> None:
             "ok",
         )
 
+    render_outwarding_data_timeline(production, manual_outwarding, combined)
+
     render_outwarding_flagging_agent(combined)
     st.divider()
     render_inbound_coverage_agent(combined)
+    st.divider()
+    render_allocation_optimizer_agent(combined)
     st.divider()
 
     filtered = combined.copy()
     min_date = filtered["Usage Date"].min().date()
     max_date = filtered["Usage Date"].max().date()
-    filter_columns = st.columns([1.7, 2, 2, 1.3])
+    filter_columns = st.columns([1.5, 1.8, 1.8, 1.8, 1.2])
     with filter_columns[0]:
         selected_dates = st.date_input(
             "Usage date range",
@@ -5289,6 +6328,18 @@ def render_outwarding_sources(manual_outwarding: pd.DataFrame) -> None:
             key="computed_usage_part_search",
         )
     with filter_columns[2]:
+        buyer_options = sorted(
+            value
+            for value in filtered["Buyer"].astype(str).unique()
+            if value
+        )
+        selected_buyers = st.multiselect(
+            "Buyer",
+            buyer_options,
+            placeholder="All buyers",
+            key="computed_usage_buyers",
+        )
+    with filter_columns[3]:
         supplier_options = sorted(
             {
                 supplier.strip()
@@ -5303,7 +6354,7 @@ def render_outwarding_sources(manual_outwarding: pd.DataFrame) -> None:
             placeholder="All suppliers",
             key="computed_usage_suppliers",
         )
-    with filter_columns[3]:
+    with filter_columns[4]:
         material_options = sorted(
             value
             for value in filtered["Material Type"].astype(str).unique()
@@ -5327,6 +6378,8 @@ def render_outwarding_sources(manual_outwarding: pd.DataFrame) -> None:
             .astype(str)
             .str.contains(part_search.strip(), case=False, na=False, regex=False)
         ]
+    if selected_buyers:
+        filtered = filtered[filtered["Buyer"].isin(selected_buyers)]
     if selected_suppliers:
         selected_supplier_set = set(selected_suppliers)
         filtered = filtered[
@@ -5356,6 +6409,12 @@ def render_outwarding_sources(manual_outwarding: pd.DataFrame) -> None:
         hide_index=True,
         column_config={
             "Daily Total Production": st.column_config.NumberColumn(format="%.0f"),
+            "P-VIN Produced Qty": st.column_config.NumberColumn(format="%.0f"),
+            "VNA Produced Qty": st.column_config.NumberColumn(format="%.0f"),
+            "Free VIN Produced Qty": st.column_config.NumberColumn(format="%.0f"),
+            "P-VIN Production Used Qty": st.column_config.NumberColumn(format="%.3f"),
+            "VNA Production Used Qty": st.column_config.NumberColumn(format="%.3f"),
+            "Free VIN Production Used Qty": st.column_config.NumberColumn(format="%.3f"),
             "Production Used Qty": st.column_config.NumberColumn(format="%.3f"),
             "Servicing Used Qty": st.column_config.NumberColumn(format="%.3f"),
             "Total Outwarding Qty": st.column_config.NumberColumn(format="%.3f"),
@@ -5397,11 +6456,17 @@ def render_outwarding_sources(manual_outwarding: pd.DataFrame) -> None:
 
 def render_outwarding() -> None:
     st.header("Outwarding Parts")
-    st.write("Production consumption is calculated from daily production × BOM.")
-    empty_manual_outwarding = pd.DataFrame(
-        columns=TABLES["outwarding_parts"]["columns"]
+    st.write(
+        "Production consumption is calculated from daily production × BOM. "
+        "Servicing demand can be entered below and is added to total outwarding."
     )
-    render_outwarding_sources(empty_manual_outwarding)
+    with st.expander("Servicing outwarding input", expanded=False):
+        st.caption(
+            "Enter servicing material usage here. These rows feed `Servicing Used Qty` "
+            "and are included in the allocation optimizer."
+        )
+        manual_outwarding = render_editable_table("outwarding_parts")
+    render_outwarding_sources(manual_outwarding)
 
 
 def agent_action_id(

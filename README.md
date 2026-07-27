@@ -12,6 +12,7 @@ Clean Streamlit starter app for collaborative inventory work.
 - GRN Data Quality Agent for missing receipt fields, quantity issues, discrepancies, and duplicate GRN lines
 - Production Change Flagging Agent for outwarding-plan fluctuations and owner alert logs
 - Inbound Coverage Agent comparing weekly outwarding demand against saved GRN receipts
+- Production vs Servicing Allocation Optimizer for splitting constrained stock between line demand and service demand
 - Supplier Ownership Agent mapping risky supplier/part pockets to buyer follow-up owners
 - Basic stock risk flags
 - CSV-backed storage in `data/`
@@ -147,6 +148,10 @@ daily production = P-VIN actual + VNA actual + Free VIN actual
 part usage = daily FG production × exploded BOM quantity
 ```
 
+The app keeps the production buckets separate after BOM explosion, so computed
+part usage includes `P-VIN Production Used Qty`, `VNA Production Used Qty`, and
+`Free VIN Production Used Qty` as well as the total `Production Used Qty`.
+
 The **Production Change Flagging Agent** compares the current outwarding
 calculation against a saved baseline. It flags:
 
@@ -174,13 +179,41 @@ does not cover the outwarding requirement. This is a warning signal only; final
 stock should still consider opening stock, physical stock, and approved
 adjustments.
 
+The **Production vs Servicing Allocation Optimizer** takes:
+
+```text
+available quantity = current stock + same-week GRN received quantity
+total outwarding demand = production demand + servicing demand
+projected closing stock = available quantity - production allocation - servicing allocation
+```
+
+It protects a configurable production guard, protects a configurable servicing
+guard, then splits any remaining constrained stock using production and
+servicing priority weights. The output recommends how much quantity to allocate
+to production, how much to allocate to servicing, expected shortfall, projected
+closing stock, and the follow-up action. For each part, projected closing stock
+is carried forward as the next week's starting stock, so the same opening stock
+is not counted again and again.
+
 OAuth tokens and downloaded source caches remain local and are ignored by Git.
+
+## Optimizer Data Sources
+
+The allocation optimizer uses these app data sources and columns:
+
+- **Production Planning Weekly Report**: `vin_details_daily.csv` and `daywise_sku_map.csv` provide production date, variant/model/color, P-VIN actuals, VNA actuals, Free VIN actuals, and FG mapping.
+- **BOM Master**: `exploded_bom.csv` uses `FG`, `Component`, and `Qty per FG (exploded)` to calculate production part demand; `raw_bom.csv` adds part description and material type.
+- **Gate Entry / GRN**: `inwarding_sheet_snapshot.csv` and `grn_sheet_snapshot.csv` use `Date`, `Part Number`, `Supplier Name`, and `Receipt Qty` for same-week inbound visibility.
+- **SPOCs Onsite Update**: `spoc_summary_snapshot.csv` uses `Part No`, `Part Description`, `Opening Stock`, `MRP requirement`, and `Closing Stock`; latest nonblank `Opening Stock` is used as optimizer starting stock.
+- **Servicing demand**: the **Servicing outwarding input** table in Outwarding Parts uses `Part No.`, `Used Qty`, and `Usage Date`.
+- **Buyer mapping**: `buyer_mapping_source.csv` uses `Part Number`, `Mapped Supplier`, and `Buyer Name`; part-number mapping is preferred, supplier-name mapping is fallback.
 
 ## Agent summary
 
 - **GRN Data Quality Agent**: checks saved GRN rows before they affect stock.
 - **Production Change Flagging Agent**: compares the current outwarding plan to a saved baseline.
 - **Inbound Coverage Agent**: checks whether inwarding visibility covers outwarding pressure.
+- **Production vs Servicing Allocation Optimizer**: recommends constrained-stock allocation across production and servicing.
 - **Supplier Ownership Agent**: turns risky supplier/part groups into buyer follow-up rows.
 
 
@@ -230,6 +263,12 @@ changes or a later refresh fails.
 Each inwarding row is enriched with its SCM buyer from the configured buyer
 mapping sheet. Part number is matched first, followed by a normalized supplier
 name; unresolved source rows are shown as `Not mapped`.
+
+The same buyer mapping cache is also used by **Outwarding Parts**. Outwarding
+part rows are mapped by part number first, then by supplier name, so the
+supplier/buyer owner shown in outwarding stays aligned with the inwarding
+agent's current mapping sheet.
+
 ## Inwarding discrepancy agent
 
 The discrepancy-agent section under **Inwarding Parts** continuously checks the
