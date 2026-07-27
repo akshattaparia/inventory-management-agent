@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import json
 import os
+import hashlib
 import subprocess
 import sys
 from datetime import datetime, timedelta
@@ -92,6 +93,41 @@ OUTWARDING_BASELINE_PATH = DATA_DIR / "outwarding_plan_baseline.csv"
 OUTWARDING_ALERT_LOG_PATH = DATA_DIR / "outwarding_alert_log.csv"
 OUTWARDING_OWNER_DEFAULT = "Akshat Taparia, Abhiraj Koslia"
 AGENT_TABLE_LIMIT = 250
+INWARDING_SHEET_URL = DEFAULT_GOOGLE_SHEET_URL
+INWARDING_SNAPSHOT_PATH = DATA_DIR / "inwarding_sheet_snapshot.csv"
+INWARDING_SNAPSHOT_META_PATH = DATA_DIR / "inwarding_sheet_snapshot.json"
+BUYER_MAPPING_SHEET_URL = (
+    "https://docs.google.com/spreadsheets/d/"
+    "147vIBFZxf6aQddMG-cpQmuFtcM-6nH0pjn0HDHMyLhE/edit?gid=0#gid=0"
+)
+BUYER_MAPPING_CACHE_PATH = DATA_DIR / "buyer_mapping_source.csv"
+AGENT_ACTIONS_PATH = DATA_DIR / "agent_actions.csv"
+AGENT_ACTION_COLUMNS = [
+    "Action ID",
+    "Active",
+    "Issue Type",
+    "Severity",
+    "Buyer Name",
+    "Supplier Name",
+    "Part Number",
+    "Part Name",
+    "Gate Entry No",
+    "Entry Date",
+    "Invoice Qty",
+    "Receipt Qty",
+    "Difference Qty",
+    "Latest Production Demand",
+    "Production Impact",
+    "Reason",
+    "Status",
+    "Age (days)",
+    "Escalation",
+    "First Detected",
+    "Last Checked",
+    "Acknowledged At",
+    "Resolved At",
+    "Notes",
+]
 
 TABLES = {
     "part_inventory": {
@@ -178,8 +214,7 @@ def save_table(key: str, df: pd.DataFrame) -> None:
 
 
 def numeric(series: pd.Series) -> pd.Series:
-    cleaned = series.astype(str).str.replace(",", "", regex=False).str.strip()
-    return pd.to_numeric(cleaned, errors="coerce").fillna(0)
+    return pd.to_numeric(series, errors="coerce").fillna(0)
 
 
 def normalize_column_name(value: object) -> str:
@@ -223,9 +258,7 @@ def display_qty(value: object) -> str:
 
 
 def first_existing_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    normalized: dict[str, str] = {}
-    for column in df.columns:
-        normalized.setdefault(normalize_column_name(column), column)
+    normalized = {normalize_column_name(column): column for column in df.columns}
     for candidate in candidates:
         column = normalized.get(normalize_column_name(candidate))
         if column:
@@ -377,118 +410,6 @@ def build_grn_display_frame(df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
-def grn_reference(row: pd.Series) -> str:
-    parts = []
-    for label in ["Gate Entry No.", "Invoice Number", "PO Number", "Source Row"]:
-        value = clean_text(row.get(label, ""))
-        if value:
-            parts.append(f"{label}: {value}")
-    return " | ".join(parts)
-
-
-def build_grn_quality_alerts(grn_df: pd.DataFrame) -> pd.DataFrame:
-    columns = [
-        "Agent",
-        "Severity",
-        "Issue",
-        "Part No.",
-        "Supplier",
-        "Reference",
-        "Rcvd Qty",
-        "Arrival Date",
-        "Recommended Action",
-    ]
-    if grn_df.empty:
-        return pd.DataFrame(columns=columns)
-
-    df = grn_df.copy().fillna("")
-    df["Part No."] = df["Part No."].apply(stock_part_key)
-    df["Supplier"] = df["Supplier"].apply(normalize_supplier_name)
-    rcvd_qty = numeric(df["Rcvd Qty"])
-    invoice_qty = numeric(df["Invoice Qty"]) if "Invoice Qty" in df.columns else pd.Series(0, index=df.index)
-    discrepancy = numeric(df["Discrepancy"]) if "Discrepancy" in df.columns else invoice_qty - rcvd_qty
-    arrival_dates = parse_grn_dates(df["Arrival Date"])
-
-    records: list[dict[str, object]] = []
-
-    def add_issue(mask: pd.Series, severity: str, issue: str, action: str) -> None:
-        for _, row in df.loc[mask].iterrows():
-            records.append(
-                {
-                    "Agent": "GRN Data Quality Agent",
-                    "Severity": severity,
-                    "Issue": issue,
-                    "Part No.": row.get("Part No.", ""),
-                    "Supplier": row.get("Supplier", ""),
-                    "Reference": grn_reference(row),
-                    "Rcvd Qty": row.get("Rcvd Qty", ""),
-                    "Arrival Date": row.get("Arrival Date", ""),
-                    "Recommended Action": action,
-                }
-            )
-
-    add_issue(
-        df["Part No."].eq(""),
-        "Critical",
-        "Missing part number",
-        "Fix the part number in the GRN sheet before this receipt is used in part-level stock.",
-    )
-    add_issue(
-        df["Supplier"].eq(""),
-        "Watch",
-        "Missing supplier",
-        "Add supplier in the source sheet or map the part to a supplier from the SPOC/BOM master.",
-    )
-    add_issue(
-        rcvd_qty <= 0,
-        "Critical",
-        "Received quantity is blank, zero, or negative",
-        "Correct Receipt Qty. Stock cannot increase from a non-positive GRN receipt.",
-    )
-    add_issue(
-        arrival_dates.isna(),
-        "Watch",
-        "Missing arrival date",
-        "Add the arrival/posting date so the receipt can be compared against production consumption by day/week.",
-    )
-
-    invoice_mismatch = (invoice_qty > 0) & ((invoice_qty - rcvd_qty).abs() > 0.0001)
-    add_issue(
-        invoice_mismatch,
-        "Watch",
-        "Invoice quantity and received quantity differ",
-        "Check whether the difference is accepted shortage/excess or a source entry issue.",
-    )
-
-    explicit_discrepancy = discrepancy.abs() > 0.0001
-    add_issue(
-        explicit_discrepancy,
-        "Watch",
-        "Quantity discrepancy is recorded",
-        "Review discrepancy reason and make sure supplier/SCM follow-up is captured.",
-    )
-
-    key_columns = ["Gate Entry No.", "Part No.", "Invoice Number"]
-    if all(column in df.columns for column in key_columns):
-        duplicate_source = df[key_columns].astype(str).apply(lambda col: col.str.strip())
-        non_blank_key = duplicate_source.ne("").all(axis=1)
-        duplicate_key = duplicate_source.agg("|".join, axis=1)
-        duplicate_mask = non_blank_key & duplicate_key.duplicated(keep=False)
-        add_issue(
-            duplicate_mask,
-            "Watch",
-            "Possible duplicate GRN line",
-            "Check whether this is a real split receipt or the same gate/invoice/part repeated twice.",
-        )
-
-    alerts = pd.DataFrame(records, columns=columns)
-    if alerts.empty:
-        return alerts
-    severity_rank = {"Critical": 0, "Watch": 1}
-    alerts["_rank"] = alerts["Severity"].map(severity_rank).fillna(9)
-    return alerts.sort_values(["_rank", "Issue", "Part No."]).drop(columns="_rank").reset_index(drop=True)
-
-
 def parse_google_sheet_url(url: str) -> tuple[str, str]:
     match = re.search(r"/spreadsheets/d/([^/]+)", url)
     if not match:
@@ -508,8 +429,6 @@ def google_sheets_credentials_configured() -> bool:
     except Exception:
         pass
     return bool(
-        GOOGLE_SERVICE_ACCOUNT_JSON_PATH.exists()
-        or
         os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
         or os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
     )
@@ -533,12 +452,6 @@ def google_sheets_credentials():
             info["private_key"] = str(info["private_key"]).replace("\\n", "\n")
         return service_account.Credentials.from_service_account_info(
             info,
-            scopes=[GOOGLE_SHEETS_READONLY_SCOPE],
-        )
-
-    if GOOGLE_SERVICE_ACCOUNT_JSON_PATH.exists():
-        return service_account.Credentials.from_service_account_file(
-            GOOGLE_SERVICE_ACCOUNT_JSON_PATH,
             scopes=[GOOGLE_SHEETS_READONLY_SCOPE],
         )
 
@@ -617,7 +530,7 @@ def raw_sheet_to_table(raw: pd.DataFrame) -> pd.DataFrame:
         if non_blank_count >= 2:
             header_row = index
             break
-    columns = unique_headers(raw.iloc[header_row].tolist(), raw.shape[1])
+    columns = [clean_text(value) or f"Column {idx + 1}" for idx, value in enumerate(raw.iloc[header_row].tolist())]
     table = raw.iloc[header_row + 1 :].copy()
     table.columns = columns
     return table.reset_index(drop=True).fillna("")
@@ -629,10 +542,6 @@ def google_sheet_csv_url(url: str) -> str:
 
 
 def load_google_sheet(url: str) -> pd.DataFrame:
-    credentials = load_google_credentials()
-    if credentials is not None:
-        raw, _ = load_google_sheet_oauth_raw(url, credentials)
-        return raw_sheet_to_table(raw)
     if google_sheets_credentials_configured():
         return raw_sheet_to_table(load_google_sheet_api_raw(url))
     csv_url = google_sheet_csv_url(url)
@@ -640,10 +549,6 @@ def load_google_sheet(url: str) -> pd.DataFrame:
 
 
 def load_google_sheet_raw(url: str) -> pd.DataFrame:
-    credentials = load_google_credentials()
-    if credentials is not None:
-        raw, _ = load_google_sheet_oauth_raw(url, credentials)
-        return raw
     if google_sheets_credentials_configured():
         return load_google_sheet_api_raw(url)
     csv_url = google_sheet_csv_url(url)
@@ -687,7 +592,7 @@ def load_snapshot_meta(meta_path: Path) -> dict[str, object]:
 
 
 def create_sheet_snapshot(source_url: str, snapshot_path: Path, meta_path: Path) -> tuple[pd.DataFrame, dict[str, object]]:
-    source_label = google_sheet_read_method_label()
+    source_label = "Google Sheets API" if google_sheets_credentials_configured() else "CSV export link"
     raw = load_google_sheet_raw(source_url)
     save_sheet_snapshot(raw, snapshot_path, meta_path, source_url, source_label)
     return raw, load_snapshot_meta(meta_path)
@@ -700,50 +605,20 @@ def show_google_sheet_access_help(exc: Exception) -> None:
         """
         **Quick fix**
 
-        1. Use the **Google Sheets authorization** panel on this page.
-        2. Save the Google OAuth Client ID and Client Secret.
-        3. Click **Connect Google account for Sheets**.
-        4. Sign in with a Google account that can view the sheet.
+        1. Open the Google Sheet.
+        2. Click **Share**.
+        3. Under **General access**, choose **Anyone with the link**.
+        4. Set it to **Viewer**.
         5. Come back here and click the copy/update button again.
 
-        **Fallback for non-private sheets**
+        **Private-company-data fix**
 
-        Share the Google Sheet as **Anyone with the link can view**.
+        1. Configure `.streamlit/secrets.toml` from `.streamlit/secrets.toml.example`.
+        2. Paste the Google service-account JSON values there.
+        3. Share the Google Sheet with the service account `client_email` as **Viewer**.
         """
     )
     st.code(str(exc))
-
-
-def load_saved_service_account_email() -> str:
-    if not GOOGLE_SERVICE_ACCOUNT_JSON_PATH.exists():
-        return ""
-    try:
-        info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON_PATH.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return ""
-    return clean_text(info.get("client_email", ""))
-
-
-def save_uploaded_service_account(uploaded_file) -> tuple[bool, str]:
-    try:
-        info = json.loads(uploaded_file.getvalue().decode("utf-8"))
-    except Exception as exc:
-        return False, f"Could not read this as a JSON file: {exc}"
-
-    required = ["type", "project_id", "private_key", "client_email", "token_uri"]
-    missing = [key for key in required if not clean_text(info.get(key, ""))]
-    if missing:
-        return False, f"This does not look like a Google service-account key. Missing: {', '.join(missing)}"
-    if info.get("type") != "service_account":
-        return False, "This JSON is not a service-account key. It must have type = service_account."
-
-    GOOGLE_SERVICE_ACCOUNT_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
-    GOOGLE_SERVICE_ACCOUNT_JSON_PATH.write_text(json.dumps(info, indent=2), encoding="utf-8")
-    try:
-        GOOGLE_SERVICE_ACCOUNT_JSON_PATH.chmod(0o600)
-    except OSError:
-        pass
-    return True, clean_text(info.get("client_email", ""))
 
 
 def snapshot_age_label(snapshot_path: Path) -> str:
@@ -951,115 +826,6 @@ def build_supplier_buyer_summary(parts: pd.DataFrame) -> pd.DataFrame:
     return grouped[columns]
 
 
-def build_part_owner_lookup(parts: pd.DataFrame) -> pd.DataFrame:
-    columns = ["Part No.", "Buyer", "Mapped Supplier"]
-    if parts.empty:
-        return pd.DataFrame(columns=columns)
-    lookup = parts.copy()
-    lookup["Part No."] = lookup["Part No."].apply(stock_part_key)
-    lookup = lookup[lookup["Part No."].ne("")]
-    if lookup.empty:
-        return pd.DataFrame(columns=columns)
-    grouped = (
-        lookup.groupby("Part No.", as_index=False)
-        .agg(
-            Buyer=("Buyer", joined_text),
-            **{"Mapped Supplier": ("Supplier", joined_text)},
-        )
-    )
-    return grouped[columns]
-
-
-def load_part_owner_lookup() -> pd.DataFrame:
-    raw = load_sheet_snapshot(SPOC_SUMMARY_SNAPSHOT_CSV)
-    if raw.empty:
-        return pd.DataFrame(columns=["Part No.", "Buyer", "Mapped Supplier"])
-    try:
-        parts, _ = parse_spoc_summary_raw(raw)
-    except Exception:
-        return pd.DataFrame(columns=["Part No.", "Buyer", "Mapped Supplier"])
-    return build_part_owner_lookup(parts)
-
-
-def build_supplier_owner_alerts(parts: pd.DataFrame) -> pd.DataFrame:
-    columns = [
-        "Agent",
-        "Severity",
-        "Buyer",
-        "Supplier",
-        "Parts",
-        "At Risk Parts",
-        "Critical Parts",
-        "Issue",
-        "Recommended Action",
-    ]
-    if parts.empty:
-        return pd.DataFrame(columns=columns)
-
-    summary = build_supplier_buyer_summary(parts)
-    records: list[dict[str, object]] = []
-    for _, row in summary.iterrows():
-        buyer = clean_text(row.get("Buyer", "")) or "Unmapped buyer"
-        supplier = clean_text(row.get("Supplier", "")) or "Unmapped supplier"
-        at_risk = int(row.get("Below Required", 0) or 0)
-        critical = int(row.get("Critical", 0) or 0)
-        parts_count = int(row.get("Parts", 0) or 0)
-        if buyer == "Unmapped buyer" or supplier == "Unmapped supplier":
-            records.append(
-                {
-                    "Agent": "Supplier Ownership Agent",
-                    "Severity": "Critical" if critical else "Watch",
-                    "Buyer": buyer,
-                    "Supplier": supplier,
-                    "Parts": parts_count,
-                    "At Risk Parts": at_risk,
-                    "Critical Parts": critical,
-                    "Issue": "Buyer/supplier ownership needs cleanup",
-                    "Recommended Action": "Fix the SPOC Summary buyer/supplier mapping so follow-up ownership is clear.",
-                }
-            )
-            continue
-        if critical:
-            records.append(
-                {
-                    "Agent": "Supplier Ownership Agent",
-                    "Severity": "Critical",
-                    "Buyer": buyer,
-                    "Supplier": supplier,
-                    "Parts": parts_count,
-                    "At Risk Parts": at_risk,
-                    "Critical Parts": critical,
-                    "Issue": "Critical parts under this owner",
-                    "Recommended Action": "Buyer should follow up with the supplier and SCM owner before production release.",
-                }
-            )
-        elif at_risk:
-            records.append(
-                {
-                    "Agent": "Supplier Ownership Agent",
-                    "Severity": "Watch",
-                    "Buyer": buyer,
-                    "Supplier": supplier,
-                    "Parts": parts_count,
-                    "At Risk Parts": at_risk,
-                    "Critical Parts": critical,
-                    "Issue": "Parts below required quantity",
-                    "Recommended Action": "Buyer should confirm incoming supply, pull-in options, or stock correction.",
-                }
-            )
-
-    alerts = pd.DataFrame(records, columns=columns)
-    if alerts.empty:
-        return alerts
-    severity_rank = {"Critical": 0, "Watch": 1}
-    alerts["_rank"] = alerts["Severity"].map(severity_rank).fillna(9)
-    return (
-        alerts.sort_values(["_rank", "Critical Parts", "At Risk Parts", "Supplier"], ascending=[True, False, False, True])
-        .drop(columns="_rank")
-        .reset_index(drop=True)
-    )
-
-
 def google_oauth_settings() -> dict[str, str] | None:
     config: dict[str, object] | None = None
     try:
@@ -1265,7 +1031,7 @@ def unique_headers(values: list[object], width: int) -> list[str]:
     return headers
 
 
-def load_google_sheet_oauth_raw(
+def load_google_sheet_oauth(
     url: str,
     credentials: Credentials,
 ) -> tuple[pd.DataFrame, str]:
@@ -1318,21 +1084,9 @@ def load_google_sheet_oauth_raw(
         return pd.DataFrame(), selected_sheet
 
     width = max(len(row) for row in values)
-    rows = [row + [""] * (width - len(row)) for row in values]
-    return pd.DataFrame(rows, dtype=str).fillna(""), selected_sheet
-
-
-def load_google_sheet_oauth(
-    url: str,
-    credentials: Credentials,
-) -> tuple[pd.DataFrame, str]:
-    raw, selected_sheet = load_google_sheet_oauth_raw(url, credentials)
-    if raw.empty:
-        return pd.DataFrame(), selected_sheet
-    columns = unique_headers(raw.iloc[0].tolist(), raw.shape[1])
-    rows = raw.iloc[1:].copy()
-    rows.columns = columns
-    return rows.reset_index(drop=True).fillna(""), selected_sheet
+    columns = unique_headers(values[0], width)
+    rows = [row + [""] * (width - len(row)) for row in values[1:]]
+    return pd.DataFrame(rows, columns=columns).fillna(""), selected_sheet
 
 
 def save_source_cache(path: Path, df: pd.DataFrame) -> None:
@@ -1711,6 +1465,216 @@ def combine_manual_outwarding(
     )
 
 
+def grn_reference(row: pd.Series) -> str:
+    parts = []
+    for label in ["Gate Entry No.", "Invoice Number", "PO Number", "Source Row"]:
+        value = clean_text(row.get(label, ""))
+        if value:
+            parts.append(f"{label}: {value}")
+    return " | ".join(parts)
+
+
+def build_grn_quality_alerts(grn_df: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "Agent",
+        "Severity",
+        "Issue",
+        "Part No.",
+        "Supplier",
+        "Reference",
+        "Rcvd Qty",
+        "Arrival Date",
+        "Recommended Action",
+    ]
+    if grn_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    df = grn_df.copy().fillna("")
+    df["Part No."] = df["Part No."].apply(stock_part_key)
+    df["Supplier"] = df["Supplier"].apply(normalize_supplier_name)
+    rcvd_qty = numeric(df["Rcvd Qty"])
+    invoice_qty = numeric(df["Invoice Qty"]) if "Invoice Qty" in df.columns else pd.Series(0, index=df.index)
+    discrepancy = numeric(df["Discrepancy"]) if "Discrepancy" in df.columns else invoice_qty - rcvd_qty
+    arrival_dates = parse_grn_dates(df["Arrival Date"])
+
+    records: list[dict[str, object]] = []
+
+    def add_issue(mask: pd.Series, severity: str, issue: str, action: str) -> None:
+        for _, row in df.loc[mask].iterrows():
+            records.append(
+                {
+                    "Agent": "GRN Data Quality Agent",
+                    "Severity": severity,
+                    "Issue": issue,
+                    "Part No.": row.get("Part No.", ""),
+                    "Supplier": row.get("Supplier", ""),
+                    "Reference": grn_reference(row),
+                    "Rcvd Qty": row.get("Rcvd Qty", ""),
+                    "Arrival Date": row.get("Arrival Date", ""),
+                    "Recommended Action": action,
+                }
+            )
+
+    add_issue(
+        df["Part No."].eq(""),
+        "Critical",
+        "Missing part number",
+        "Fix the part number in the GRN sheet before this receipt is used in part-level stock.",
+    )
+    add_issue(
+        df["Supplier"].eq(""),
+        "Watch",
+        "Missing supplier",
+        "Add supplier in the source sheet or map the part to a supplier from the SPOC/BOM master.",
+    )
+    add_issue(
+        rcvd_qty <= 0,
+        "Critical",
+        "Received quantity is blank, zero, or negative",
+        "Correct Receipt Qty. Stock cannot increase from a non-positive GRN receipt.",
+    )
+    add_issue(
+        arrival_dates.isna(),
+        "Watch",
+        "Missing arrival date",
+        "Add the arrival/posting date so the receipt can be compared against production consumption by day/week.",
+    )
+
+    invoice_mismatch = (invoice_qty > 0) & ((invoice_qty - rcvd_qty).abs() > 0.0001)
+    add_issue(
+        invoice_mismatch,
+        "Watch",
+        "Invoice quantity and received quantity differ",
+        "Check whether the difference is accepted shortage/excess or a source entry issue.",
+    )
+
+    explicit_discrepancy = discrepancy.abs() > 0.0001
+    add_issue(
+        explicit_discrepancy,
+        "Watch",
+        "Quantity discrepancy is recorded",
+        "Review discrepancy reason and make sure supplier/SCM follow-up is captured.",
+    )
+
+    key_columns = ["Gate Entry No.", "Part No.", "Invoice Number"]
+    if all(column in df.columns for column in key_columns):
+        duplicate_source = df[key_columns].astype(str).apply(lambda col: col.str.strip())
+        non_blank_key = duplicate_source.ne("").all(axis=1)
+        duplicate_key = duplicate_source.agg("|".join, axis=1)
+        duplicate_mask = non_blank_key & duplicate_key.duplicated(keep=False)
+        add_issue(
+            duplicate_mask,
+            "Watch",
+            "Possible duplicate GRN line",
+            "Check whether this is a real split receipt or the same gate/invoice/part repeated twice.",
+        )
+
+    alerts = pd.DataFrame(records, columns=columns)
+    if alerts.empty:
+        return alerts
+    severity_rank = {"Critical": 0, "Watch": 1}
+    alerts["_rank"] = alerts["Severity"].map(severity_rank).fillna(9)
+    return alerts.sort_values(["_rank", "Issue", "Part No."]).drop(columns="_rank").reset_index(drop=True)
+
+
+def build_part_owner_lookup(parts: pd.DataFrame) -> pd.DataFrame:
+    columns = ["Part No.", "Buyer", "Mapped Supplier"]
+    if parts.empty:
+        return pd.DataFrame(columns=columns)
+    lookup = parts.copy()
+    lookup["Part No."] = lookup["Part No."].apply(stock_part_key)
+    lookup = lookup[lookup["Part No."].ne("")]
+    if lookup.empty:
+        return pd.DataFrame(columns=columns)
+    grouped = (
+        lookup.groupby("Part No.", as_index=False)
+        .agg(
+            Buyer=("Buyer", joined_text),
+            **{"Mapped Supplier": ("Supplier", joined_text)},
+        )
+    )
+    return grouped[columns]
+
+
+def build_supplier_owner_alerts(parts: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "Agent",
+        "Severity",
+        "Buyer",
+        "Supplier",
+        "Parts",
+        "At Risk Parts",
+        "Critical Parts",
+        "Issue",
+        "Recommended Action",
+    ]
+    if parts.empty:
+        return pd.DataFrame(columns=columns)
+
+    summary = build_supplier_buyer_summary(parts)
+    records: list[dict[str, object]] = []
+    for _, row in summary.iterrows():
+        buyer = clean_text(row.get("Buyer", "")) or "Unmapped buyer"
+        supplier = clean_text(row.get("Supplier", "")) or "Unmapped supplier"
+        at_risk = int(row.get("Below Required", 0) or 0)
+        critical = int(row.get("Critical", 0) or 0)
+        parts_count = int(row.get("Parts", 0) or 0)
+        if buyer == "Unmapped buyer" or supplier == "Unmapped supplier":
+            records.append(
+                {
+                    "Agent": "Supplier Ownership Agent",
+                    "Severity": "Critical" if critical else "Watch",
+                    "Buyer": buyer,
+                    "Supplier": supplier,
+                    "Parts": parts_count,
+                    "At Risk Parts": at_risk,
+                    "Critical Parts": critical,
+                    "Issue": "Buyer/supplier ownership needs cleanup",
+                    "Recommended Action": "Fix the SPOC Summary buyer/supplier mapping so follow-up ownership is clear.",
+                }
+            )
+            continue
+        if critical:
+            records.append(
+                {
+                    "Agent": "Supplier Ownership Agent",
+                    "Severity": "Critical",
+                    "Buyer": buyer,
+                    "Supplier": supplier,
+                    "Parts": parts_count,
+                    "At Risk Parts": at_risk,
+                    "Critical Parts": critical,
+                    "Issue": "Critical parts under this owner",
+                    "Recommended Action": "Buyer should follow up with the supplier and SCM owner before production release.",
+                }
+            )
+        elif at_risk:
+            records.append(
+                {
+                    "Agent": "Supplier Ownership Agent",
+                    "Severity": "Watch",
+                    "Buyer": buyer,
+                    "Supplier": supplier,
+                    "Parts": parts_count,
+                    "At Risk Parts": at_risk,
+                    "Critical Parts": critical,
+                    "Issue": "Parts below required quantity",
+                    "Recommended Action": "Buyer should confirm incoming supply, pull-in options, or stock correction.",
+                }
+            )
+
+    alerts = pd.DataFrame(records, columns=columns)
+    if alerts.empty:
+        return alerts
+    severity_rank = {"Critical": 0, "Watch": 1}
+    alerts["_rank"] = alerts["Severity"].map(severity_rank).fillna(9)
+    return (
+        alerts.sort_values(["_rank", "Critical Parts", "At Risk Parts", "Supplier"], ascending=[True, False, False, True])
+        .drop(columns="_rank")
+        .reset_index(drop=True)
+    )
+
+
 def prepare_usage_for_agent(usage: pd.DataFrame) -> pd.DataFrame:
     columns = [
         "Usage Date",
@@ -1784,6 +1748,16 @@ def weekly_production_summary(usage: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def load_grn_sheet_display_snapshot() -> pd.DataFrame:
+    raw = load_source_cache(INWARDING_SNAPSHOT_PATH)
+    if not raw.empty:
+        return build_grn_display_frame(raw)
+    raw = load_sheet_snapshot(GRN_SHEET_SNAPSHOT_CSV)
+    if raw.empty:
+        return build_grn_display_frame(pd.DataFrame())
+    return build_grn_display_frame(raw_sheet_to_table(raw))
+
+
 def weekly_part_usage_summary(usage: pd.DataFrame) -> pd.DataFrame:
     prepared = prepare_usage_for_agent(usage)
     columns = [
@@ -1810,51 +1784,6 @@ def weekly_part_usage_summary(usage: pd.DataFrame) -> pd.DataFrame:
         )
         .sort_values(["Plan Week", "Part No."], ascending=[False, True])
     )
-
-
-def load_grn_sheet_display_snapshot() -> pd.DataFrame:
-    raw = load_sheet_snapshot(GRN_SHEET_SNAPSHOT_CSV)
-    if raw.empty:
-        return build_grn_display_frame(pd.DataFrame())
-    return build_grn_display_frame(raw_sheet_to_table(raw))
-
-
-def weekly_grn_receipts_summary(grn_df: pd.DataFrame) -> pd.DataFrame:
-    columns = ["Plan Week", "Part No.", "Inward Supplier", "Received Qty", "Last Arrival Date"]
-    if grn_df.empty:
-        return pd.DataFrame(columns=columns)
-
-    prepared = grn_df.copy()
-    prepared["Part No."] = prepared["Part No."].apply(stock_part_key)
-    prepared["Inward Supplier"] = prepared["Supplier"].apply(normalize_supplier_name)
-    prepared["Received Qty"] = numeric(prepared["Rcvd Qty"])
-    prepared["Arrival Date Parsed"] = parse_grn_dates(prepared["Arrival Date"])
-    prepared = prepared[
-        prepared["Part No."].ne("")
-        & prepared["Arrival Date Parsed"].notna()
-        & (prepared["Received Qty"] > 0)
-    ].copy()
-    if prepared.empty:
-        return pd.DataFrame(columns=columns)
-
-    iso = prepared["Arrival Date Parsed"].dt.isocalendar()
-    prepared["Plan Week"] = (
-        iso["year"].astype(str)
-        + "-W"
-        + iso["week"].astype(str).str.zfill(2)
-    )
-    grouped = (
-        prepared.groupby(["Plan Week", "Part No."], as_index=False)
-        .agg(
-            **{
-                "Inward Supplier": ("Inward Supplier", joined_text),
-                "Received Qty": ("Received Qty", "sum"),
-                "Last Arrival Date": ("Arrival Date Parsed", "max"),
-            }
-        )
-    )
-    grouped["Last Arrival Date"] = grouped["Last Arrival Date"].dt.strftime("%Y-%m-%d")
-    return grouped[columns]
 
 
 def pct_delta(current: float, baseline: float) -> float:
@@ -2139,6 +2068,112 @@ def append_outwarding_alert_log(alerts: pd.DataFrame) -> pd.DataFrame:
         combined = combined.drop_duplicates("Alert ID", keep="last")
     save_source_cache(OUTWARDING_ALERT_LOG_PATH, combined)
     return combined
+
+
+def weekly_grn_receipts_summary(grn_df: pd.DataFrame) -> pd.DataFrame:
+    columns = ["Plan Week", "Part No.", "Inward Supplier", "Received Qty", "Last Arrival Date"]
+    if grn_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    prepared = grn_df.copy()
+    prepared["Part No."] = prepared["Part No."].apply(stock_part_key)
+    prepared["Inward Supplier"] = prepared["Supplier"].apply(normalize_supplier_name)
+    prepared["Received Qty"] = numeric(prepared["Rcvd Qty"])
+    prepared["Arrival Date Parsed"] = parse_grn_dates(prepared["Arrival Date"])
+    prepared = prepared[
+        prepared["Part No."].ne("")
+        & prepared["Arrival Date Parsed"].notna()
+        & (prepared["Received Qty"] > 0)
+    ].copy()
+    if prepared.empty:
+        return pd.DataFrame(columns=columns)
+
+    iso = prepared["Arrival Date Parsed"].dt.isocalendar()
+    prepared["Plan Week"] = (
+        iso["year"].astype(str)
+        + "-W"
+        + iso["week"].astype(str).str.zfill(2)
+    )
+    grouped = (
+        prepared.groupby(["Plan Week", "Part No."], as_index=False)
+        .agg(
+            **{
+                "Inward Supplier": ("Inward Supplier", joined_text),
+                "Received Qty": ("Received Qty", "sum"),
+                "Last Arrival Date": ("Arrival Date Parsed", "max"),
+            }
+        )
+    )
+    grouped["Last Arrival Date"] = grouped["Last Arrival Date"].dt.strftime("%Y-%m-%d")
+    return grouped[columns]
+
+
+def load_part_owner_lookup() -> pd.DataFrame:
+    raw = load_sheet_snapshot(SPOC_SUMMARY_SNAPSHOT_CSV)
+    if raw.empty:
+        return pd.DataFrame(columns=["Part No.", "Buyer", "Mapped Supplier"])
+    try:
+        parts, _ = parse_spoc_summary_raw(raw)
+    except Exception:
+        return pd.DataFrame(columns=["Part No.", "Buyer", "Mapped Supplier"])
+    return build_part_owner_lookup(parts)
+
+
+def load_google_sheet_oauth_raw(
+    url: str,
+    credentials: Credentials,
+) -> tuple[pd.DataFrame, str]:
+    spreadsheet_id, gid = parse_google_sheet_url(url)
+    if credentials.expired and credentials.refresh_token:
+        credentials.refresh(GoogleAuthRequest())
+        save_google_credentials(credentials)
+
+    headers = {"Authorization": f"Bearer {credentials.token}"}
+    metadata_response = requests.get(
+        f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}",
+        headers=headers,
+        params={"fields": "sheets.properties(sheetId,title,index)"},
+        timeout=20,
+    )
+    metadata_response.raise_for_status()
+    sheets = metadata_response.json().get("sheets", [])
+    if not sheets:
+        raise ValueError("The spreadsheet contains no worksheets.")
+
+    selected_properties = next(
+        (
+            item["properties"]
+            for item in sheets
+            if str(item.get("properties", {}).get("sheetId")) == str(gid)
+        ),
+        None,
+    )
+    if selected_properties is None:
+        raise ValueError(f"Could not find worksheet gid {gid}.")
+
+    selected_sheet = selected_properties["title"]
+    escaped_title = selected_sheet.replace("'", "''")
+    encoded_range = quote(f"'{escaped_title}'", safe="")
+    values_response = requests.get(
+        (
+            f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}"
+            f"/values/{encoded_range}"
+        ),
+        headers=headers,
+        params={
+            "majorDimension": "ROWS",
+            "valueRenderOption": "FORMATTED_VALUE",
+        },
+        timeout=60,
+    )
+    values_response.raise_for_status()
+    values = values_response.json().get("values", [])
+    if not values:
+        return pd.DataFrame(), selected_sheet
+
+    width = max(len(row) for row in values)
+    rows = [row + [""] * (width - len(row)) for row in values]
+    return pd.DataFrame(rows, dtype=str).fillna(""), selected_sheet
 
 
 def build_inventory_status(df: pd.DataFrame) -> pd.DataFrame:
@@ -2556,6 +2591,364 @@ def render_supplier_buyer_map() -> None:
     )
 
 
+def render_superset_inwarding() -> None:
+    st.header("Inwarding Parts")
+    st.write(
+        "Live GRN inwarding from the Superset/Trino source. "
+        "This page does not use sample data or the previous app's files."
+    )
+
+    top_left, top_right = st.columns([1, 4])
+    with top_left:
+        if st.button("Run live export now", type="primary"):
+            ok, message = run_grn_export()
+            if ok:
+                st.success(message)
+                st.rerun()
+            else:
+                st.error("Live Superset GRN export failed.")
+                st.code(message)
+    with top_right:
+        st.caption(
+            f"Source file for this new app: `{LIVE_GRN_CSV.relative_to(APP_DIR)}`. "
+            f"Last refreshed: {grn_file_age_label()}."
+        )
+
+    if not LIVE_GRN_CSV.exists():
+        st.warning("No live Superset GRN export exists yet for this new app.")
+        st.write("Press **Run live export now** after `config/grn_export.env` is configured on this machine.")
+        st.code("python scripts/scheduled_grn_export.py", language="bash")
+        return
+
+    raw_df = load_live_grn()
+    meta = load_live_grn_meta()
+    grn_df = build_grn_display_frame(raw_df)
+    if grn_df.empty:
+        st.warning("The live Superset GRN export exists, but it has no rows.")
+        return
+
+    grn_dates = parse_grn_dates(grn_df["Arrival Date"])
+    valid_dates = grn_dates.dropna()
+    if not valid_dates.empty:
+        latest_date = valid_dates.max().date()
+        default_start = latest_date - timedelta(days=2)
+        default_end = latest_date
+    else:
+        default_start = datetime.now().date() - timedelta(days=2)
+        default_end = datetime.now().date()
+
+    filter_row_1 = st.columns(4)
+    with filter_row_1[0]:
+        start_date = st.date_input("Start date", value=default_start, key="grn_start_date")
+    with filter_row_1[1]:
+        end_date = st.date_input("End date", value=default_end, key="grn_end_date")
+    with filter_row_1[2]:
+        plants = sorted(value for value in grn_df["Plant"].unique() if value)
+        selected_plants = st.multiselect("Plant", plants, default=[], key="grn_plants")
+    with filter_row_1[3]:
+        locations = sorted(value for value in grn_df["Storage Location"].unique() if value)
+        selected_locations = st.multiselect("Storage location", locations, default=[], key="grn_locations")
+
+    filter_row_2 = st.columns(3)
+    with filter_row_2[0]:
+        part_query = st.text_input("Part No. contains", key="grn_part_query")
+    with filter_row_2[1]:
+        po_query = st.text_input("PO Number contains", key="grn_po_query")
+    with filter_row_2[2]:
+        movement_types = sorted(value for value in grn_df["Movement Type"].unique() if value)
+        selected_movements = st.multiselect("Movement type", movement_types, default=[], key="grn_movements")
+
+    filtered = grn_df.copy()
+    filtered_dates = parse_grn_dates(filtered["Arrival Date"])
+    if not valid_dates.empty:
+        filtered = filtered[(filtered_dates.dt.date >= start_date) & (filtered_dates.dt.date <= end_date)]
+    if selected_plants:
+        filtered = filtered[filtered["Plant"].isin(selected_plants)]
+    if selected_locations:
+        filtered = filtered[filtered["Storage Location"].isin(selected_locations)]
+    if selected_movements:
+        filtered = filtered[filtered["Movement Type"].isin(selected_movements)]
+    if part_query.strip():
+        filtered = filtered[filtered["Part No."].str.contains(part_query.strip(), case=False, na=False)]
+    if po_query.strip():
+        filtered = filtered[filtered["PO Number"].str.contains(po_query.strip(), case=False, na=False)]
+
+    received_total = numeric(filtered["Rcvd Qty"]).sum()
+    unique_parts = filtered["Part No."].replace("", pd.NA).dropna().nunique()
+    latest_visible = parse_grn_dates(filtered["Arrival Date"]).max()
+    exported_at = str(meta.get("exported_at_utc", "") or "").replace("T", " ").replace("+00:00", " UTC")
+
+    metrics = st.columns(4)
+    with metrics[0]:
+        render_metric("GRN rows", f"{len(filtered):,}", "neutral")
+    with metrics[1]:
+        render_metric("Received qty", f"{received_total:,.0f}", "ok")
+    with metrics[2]:
+        render_metric("Parts", f"{unique_parts:,}", "neutral")
+    with metrics[3]:
+        latest_label = latest_visible.strftime("%Y-%m-%d") if pd.notna(latest_visible) else "not available"
+        render_metric("Latest date", latest_label, "neutral")
+
+    if exported_at:
+        st.caption(f"Exported at: {exported_at}. Raw Superset rows in file: {len(raw_df):,}.")
+    else:
+        st.caption(f"Raw Superset rows in file: {len(raw_df):,}.")
+
+    st.subheader("Live GRN Inwarding Table")
+    st.dataframe(
+        filtered,
+        use_container_width=True,
+        hide_index=True,
+        height=560,
+    )
+    st.download_button(
+        "Download filtered GRN CSV",
+        filtered.to_csv(index=False),
+        file_name="live_superset_grn_filtered.csv",
+        mime="text/csv",
+    )
+
+
+def clean_inwarding_snapshot(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    renamed = df.rename(
+        columns={
+            "Suplier Name": "Supplier Name",
+            "Invoice QTY": "Invoice Qty",
+        }
+    )
+    preferred_columns = [
+        "Gate Entry No",
+        "Date",
+        "Shift",
+        "In Time",
+        "Vehicle No",
+        "Invoice Number",
+        "Invoice Date",
+        "PO Number",
+        "Supplier Name",
+        "Part Number",
+        "Part Name",
+        "Invoice Qty",
+        "Receipt Qty",
+        "Discrepancy",
+        "Unloading Status",
+        "Model",
+        "Remarks",
+    ]
+    available_columns = [
+        column for column in preferred_columns if column in renamed.columns
+    ]
+    result = renamed[available_columns].copy().fillna("")
+    supplier_values = result.get(
+        "Supplier Name",
+        pd.Series("", index=result.index),
+    ).map(clean_text)
+    part_values = result.get(
+        "Part Number",
+        pd.Series("", index=result.index),
+    ).map(clean_text)
+    placeholder_rows = (
+        supplier_values.str.lower().str.startswith("enter ")
+        | part_values.str.lower().str.startswith("enter ")
+    )
+    result = result[~placeholder_rows]
+    if "Date" in result.columns:
+        parsed_dates = pd.to_datetime(
+            result["Date"],
+            errors="coerce",
+            format="mixed",
+        )
+        result = (
+            result.assign(_parsed_date=parsed_dates)
+            .sort_values(
+                ["_parsed_date", "Gate Entry No"],
+                ascending=[False, False],
+                na_position="last",
+            )
+            .drop(columns="_parsed_date")
+        )
+    return result.reset_index(drop=True)
+
+
+def supplier_match_key(value: object) -> str:
+    return re.sub(r"[^A-Z0-9]", "", clean_text(value).upper())
+
+
+def canonical_supplier_key(value: object) -> str:
+    ignored_words = {
+        "CO",
+        "COMPANY",
+        "INC",
+        "INDIA",
+        "INDIAN",
+        "LIMITED",
+        "LLP",
+        "LTD",
+        "PRIVATE",
+        "PVT",
+        "UNIT",
+    }
+    words = [
+        word
+        for word in re.findall(r"[A-Z0-9]+", clean_text(value).upper())
+        if word not in ignored_words and not word.isdigit()
+    ]
+    normalized_words: list[str] = []
+    for word in words:
+        if word.endswith("IES") and len(word) > 4:
+            word = f"{word[:-3]}Y"
+        elif word.endswith("S") and len(word) > 5:
+            word = word[:-1]
+        normalized_words.append(word)
+    return "".join(normalized_words)
+
+
+def clean_buyer_mapping_source(df: pd.DataFrame) -> pd.DataFrame:
+    output_columns = ["Part Number", "Mapped Supplier", "Buyer Name"]
+    if df.empty:
+        return pd.DataFrame(columns=output_columns)
+    if set(output_columns).issubset(df.columns):
+        result = df[output_columns].copy()
+    else:
+        rows = df.astype(str).to_numpy().tolist()
+        header_index = next(
+            (
+                index
+                for index, row in enumerate(rows)
+                if {"Component", "Supplier", "SCM Buyer"}.issubset(
+                    {str(value).strip() for value in row}
+                )
+            ),
+            None,
+        )
+        if header_index is None:
+            return pd.DataFrame(columns=output_columns)
+        width = len(df.columns)
+        headers = unique_headers(rows[header_index], width)
+        data_rows = [
+            row + [""] * (width - len(row))
+            for row in rows[header_index + 1 :]
+        ]
+        table = pd.DataFrame(data_rows, columns=headers).fillna("")
+        result = table[["Component", "Supplier", "SCM Buyer"]].copy()
+        result.columns = output_columns
+
+    result["Part Number"] = result["Part Number"].map(stock_part_key)
+    result["Mapped Supplier"] = result["Mapped Supplier"].map(clean_text)
+    result["Buyer Name"] = result["Buyer Name"].map(normalize_buyer_name)
+    return result[
+        result["Buyer Name"].ne("")
+        & (
+            result["Part Number"].ne("")
+            | result["Mapped Supplier"].ne("")
+        )
+    ].drop_duplicates()
+
+
+def enrich_inwarding_buyers(
+    inwarding: pd.DataFrame,
+    buyer_mapping: pd.DataFrame,
+) -> pd.DataFrame:
+    result = inwarding.copy()
+    if result.empty:
+        return result
+
+    mapping = clean_buyer_mapping_source(buyer_mapping)
+    if mapping.empty:
+        result["Buyer Name"] = "Not mapped"
+    else:
+        mapping["Part Key"] = mapping["Part Number"].map(stock_part_key)
+        mapping["Supplier Key"] = mapping["Mapped Supplier"].map(
+            supplier_match_key
+        )
+        mapping["Supplier Prefix"] = mapping["Supplier Key"].str[:20]
+        mapping["Canonical Supplier Key"] = mapping["Mapped Supplier"].map(
+            canonical_supplier_key
+        )
+
+        part_map = (
+            mapping[mapping["Part Key"].ne("")]
+            .groupby("Part Key")["Buyer Name"]
+            .agg(joined_text)
+        )
+        supplier_map = (
+            mapping[mapping["Supplier Key"].ne("")]
+            .groupby("Supplier Key")["Buyer Name"]
+            .agg(joined_text)
+        )
+        supplier_prefix_map = (
+            mapping[mapping["Supplier Prefix"].ne("")]
+            .groupby("Supplier Prefix")["Buyer Name"]
+            .agg(joined_text)
+        )
+        canonical_supplier_map = (
+            mapping[mapping["Canonical Supplier Key"].ne("")]
+            .groupby("Canonical Supplier Key")["Buyer Name"]
+            .agg(joined_text)
+        )
+
+        part_keys = result.get(
+            "Part Number",
+            pd.Series("", index=result.index),
+        ).map(stock_part_key)
+        supplier_keys = result.get(
+            "Supplier Name",
+            pd.Series("", index=result.index),
+        ).map(supplier_match_key)
+        buyers = part_keys.map(part_map).fillna("")
+        buyers = buyers.where(
+            buyers.ne(""),
+            supplier_keys.map(supplier_map).fillna(""),
+        )
+        buyers = buyers.where(
+            buyers.ne(""),
+            supplier_keys.str[:20].map(supplier_prefix_map).fillna(""),
+        )
+        canonical_supplier_keys = result.get(
+            "Supplier Name",
+            pd.Series("", index=result.index),
+        ).map(canonical_supplier_key)
+        buyers = buyers.where(
+            buyers.ne(""),
+            canonical_supplier_keys.map(canonical_supplier_map).fillna(""),
+        )
+        result["Buyer Name"] = buyers.replace("", "Not mapped")
+
+    if "Supplier Name" in result.columns:
+        columns = list(result.columns)
+        columns.remove("Buyer Name")
+        supplier_index = columns.index("Supplier Name")
+        columns.insert(supplier_index + 1, "Buyer Name")
+        result = result[columns]
+    return result
+
+
+def save_inwarding_snapshot(df: pd.DataFrame, tab_name: str) -> None:
+    save_source_cache(INWARDING_SNAPSHOT_PATH, df)
+    metadata = {
+        "source_url": INWARDING_SHEET_URL,
+        "tab": tab_name,
+        "rows": int(len(df)),
+        "refreshed_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    tmp_path = INWARDING_SNAPSHOT_META_PATH.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    tmp_path.replace(INWARDING_SNAPSHOT_META_PATH)
+
+
+def load_inwarding_snapshot_meta() -> dict[str, object]:
+    if not INWARDING_SNAPSHOT_META_PATH.exists():
+        return {}
+    try:
+        return json.loads(
+            INWARDING_SNAPSHOT_META_PATH.read_text(encoding="utf-8")
+        )
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
 def render_grn_quality_agent(grn_df: pd.DataFrame) -> None:
     st.subheader("GRN Data Quality Agent")
     st.write("Checks whether inwarding rows are usable for stock math before they affect inventory.")
@@ -2598,145 +2991,271 @@ def render_grn_quality_agent(grn_df: pd.DataFrame) -> None:
 def render_inwarding() -> None:
     st.header("Inwarding Parts")
     st.write(
-        "GRN inwarding from the live gate-entry Google Sheet. "
-        "Receipt Qty is treated as the GRN received quantity."
+        "This page shows the last saved copy of the Direct Gate Entry sheet. "
+        "Press Refresh only when you want to replace it with the latest version."
     )
-    source_label = google_sheet_read_method_label()
 
-    sheet_url = st.text_input(
-        "GRN Google Sheet link",
-        value=DEFAULT_GRN_SHEET_URL,
-        help="This sheet is used as the GRN source. The app saves a copy only when you press the update button.",
-    )
-    action_col, info_col = st.columns([1.4, 4.6])
-    with action_col:
-        refresh_clicked = st.button("Create / update GRN copy", type="primary")
-    with info_col:
-        st.caption(
-            f"Current fetch method: {source_label}. "
-            f"Saved copy: `{GRN_SHEET_SNAPSHOT_CSV.relative_to(APP_DIR)}`. "
-            f"Last copied: {snapshot_age_label(GRN_SHEET_SNAPSHOT_CSV)}."
+    credentials = load_google_credentials()
+    if credentials is None:
+        st.info(
+            "Connect Google Sheets once here. The token is saved locally in `.streamlit/` "
+            "and is not committed to Git."
         )
-    if source_label == "CSV export link":
-        st.info("No Google Sheets authorization is connected yet. Connect OAuth here to read the private GRN sheet.")
-        render_google_oauth_controls("grn_inwarding", expanded=True)
+        credentials = render_google_oauth_controls("inwarding_live", expanded=True)
+    else:
+        st.success("Google Sheets authorization is connected.")
 
+    refresh_clicked = st.button(
+        "Refresh",
+        type="primary",
+        disabled=credentials is None,
+    )
     if refresh_clicked:
         try:
-            create_sheet_snapshot(sheet_url, GRN_SHEET_SNAPSHOT_CSV, GRN_SHEET_SNAPSHOT_META)
-            st.success("Created a fresh GRN sheet copy.")
-            st.rerun()
+            with st.spinner("Reading the latest Direct Gate Entry sheet..."):
+                source_df, tab_name = load_google_sheet_oauth(
+                    INWARDING_SHEET_URL,
+                    credentials,
+                )
+                buyer_source_df, buyer_tab_name = load_google_sheet_oauth(
+                    BUYER_MAPPING_SHEET_URL,
+                    credentials,
+                )
+                cleaned_df = clean_inwarding_snapshot(source_df)
+                cleaned_buyer_mapping = clean_buyer_mapping_source(
+                    buyer_source_df
+                )
+                save_inwarding_snapshot(cleaned_df, tab_name)
+                save_source_cache(
+                    BUYER_MAPPING_CACHE_PATH,
+                    cleaned_buyer_mapping,
+                )
+                refreshed_snapshot = enrich_inwarding_buyers(
+                    cleaned_df,
+                    cleaned_buyer_mapping,
+                )
+                refreshed_actions = reconcile_agent_actions(
+                    build_agent_issues(refreshed_snapshot)
+                )
+                open_action_count = int(
+                    (
+                        refreshed_actions["Active"].eq("Yes")
+                        & ~refreshed_actions["Status"].isin(
+                            ["Resolved", "Auto-resolved"]
+                        )
+                    ).sum()
+                )
+            st.success(
+                f"Saved the latest '{tab_name}' snapshot with "
+                f"{len(cleaned_df):,} rows and buyer mapping from "
+                f"'{buyer_tab_name}'. The agent found "
+                f"{open_action_count:,} open action(s)."
+            )
         except Exception as exc:
-            st.error("Could not create the GRN sheet copy.")
-            show_google_sheet_access_help(exc)
-            return
+            st.error(
+                "Refresh failed. The previous saved snapshot is still being shown. "
+                f"Details: {exc}"
+            )
 
-    raw = load_sheet_snapshot(GRN_SHEET_SNAPSHOT_CSV)
-    if raw.empty:
-        st.warning("No saved GRN sheet copy exists yet.")
-        st.write(
-            "Click **Create / update GRN copy** once. "
-            "After that, this page will keep showing that saved copy until you click the button again."
+    snapshot = enrich_inwarding_buyers(
+        clean_inwarding_snapshot(
+            load_source_cache(INWARDING_SNAPSHOT_PATH)
+        ),
+        load_source_cache(BUYER_MAPPING_CACHE_PATH),
+    )
+    if snapshot.empty:
+        st.info(
+            "No saved inwarding snapshot exists yet. Connect Google and press "
+            "Refresh inwarding from Google Sheet once."
         )
         return
 
-    meta = load_snapshot_meta(GRN_SHEET_SNAPSHOT_META)
-    raw_df = raw_sheet_to_table(raw)
-    grn_df = build_grn_display_frame(raw_df)
-    if grn_df.empty:
-        st.warning("The saved GRN sheet copy exists, but it has no readable rows.")
-        return
+    metadata = load_inwarding_snapshot_meta()
+    refreshed_at = str(metadata.get("refreshed_at", "")).replace("T", " ")
+    tab_name = str(metadata.get("tab", "DIRECT GATE ENTRY"))
+    st.caption(
+        f"Showing saved tab: {tab_name}. Last refreshed: "
+        f"{refreshed_at or snapshot_age_label(INWARDING_SNAPSHOT_PATH)}."
+    )
 
-    grn_dates = parse_grn_dates(grn_df["Arrival Date"])
-    valid_dates = grn_dates.dropna()
-    if not valid_dates.empty:
-        latest_date = valid_dates.max().date()
-        default_start = latest_date - timedelta(days=2)
-        default_end = latest_date
-    else:
-        default_start = datetime.now().date() - timedelta(days=2)
-        default_end = datetime.now().date()
+    filtered = snapshot.copy()
+    parsed_dates = pd.to_datetime(
+        filtered.get("Date", pd.Series(index=filtered.index, dtype=str)),
+        errors="coerce",
+        format="mixed",
+    )
+    valid_dates = parsed_dates.dropna()
+    filter_columns = st.columns([1.5, 1.2, 1.5, 1.7, 1.4, 1.3])
+    with filter_columns[0]:
+        if valid_dates.empty:
+            selected_dates = ()
+            st.caption("No valid dates found")
+        else:
+            min_date = valid_dates.min().date()
+            max_date = valid_dates.max().date()
+            selected_dates = st.date_input(
+                "Entry date range",
+                value=(min_date, max_date),
+                min_value=min_date,
+                max_value=max_date,
+                key="inwarding_snapshot_dates",
+            )
+    with filter_columns[1]:
+        gate_search = st.text_input(
+            "Gate entry number",
+            placeholder="Search gate entry",
+            key="inwarding_snapshot_gate_entry",
+            help="Enter a full or partial gate entry number to fact-check a flagged issue.",
+        )
+    with filter_columns[2]:
+        part_search = st.text_input(
+            "Part number",
+            placeholder="Search part number",
+            key="inwarding_snapshot_part",
+        )
+    with filter_columns[3]:
+        supplier_options = sorted(
+            value
+            for value in filtered.get(
+                "Supplier Name",
+                pd.Series(dtype=str),
+            ).astype(str).unique()
+            if value
+        )
+        selected_suppliers = st.multiselect(
+            "Supplier",
+            supplier_options,
+            placeholder="All suppliers",
+            key="inwarding_snapshot_suppliers",
+        )
+    with filter_columns[4]:
+        buyer_options = sorted(
+            value
+            for value in filtered.get(
+                "Buyer Name",
+                pd.Series(dtype=str),
+            ).astype(str).unique()
+            if value
+        )
+        selected_buyers = st.multiselect(
+            "Buyer",
+            buyer_options,
+            placeholder="All buyers",
+            key="inwarding_snapshot_buyers",
+        )
+    with filter_columns[5]:
+        status_options = sorted(
+            value
+            for value in filtered.get(
+                "Unloading Status",
+                pd.Series(dtype=str),
+            ).astype(str).unique()
+            if value
+        )
+        selected_statuses = st.multiselect(
+            "Unloading status",
+            status_options,
+            placeholder="All statuses",
+            key="inwarding_snapshot_statuses",
+        )
 
-    filter_row_1 = st.columns(4)
-    with filter_row_1[0]:
-        start_date = st.date_input("Start date", value=default_start, key="grn_start_date")
-    with filter_row_1[1]:
-        end_date = st.date_input("End date", value=default_end, key="grn_end_date")
-    with filter_row_1[2]:
-        suppliers = sorted(value for value in grn_df["Supplier"].unique() if value)
-        selected_suppliers = st.multiselect("Supplier", suppliers, default=[], key="grn_suppliers")
-    with filter_row_1[3]:
-        part_query = st.text_input("Part No. contains", key="grn_part_query")
+    if isinstance(selected_dates, (tuple, list)) and len(selected_dates) == 2:
+        start_date, end_date = selected_dates
+        if start_date != min_date or end_date != max_date:
+            filtered = filtered[
+                parsed_dates.dt.date.between(start_date, end_date)
+            ]
+    if part_search.strip() and "Part Number" in filtered.columns:
+        filtered = filtered[
+            filtered["Part Number"].astype(str).str.contains(
+                part_search.strip(),
+                case=False,
+                na=False,
+                regex=False,
+            )
+        ]
+    if gate_search.strip() and "Gate Entry No" in filtered.columns:
+        filtered = filtered[
+            filtered["Gate Entry No"].astype(str).str.contains(
+                gate_search.strip(),
+                case=False,
+                na=False,
+                regex=False,
+            )
+        ]
+    if selected_suppliers and "Supplier Name" in filtered.columns:
+        filtered = filtered[
+            filtered["Supplier Name"].isin(selected_suppliers)
+        ]
+    if selected_buyers and "Buyer Name" in filtered.columns:
+        filtered = filtered[filtered["Buyer Name"].isin(selected_buyers)]
+    if selected_statuses and "Unloading Status" in filtered.columns:
+        filtered = filtered[
+            filtered["Unloading Status"].isin(selected_statuses)
+        ]
 
-    filter_row_2 = st.columns(4)
-    with filter_row_2[0]:
-        po_query = st.text_input("PO Number contains", key="grn_po_query")
-    with filter_row_2[1]:
-        invoice_query = st.text_input("Invoice Number contains", key="grn_invoice_query")
-    with filter_row_2[2]:
-        gate_entry_query = st.text_input("Gate Entry No. contains", key="grn_gate_entry_query")
-    with filter_row_2[3]:
-        unloading_statuses = sorted(value for value in raw_df.get("Unloading Status", pd.Series(dtype=str)).fillna("").astype(str).unique() if value)
-        selected_unloading = st.multiselect("Unloading status", unloading_statuses, default=[], key="grn_unloading_status")
+    receipt_total = numeric(
+        filtered.get("Receipt Qty", pd.Series(dtype=str))
+    ).sum()
+    mapped_rows = int(
+        filtered.get("Buyer Name", pd.Series(dtype=str))
+        .astype(str)
+        .ne("Not mapped")
+        .sum()
+    )
+    mapping_coverage = (
+        mapped_rows / len(filtered) * 100
+        if len(filtered)
+        else 0
+    )
+    metric_columns = st.columns(4)
+    with metric_columns[0]:
+        render_metric("Snapshot rows", f"{len(filtered):,}", "neutral")
+    with metric_columns[1]:
+        render_metric("Receipt qty", f"{receipt_total:,.0f}", "ok")
+    with metric_columns[2]:
+        render_metric(
+            "Unique parts",
+            f"{filtered.get('Part Number', pd.Series(dtype=str)).replace('', pd.NA).dropna().nunique():,}",
+            "neutral",
+        )
+    with metric_columns[3]:
+        latest_date = pd.to_datetime(
+            filtered.get("Date", pd.Series(dtype=str)),
+            errors="coerce",
+            format="mixed",
+        ).max()
+        render_metric(
+            "Latest entry",
+            latest_date.strftime("%d %b %Y")
+            if pd.notna(latest_date)
+            else "Not available",
+            "neutral",
+        )
+    st.caption(
+        f"Buyer mapping coverage: {mapped_rows:,} of {len(filtered):,} rows "
+        f"({mapping_coverage:.1f}%). Part-number mapping is used first; "
+        "supplier mapping is the fallback."
+    )
 
-    filtered = grn_df.copy()
-    filtered_dates = parse_grn_dates(filtered["Arrival Date"])
-    if not valid_dates.empty:
-        filtered = filtered[(filtered_dates.dt.date >= start_date) & (filtered_dates.dt.date <= end_date)]
-    if selected_suppliers:
-        filtered = filtered[filtered["Supplier"].isin(selected_suppliers)]
-    if part_query.strip():
-        filtered = filtered[filtered["Part No."].str.contains(part_query.strip(), case=False, na=False)]
-    if po_query.strip():
-        filtered = filtered[filtered["PO Number"].str.contains(po_query.strip(), case=False, na=False)]
-    if invoice_query.strip():
-        filtered = filtered[filtered["Invoice Number"].str.contains(invoice_query.strip(), case=False, na=False)]
-    if gate_entry_query.strip():
-        filtered = filtered[filtered["Gate Entry No."].str.contains(gate_entry_query.strip(), case=False, na=False)]
-    if selected_unloading and "Unloading Status" in raw_df.columns:
-        status_by_row = raw_df["Unloading Status"].reset_index(drop=True)
-        filtered_row_numbers = pd.to_numeric(filtered["Source Row"], errors="coerce").fillna(0).astype(int) - 1
-        matching_rows = status_by_row.iloc[
-            [index for index in filtered_row_numbers.tolist() if 0 <= index < len(status_by_row)]
-        ].isin(selected_unloading)
-        filtered = filtered.loc[matching_rows.to_numpy()]
-
-    received_total = numeric(filtered["Rcvd Qty"]).sum()
-    unique_parts = filtered["Part No."].replace("", pd.NA).dropna().nunique()
-    latest_visible = parse_grn_dates(filtered["Arrival Date"]).max()
-
-    metrics = st.columns(4)
-    with metrics[0]:
-        render_metric("GRN rows", f"{len(filtered):,}", "neutral")
-    with metrics[1]:
-        render_metric("Received qty", f"{received_total:,.0f}", "ok")
-    with metrics[2]:
-        render_metric("Parts", f"{unique_parts:,}", "neutral")
-    with metrics[3]:
-        latest_label = latest_visible.strftime("%Y-%m-%d") if pd.notna(latest_visible) else "not available"
-        render_metric("Latest date", latest_label, "neutral")
-
-    copied_at = str(meta.get("copied_at", "") or "")
-    if copied_at:
-        st.caption(f"Saved Google Sheet copy created at: {copied_at}. Source rows copied: {meta.get('rows', 0):,}.")
-    st.caption("GRN received quantity is read from the sheet column `Receipt Qty`.")
-
-    render_grn_quality_agent(filtered)
+    render_grn_quality_agent(build_grn_display_frame(filtered))
     st.divider()
 
-    st.subheader("GRN Inwarding Table")
     st.dataframe(
         filtered,
         use_container_width=True,
         hide_index=True,
-        height=560,
+        height=600,
     )
     st.download_button(
-        "Download filtered GRN CSV",
-        filtered.to_csv(index=False),
-        file_name="google_sheet_grn_filtered.csv",
+        "Download filtered inwarding CSV",
+        data=filtered.to_csv(index=False).encode("utf-8"),
+        file_name="inwarding_snapshot_filtered.csv",
         mime="text/csv",
+        key="inwarding_snapshot_download",
     )
+    st.divider()
+    render_agentic_flow()
 
 
 def render_outwarding_flagging_agent(combined: pd.DataFrame) -> None:
@@ -3177,39 +3696,1309 @@ def render_outwarding_sources(manual_outwarding: pd.DataFrame) -> None:
 
 def render_outwarding() -> None:
     st.header("Outwarding Parts")
-    st.write(
-        "Production consumption is calculated from daily production × BOM. "
-        "Servicing issues remain a separate outwarding source."
+    st.write("Production consumption is calculated from daily production × BOM.")
+    empty_manual_outwarding = pd.DataFrame(
+        columns=TABLES["outwarding_parts"]["columns"]
     )
-    df = load_table("outwarding_parts")
-    render_outwarding_sources(df)
-    st.divider()
-    st.subheader("Servicing and Other Manual Outwarding")
-    render_editable_table("outwarding_parts")
+    render_outwarding_sources(empty_manual_outwarding)
+
+
+def agent_action_id(
+    issue_type: str,
+    gate_entry: str,
+    part_number: str,
+    supplier: str,
+    invoice_number: str,
+) -> str:
+    identity = "|".join(
+        [
+            issue_type,
+            gate_entry,
+            part_number,
+            supplier,
+            invoice_number,
+        ]
+    )
+    return hashlib.sha1(identity.encode("utf-8")).hexdigest()[:12].upper()
+
+
+def load_agent_actions() -> pd.DataFrame:
+    if not AGENT_ACTIONS_PATH.exists():
+        return pd.DataFrame(columns=AGENT_ACTION_COLUMNS)
+    actions = pd.read_csv(AGENT_ACTIONS_PATH, dtype=str).fillna("")
+    for column in AGENT_ACTION_COLUMNS:
+        if column not in actions.columns:
+            actions[column] = ""
+    return actions[AGENT_ACTION_COLUMNS]
+
+
+def save_agent_actions(actions: pd.DataFrame) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    output = actions.copy().fillna("")
+    for column in AGENT_ACTION_COLUMNS:
+        if column not in output.columns:
+            output[column] = ""
+    tmp_path = AGENT_ACTIONS_PATH.with_suffix(".tmp")
+    output[AGENT_ACTION_COLUMNS].to_csv(tmp_path, index=False)
+    tmp_path.replace(AGENT_ACTIONS_PATH)
+
+
+def latest_part_demand() -> dict[str, float]:
+    usage = load_source_cache(COMPUTED_USAGE_CACHE_PATH)
+    required_columns = {"Usage Date", "Part No.", "Total Outwarding Qty"}
+    if usage.empty or not required_columns.issubset(usage.columns):
+        return {}
+    usage_dates = pd.to_datetime(
+        usage["Usage Date"],
+        errors="coerce",
+        format="mixed",
+    )
+    if usage_dates.dropna().empty:
+        return {}
+    latest_date = usage_dates.max()
+    latest = usage[usage_dates.eq(latest_date)].copy()
+    latest["_demand"] = numeric(latest["Total Outwarding Qty"])
+    return (
+        latest.assign(
+            _part_key=latest["Part No."].map(stock_part_key)
+        )
+        .groupby("_part_key")["_demand"]
+        .sum()
+        .to_dict()
+    )
+
+
+def discrepancy_severity(
+    difference: float,
+    invoice_qty: float,
+    production_demand: float,
+) -> str:
+    magnitude = abs(difference)
+    ratio = magnitude / abs(invoice_qty) if invoice_qty else 0
+    if magnitude >= 100 or ratio >= 0.20:
+        severity = "Critical"
+    elif magnitude >= 20 or ratio >= 0.05:
+        severity = "High"
+    else:
+        severity = "Medium"
+    if difference > 0 and production_demand > 0:
+        if difference >= production_demand:
+            return "Critical"
+        if severity == "Medium":
+            return "High"
+    return severity
+
+
+def build_agent_issues(snapshot: pd.DataFrame) -> pd.DataFrame:
+    if snapshot.empty:
+        return pd.DataFrame(columns=AGENT_ACTION_COLUMNS)
+
+    now = datetime.now()
+    now_text = now.isoformat(timespec="seconds")
+    demand_by_part = latest_part_demand()
+    issues: list[dict[str, object]] = []
+
+    def add_issue(
+        row: pd.Series,
+        issue_type: str,
+        severity: str,
+        reason: str,
+        difference: float = 0,
+        invoice_qty: float = 0,
+        receipt_qty: float = 0,
+    ) -> None:
+        buyer = clean_text(row.get("Buyer Name", ""))
+        if not buyer or buyer == "Not mapped":
+            buyer = "SCM Admin"
+        part_number = clean_text(row.get("Part Number", ""))
+        supplier = clean_text(row.get("Supplier Name", ""))
+        gate_entry = clean_text(row.get("Gate Entry No", ""))
+        invoice_number = clean_text(row.get("Invoice Number", ""))
+        entry_date_text = clean_text(row.get("Date", ""))
+        entry_date = pd.to_datetime(
+            entry_date_text,
+            errors="coerce",
+            dayfirst=True,
+        )
+        age_days = (
+            max((now.date() - entry_date.date()).days, 0)
+            if not pd.isna(entry_date)
+            else 0
+        )
+        demand = float(demand_by_part.get(stock_part_key(part_number), 0))
+        production_impact = "No latest-day demand"
+        if difference > 0 and demand > 0:
+            production_impact = (
+                f"At risk: shortage {display_qty(difference)} vs "
+                f"latest demand {display_qty(demand)}"
+            )
+        escalation = "None"
+        if severity == "Critical" and age_days >= 1:
+            escalation = "Escalate now"
+        elif severity == "High" and age_days >= 2:
+            escalation = "Escalate now"
+        elif age_days >= 3:
+            escalation = "Buyer follow-up due"
+        issues.append(
+            {
+                "Action ID": agent_action_id(
+                    issue_type,
+                    gate_entry,
+                    part_number,
+                    supplier,
+                    invoice_number,
+                ),
+                "Active": "Yes",
+                "Issue Type": issue_type,
+                "Severity": severity,
+                "Buyer Name": buyer,
+                "Supplier Name": supplier,
+                "Part Number": part_number,
+                "Part Name": clean_text(row.get("Part Name", "")),
+                "Gate Entry No": gate_entry,
+                "Entry Date": entry_date_text,
+                "Invoice Qty": invoice_qty,
+                "Receipt Qty": receipt_qty,
+                "Difference Qty": difference,
+                "Latest Production Demand": demand,
+                "Production Impact": production_impact,
+                "Reason": reason,
+                "Status": "New",
+                "Age (days)": age_days,
+                "Escalation": escalation,
+                "First Detected": now_text,
+                "Last Checked": now_text,
+                "Acknowledged At": "",
+                "Resolved At": "",
+                "Notes": "",
+            }
+        )
+
+    invoice_numbers = pd.to_numeric(
+        snapshot.get("Invoice Qty", pd.Series(index=snapshot.index)),
+        errors="coerce",
+    )
+    receipt_numbers = pd.to_numeric(
+        snapshot.get("Receipt Qty", pd.Series(index=snapshot.index)),
+        errors="coerce",
+    )
+    differences = invoice_numbers - receipt_numbers
+    quantity_issue_mask = (
+        invoice_numbers.notna()
+        & receipt_numbers.notna()
+        & differences.abs().gt(0.000001)
+    )
+    for index, row in snapshot[quantity_issue_mask].iterrows():
+        invoice_number = float(invoice_numbers.loc[index])
+        receipt_number = float(receipt_numbers.loc[index])
+        difference = float(differences.loc[index])
+        demand = float(
+            demand_by_part.get(
+                stock_part_key(row.get("Part Number", "")),
+                0,
+            )
+        )
+        severity = discrepancy_severity(
+            difference,
+            invoice_number,
+            demand,
+        )
+        direction = "short" if difference > 0 else "excess"
+        add_issue(
+            row,
+            "Quantity discrepancy",
+            severity,
+            f"Receipt is {display_qty(abs(difference))} {direction} "
+            "against the invoice quantity.",
+            difference,
+            invoice_number,
+            receipt_number,
+        )
+
+    buyer_values = snapshot.get(
+        "Buyer Name",
+        pd.Series("", index=snapshot.index),
+    ).map(clean_text)
+    for _, row in snapshot[
+        buyer_values.isin(["", "Not mapped"])
+    ].iterrows():
+        add_issue(
+            row,
+            "Buyer not mapped",
+            "High",
+            "No unambiguous buyer exists in the current buyer mapping.",
+        )
+
+    critical_fields = [
+        "PO Number",
+        "Invoice Number",
+        "Part Number",
+        "Supplier Name",
+    ]
+    missing_masks = {
+        field: snapshot.get(
+            field,
+            pd.Series("", index=snapshot.index),
+        ).map(clean_text).eq("")
+        for field in critical_fields
+    }
+    missing_any = pd.concat(missing_masks, axis=1).any(axis=1)
+    for index, row in snapshot[missing_any].iterrows():
+        missing_fields = [
+            field
+            for field in critical_fields
+            if bool(missing_masks[field].loc[index])
+        ]
+        severity = (
+            "High"
+            if {"Part Number", "Supplier Name"} & set(missing_fields)
+            else "Medium"
+        )
+        add_issue(
+            row,
+            "Missing critical data",
+            severity,
+            "Missing: " + ", ".join(missing_fields) + ".",
+        )
+
+    unloading_statuses = snapshot.get(
+        "Unloading Status",
+        pd.Series("", index=snapshot.index),
+    ).map(clean_text).str.lower()
+    entry_dates = pd.to_datetime(
+        snapshot.get("Date", pd.Series("", index=snapshot.index)),
+        errors="coerce",
+        dayfirst=True,
+    )
+    waiting_mask = (
+        unloading_statuses.str.contains("waiting", regex=False)
+        | unloading_statuses.eq("")
+    ) & entry_dates.notna()
+    for index, row in snapshot[waiting_mask].iterrows():
+        waiting_days = max((now.date() - entry_dates.loc[index].date()).days, 0)
+        if waiting_days >= 1:
+            add_issue(
+                row,
+                "Unloading overdue",
+                "Critical" if waiting_days >= 3 else "High",
+                f"Material has been waiting for unloading for "
+                f"{waiting_days} day(s).",
+            )
+
+    duplicate_columns = [
+        "Gate Entry No",
+        "Invoice Number",
+        "Part Number",
+        "Supplier Name",
+        "Invoice Qty",
+        "Receipt Qty",
+    ]
+    if set(duplicate_columns).issubset(snapshot.columns):
+        duplicate_rows = snapshot[
+            snapshot.duplicated(duplicate_columns, keep=False)
+        ]
+        for _, group in duplicate_rows.groupby(
+            duplicate_columns,
+            dropna=False,
+            sort=False,
+        ):
+            if len(group) > 1:
+                add_issue(
+                    group.iloc[0],
+                    "Possible duplicate entry",
+                    "Medium",
+                    f"{len(group)} identical inwarding rows were found.",
+                )
+
+    if not issues:
+        return pd.DataFrame(columns=AGENT_ACTION_COLUMNS)
+    return (
+        pd.DataFrame(issues)
+        .drop_duplicates("Action ID", keep="last")
+        .reindex(columns=AGENT_ACTION_COLUMNS)
+    )
+
+
+def reconcile_agent_actions(current_issues: pd.DataFrame) -> pd.DataFrame:
+    previous = load_agent_actions()
+    now_text = datetime.now().isoformat(timespec="seconds")
+    if previous.empty:
+        output = current_issues.copy()
+        save_agent_actions(output)
+        return output
+
+    previous_by_id = previous.set_index("Action ID", drop=False)
+    reconciled_rows: list[dict[str, object]] = []
+    current_ids: set[str] = set()
+    for _, issue in current_issues.iterrows():
+        row = issue.to_dict()
+        action_id = str(row["Action ID"])
+        current_ids.add(action_id)
+        if action_id in previous_by_id.index:
+            old = previous_by_id.loc[action_id]
+            if isinstance(old, pd.DataFrame):
+                old = old.iloc[-1]
+            for field in [
+                "Status",
+                "First Detected",
+                "Acknowledged At",
+                "Resolved At",
+                "Notes",
+            ]:
+                row[field] = clean_text(old.get(field, row[field]))
+            if row["Status"] in {"Resolved", "Auto-resolved"}:
+                row["Status"] = "Reopened"
+                row["Resolved At"] = ""
+        row["Active"] = "Yes"
+        row["Last Checked"] = now_text
+        reconciled_rows.append(row)
+
+    for _, old in previous.iterrows():
+        action_id = clean_text(old.get("Action ID", ""))
+        if action_id in current_ids:
+            continue
+        row = old.to_dict()
+        row["Active"] = "No"
+        row["Last Checked"] = now_text
+        if clean_text(row.get("Status", "")) != "Auto-resolved":
+            row["Status"] = "Auto-resolved"
+            row["Resolved At"] = now_text
+        reconciled_rows.append(row)
+
+    output = (
+        pd.DataFrame(reconciled_rows)
+        .drop_duplicates("Action ID", keep="first")
+        .reindex(columns=AGENT_ACTION_COLUMNS)
+        .fillna("")
+    )
+    save_agent_actions(output)
+    return output
+
+
+def save_agent_followup(action_id: str) -> None:
+    actions = load_agent_actions()
+    action_mask = actions["Action ID"].eq(action_id)
+    if not action_mask.any():
+        return
+    status_key = f"agent_status_{action_id}"
+    notes_key = f"agent_notes_{action_id}"
+    new_status = clean_text(st.session_state.get(status_key, "New"))
+    allowed_statuses = {
+        "New",
+        "Reopened",
+        "Acknowledged",
+        "Investigating",
+        "Awaiting source correction",
+    }
+    if new_status not in allowed_statuses:
+        new_status = "Reopened"
+    now_text = datetime.now().isoformat(timespec="seconds")
+    previous = actions.loc[action_mask].iloc[0]
+    actions.loc[action_mask, "Status"] = new_status
+    actions.loc[action_mask, "Notes"] = clean_text(
+        st.session_state.get(notes_key, "")
+    )
+    if (
+        new_status
+        in {
+            "Acknowledged",
+            "Investigating",
+            "Awaiting source correction",
+        }
+        and not clean_text(previous["Acknowledged At"])
+    ):
+        actions.loc[action_mask, "Acknowledged At"] = now_text
+    if new_status != clean_text(previous["Status"]):
+        actions.loc[action_mask, "Resolved At"] = ""
+    save_agent_actions(actions)
+    st.session_state["agent_followup_notice"] = (
+        "Follow-up saved. The agent will close this action only after the "
+        "source discrepancy is corrected."
+    )
+
+
+def render_agent_action_detail(
+    selected: pd.Series,
+    actions: pd.DataFrame,
+) -> None:
+    selected_action_id = clean_text(selected["Action ID"])
+    severity_class = clean_text(selected["Severity"]).lower()
+    st.markdown(
+        f"<div class='agent-review-heading'>"
+        f"<span class='agent-chip {escape(severity_class)}'>"
+        f"{escape(clean_text(selected['Severity']))}</span>"
+        f"<b>{escape(clean_text(selected['Issue Type']))}</b>"
+        f"<span>Action {escape(selected_action_id)}</span>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+    detail_columns = st.columns(3)
+    with detail_columns[0]:
+        with st.container(border=True):
+            st.markdown("**Owner and source**")
+            st.markdown(
+                f"Buyer: **{escape(clean_text(selected['Buyer Name']))}**  \n"
+                f"Supplier: {escape(clean_text(selected['Supplier Name']) or '—')}  \n"
+                f"Gate entry: {escape(clean_text(selected['Gate Entry No']) or '—')}  \n"
+                f"Entry date: {escape(clean_text(selected['Entry Date']) or '—')}"
+            )
+    with detail_columns[1]:
+        with st.container(border=True):
+            st.markdown("**Material**")
+            st.markdown(
+                f"Part: **{escape(clean_text(selected['Part Number']) or '—')}**  \n"
+                f"Name: {escape(clean_text(selected['Part Name']) or '—')}  \n"
+                f"Age: {escape(clean_text(selected['Age (days)']) or '0')} day(s)  \n"
+                f"Escalation: **{escape(clean_text(selected['Escalation']))}**"
+            )
+    with detail_columns[2]:
+        with st.container(border=True):
+            st.markdown("**Quantity and production**")
+            st.markdown(
+                f"Invoice: **{display_qty(selected['Invoice Qty'])}**  \n"
+                f"Received: **{display_qty(selected['Receipt Qty'])}**  \n"
+                f"Difference: **{display_qty(selected['Difference Qty'])}**  \n"
+                f"{escape(clean_text(selected['Production Impact']))}"
+            )
+
+    if selected["Severity"] == "Critical":
+        st.error(f"Why it was flagged: {selected['Reason']}", icon="🔴")
+    elif selected["Severity"] == "High":
+        st.warning(f"Why it was flagged: {selected['Reason']}", icon="🟠")
+    else:
+        st.info(f"Why it was flagged: {selected['Reason']}", icon="🟡")
+
+    st.markdown("**Buyer follow-up**")
+    if clean_text(selected["Active"]) == "No":
+        st.success(
+            "Verified resolved: the latest agent check could no longer "
+            "find this discrepancy in the source data."
+        )
+        st.caption(
+            f"Resolved at: {clean_text(selected['Resolved At']) or 'Not recorded'}"
+        )
+        return
+
+    workflow_options = [
+        "New",
+        "Reopened",
+        "Acknowledged",
+        "Investigating",
+        "Awaiting source correction",
+    ]
+    current_status = clean_text(selected["Status"])
+    if current_status not in workflow_options:
+        current_status = "Reopened"
+    with st.form(
+        key=f"agent_followup_form_{selected_action_id}",
+        border=True,
+    ):
+        workflow_columns = st.columns([1, 2])
+        with workflow_columns[0]:
+            st.selectbox(
+                "Workflow status",
+                workflow_options,
+                index=workflow_options.index(current_status),
+                key=f"agent_status_{selected_action_id}",
+                help="Buyers can progress the work, but cannot mark it resolved. Resolution is system-verified from refreshed source data.",
+            )
+        with workflow_columns[1]:
+            st.text_area(
+                "Follow-up notes",
+                value=clean_text(selected["Notes"]),
+                placeholder="Add supplier follow-up, expected correction date, or investigation details.",
+                key=f"agent_notes_{selected_action_id}",
+                help="Notes are retained in the audit history for management review.",
+            )
+        st.form_submit_button(
+            "Save follow-up",
+            type="primary",
+            on_click=save_agent_followup,
+            args=(selected_action_id,),
+        )
+
+
+def render_agentic_flow_legacy() -> None:
+    st.header("Inwarding Discrepancy Agent")
+    st.caption(
+        "A buyer-owned action queue generated from the latest saved inwarding "
+        "snapshot. The agent verifies corrections before closing an issue."
+    )
+    with st.expander("How this page works", expanded=False):
+        st.markdown(
+            """
+            1. Refresh **Inwarding Parts** to read the newest Google Sheet data.
+            2. The agent checks quantities, ownership, required fields, unloading
+               delays, duplicate rows, and possible production impact.
+            3. Buyers acknowledge and investigate their assigned actions here.
+            4. An action becomes **Auto-resolved** only after a later agent check
+               confirms that the source discrepancy no longer exists.
+
+            Hover over the small **ⓘ** icons beside labels for a quick definition.
+            """
+        )
+    snapshot = enrich_inwarding_buyers(
+        clean_inwarding_snapshot(
+            load_source_cache(INWARDING_SNAPSHOT_PATH)
+        ),
+        load_source_cache(BUYER_MAPPING_CACHE_PATH),
+    )
+    if snapshot.empty:
+        st.info(
+            "Refresh the Inwarding Parts sheet once before running the agent."
+        )
+        return
+
+    with st.spinner("Agent is checking inwarding data..."):
+        actions = reconcile_agent_actions(build_agent_issues(snapshot))
+    followup_notice = st.session_state.pop("agent_followup_notice", "")
+    if followup_notice:
+        st.success(followup_notice)
+
+    active = actions[actions["Active"].eq("Yes")].copy()
+    active_open = active[
+        ~active["Status"].isin(["Resolved", "Auto-resolved"])
+    ].copy()
+    critical = active_open[
+        active_open["Severity"].eq("Critical")
+    ]
+    escalations = active_open[
+        active_open["Escalation"].ne("None")
+    ]
+    production_risk = active_open[
+        active_open["Production Impact"].str.startswith("At risk", na=False)
+    ]
+
+    st.subheader(
+        "Current position",
+        help="A quick view of unresolved issues in the current saved snapshot.",
+    )
+    metric_columns = st.columns(4)
+    metric_columns[0].metric(
+        "Open actions",
+        f"{len(active_open):,}",
+        help="Active discrepancies that have not yet been verified as corrected.",
+        border=True,
+    )
+    metric_columns[1].metric(
+        "Critical",
+        f"{len(critical):,}",
+        help="High-impact quantity differences or unloading delays requiring immediate attention.",
+        border=True,
+    )
+    metric_columns[2].metric(
+        "Escalations due",
+        f"{len(escalations):,}",
+        help="Critical items older than one day, High items older than two days, or other overdue follow-ups.",
+        border=True,
+    )
+    metric_columns[3].metric(
+        "Production risks",
+        f"{len(production_risk):,}",
+        help="Short receipts for parts also required by the latest production/BOM calculation.",
+        border=True,
+    )
+    st.markdown(
+        """
+        <div class="agent-legend">
+            <span class="agent-chip critical">Critical</span>
+            <span class="agent-chip high">High</span>
+            <span class="agent-chip medium">Medium</span>
+            <span class="agent-chip resolved">Verified resolved</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if active_open.empty:
+        st.success("No active discrepancies are currently open.")
+    else:
+        st.subheader(
+            "Priority overview",
+            help="Workload grouped by owner and by the type of problem detected.",
+        )
+        overview_columns = st.columns([1.35, 1])
+        buyer_summary = active_open.pivot_table(
+            index="Buyer Name",
+            columns="Severity",
+            values="Action ID",
+            aggfunc="count",
+            fill_value=0,
+        )
+        for severity in ["Critical", "High", "Medium"]:
+            if severity not in buyer_summary.columns:
+                buyer_summary[severity] = 0
+        buyer_summary = buyer_summary[["Critical", "High", "Medium"]]
+        buyer_summary["Total"] = buyer_summary.sum(axis=1)
+        buyer_summary = (
+            buyer_summary.sort_values(
+                ["Critical", "Total"],
+                ascending=False,
+            )
+            .reset_index()
+        )
+        issue_summary = (
+            active_open.groupby("Issue Type")
+            .agg(
+                Actions=("Action ID", "count"),
+                Critical=(
+                    "Severity",
+                    lambda values: int((values == "Critical").sum()),
+                ),
+            )
+            .sort_values(["Critical", "Actions"], ascending=False)
+            .reset_index()
+        )
+        with overview_columns[0]:
+            with st.container(border=True):
+                st.markdown("**Buyer workload**")
+                st.caption(
+                    f"{active_open['Buyer Name'].nunique():,} owners currently "
+                    "have open actions."
+                )
+                st.dataframe(
+                    buyer_summary,
+                    width="stretch",
+                    hide_index=True,
+                    height=min(260, 36 + len(buyer_summary) * 35),
+                )
+        with overview_columns[1]:
+            with st.container(border=True):
+                st.markdown("**Problems detected**")
+                st.caption(
+                    "Use this to see which control is creating the most work."
+                )
+                st.dataframe(
+                    issue_summary,
+                    width="stretch",
+                    hide_index=True,
+                    height=min(260, 36 + len(issue_summary) * 35),
+                )
+
+    st.subheader(
+        "Action queue",
+        help="Filter the queue, then choose one action below to review its evidence and update its workflow status.",
+    )
+    filter_columns = st.columns(4)
+    with filter_columns[0]:
+        buyer_filter = st.multiselect(
+            "Buyer",
+            sorted(actions["Buyer Name"].dropna().unique()),
+            placeholder="All buyers",
+            key="agent_buyer_filter",
+            help="The buyer accountable for following up. Unmapped ownership is routed to SCM Admin.",
+        )
+    with filter_columns[1]:
+        severity_filter = st.multiselect(
+            "Severity",
+            ["Critical", "High", "Medium"],
+            placeholder="All severities",
+            key="agent_severity_filter",
+            help="Critical needs immediate attention; High needs prompt follow-up; Medium is a control or data-quality warning.",
+        )
+    with filter_columns[2]:
+        status_filter = st.multiselect(
+            "Status",
+            [
+                "New",
+                "Reopened",
+                "Acknowledged",
+                "Investigating",
+                "Awaiting source correction",
+                "Auto-resolved",
+            ],
+            default=[
+                "New",
+                "Reopened",
+                "Acknowledged",
+                "Investigating",
+                "Awaiting source correction",
+            ],
+            key="agent_status_filter",
+            help="Auto-resolved is system-controlled and appears only after the source data passes the next check.",
+        )
+    with filter_columns[3]:
+        issue_filter = st.multiselect(
+            "Issue type",
+            sorted(actions["Issue Type"].dropna().unique()),
+            placeholder="All issue types",
+            key="agent_issue_filter",
+            help="The specific rule that caused the agent to create an action.",
+        )
+
+    filtered = actions.copy()
+    if buyer_filter:
+        filtered = filtered[filtered["Buyer Name"].isin(buyer_filter)]
+    if severity_filter:
+        filtered = filtered[filtered["Severity"].isin(severity_filter)]
+    if status_filter:
+        filtered = filtered[filtered["Status"].isin(status_filter)]
+    if issue_filter:
+        filtered = filtered[filtered["Issue Type"].isin(issue_filter)]
+
+    severity_order = {"Critical": 0, "High": 1, "Medium": 2}
+    filtered["_severity_order"] = (
+        filtered["Severity"].map(severity_order).fillna(9)
+    )
+    filtered["_age_numeric"] = pd.to_numeric(
+        filtered["Age (days)"],
+        errors="coerce",
+    ).fillna(0)
+    filtered = filtered.sort_values(
+        ["_severity_order", "_age_numeric", "Buyer Name"],
+        ascending=[True, False, True],
+    ).drop(columns=["_severity_order", "_age_numeric"])
+
+    queue_columns = [
+        "Action ID",
+        "Severity",
+        "Buyer Name",
+        "Issue Type",
+        "Supplier Name",
+        "Part Number",
+        "Difference Qty",
+        "Age (days)",
+        "Status",
+    ]
+    queue = filtered[queue_columns].copy()
+    queue["Difference Qty"] = pd.to_numeric(
+        queue["Difference Qty"],
+        errors="coerce",
+    ).fillna(0)
+    queue["Age (days)"] = pd.to_numeric(
+        queue["Age (days)"],
+        errors="coerce",
+    ).fillna(0).astype(int)
+
+    def severity_style(value: object) -> str:
+        styles = {
+            "Critical": "background-color:#fee2e2;color:#991b1b;font-weight:700",
+            "High": "background-color:#ffedd5;color:#9a3412;font-weight:700",
+            "Medium": "background-color:#fef9c3;color:#854d0e;font-weight:700",
+        }
+        return styles.get(str(value), "")
+
+    def status_style(value: object) -> str:
+        styles = {
+            "Auto-resolved": "background-color:#dcfce7;color:#166534;font-weight:700",
+            "Reopened": "background-color:#fce7f3;color:#9d174d;font-weight:700",
+            "Investigating": "background-color:#dbeafe;color:#1d4ed8;font-weight:700",
+            "Awaiting source correction": "background-color:#ede9fe;color:#6d28d9;font-weight:700",
+        }
+        return styles.get(str(value), "")
+
+    queue_styler = (
+        queue.style.map(severity_style, subset=["Severity"])
+        .map(status_style, subset=["Status"])
+        .format({"Difference Qty": "{:,.2f}", "Age (days)": "{:,.0f}"})
+    )
+    st.dataframe(
+        queue_styler,
+        width="stretch",
+        hide_index=True,
+        height=min(430, 38 + max(len(queue), 1) * 35),
+        column_config={
+            "Difference Qty": st.column_config.NumberColumn(format="%.2f"),
+            "Age (days)": st.column_config.NumberColumn(format="%d"),
+        },
+    )
+    st.caption(
+        f"Showing {len(queue):,} action(s). Select an action below for the full "
+        "reason, quantities, production impact, and workflow controls."
+    )
+
+    if filtered.empty:
+        st.info("No actions match the selected filters.")
+    else:
+        action_lookup = filtered.set_index("Action ID", drop=False)
+        selected_action_id = st.selectbox(
+            "Review one action",
+            filtered["Action ID"].tolist(),
+            format_func=lambda action_id: (
+                f"{action_lookup.loc[action_id, 'Severity']} · "
+                f"{action_lookup.loc[action_id, 'Buyer Name']} · "
+                f"{action_lookup.loc[action_id, 'Issue Type']} · "
+                f"{action_lookup.loc[action_id, 'Part Number'] or 'No part number'}"
+            ),
+            key="agent_selected_action",
+            help="Choose an action to see all evidence without scrolling through a very wide table.",
+        )
+        selected = action_lookup.loc[selected_action_id]
+        if isinstance(selected, pd.DataFrame):
+            selected = selected.iloc[0]
+
+        severity_class = clean_text(selected["Severity"]).lower()
+        st.markdown(
+            f"<div class='agent-review-heading'>"
+            f"<span class='agent-chip {escape(severity_class)}'>"
+            f"{escape(clean_text(selected['Severity']))}</span>"
+            f"<b>{escape(clean_text(selected['Issue Type']))}</b>"
+            f"<span>Action {escape(clean_text(selected['Action ID']))}</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+        detail_columns = st.columns(3)
+        with detail_columns[0]:
+            with st.container(border=True):
+                st.markdown("**Owner and source**")
+                st.markdown(
+                    f"Buyer: **{escape(clean_text(selected['Buyer Name']))}**  \n"
+                    f"Supplier: {escape(clean_text(selected['Supplier Name']) or '—')}  \n"
+                    f"Gate entry: {escape(clean_text(selected['Gate Entry No']) or '—')}  \n"
+                    f"Entry date: {escape(clean_text(selected['Entry Date']) or '—')}"
+                )
+        with detail_columns[1]:
+            with st.container(border=True):
+                st.markdown("**Material**")
+                st.markdown(
+                    f"Part: **{escape(clean_text(selected['Part Number']) or '—')}**  \n"
+                    f"Name: {escape(clean_text(selected['Part Name']) or '—')}  \n"
+                    f"Age: {escape(clean_text(selected['Age (days)']) or '0')} day(s)  \n"
+                    f"Escalation: **{escape(clean_text(selected['Escalation']))}**"
+                )
+        with detail_columns[2]:
+            with st.container(border=True):
+                st.markdown("**Quantity and production**")
+                st.markdown(
+                    f"Invoice: **{display_qty(selected['Invoice Qty'])}**  \n"
+                    f"Received: **{display_qty(selected['Receipt Qty'])}**  \n"
+                    f"Difference: **{display_qty(selected['Difference Qty'])}**  \n"
+                    f"{escape(clean_text(selected['Production Impact']))}"
+                )
+
+        if selected["Severity"] == "Critical":
+            st.error(f"Why it was flagged: {selected['Reason']}", icon="🔴")
+        elif selected["Severity"] == "High":
+            st.warning(f"Why it was flagged: {selected['Reason']}", icon="🟠")
+        else:
+            st.info(f"Why it was flagged: {selected['Reason']}", icon="🟡")
+
+        st.markdown("**Buyer follow-up**")
+        if clean_text(selected["Active"]) == "No":
+            st.success(
+                "Verified resolved: the latest agent check could no longer "
+                "find this discrepancy in the source data."
+            )
+            st.caption(
+                f"Resolved at: {clean_text(selected['Resolved At']) or 'Not recorded'}"
+            )
+        else:
+            workflow_options = [
+                "New",
+                "Reopened",
+                "Acknowledged",
+                "Investigating",
+                "Awaiting source correction",
+            ]
+            current_status = clean_text(selected["Status"])
+            if current_status not in workflow_options:
+                current_status = "Reopened"
+            with st.form(
+                key=f"agent_followup_form_{selected_action_id}",
+                border=True,
+            ):
+                workflow_columns = st.columns([1, 2])
+                with workflow_columns[0]:
+                    new_status = st.selectbox(
+                        "Workflow status",
+                        workflow_options,
+                        index=workflow_options.index(current_status),
+                        key=f"agent_status_{selected_action_id}",
+                        help="Buyers can progress the work, but cannot mark it resolved. Resolution is system-verified from refreshed source data.",
+                    )
+                with workflow_columns[1]:
+                    new_notes = st.text_area(
+                        "Follow-up notes",
+                        value=clean_text(selected["Notes"]),
+                        placeholder="Add supplier follow-up, expected correction date, or investigation details.",
+                        key=f"agent_notes_{selected_action_id}",
+                        help="Notes are retained in the audit history for management review.",
+                    )
+                save_followup = st.form_submit_button(
+                    "Save follow-up",
+                    type="primary",
+                    on_click=save_agent_followup,
+                    args=(selected_action_id,),
+                )
+    with st.expander("Agent rules and complete audit history"):
+        st.markdown(
+            """
+            - Quantity mismatch: invoice quantity differs from receipt quantity.
+            - Buyer ownership: part mapping first, then normalized supplier mapping.
+            - Data quality: missing PO, invoice, part, or supplier information.
+            - Delay: material remains waiting for unloading beyond one day.
+            - Duplicate control: identical inwarding rows are flagged once.
+            - Escalation: Critical items after one day and High items after two days.
+            - Production impact: shortages are compared with the latest calculated
+              daily BOM requirement.
+            - Verified resolution: buyers cannot manually close an issue. The agent
+              sets `Auto-resolved` only when the discrepancy disappears from the
+              refreshed source snapshot.
+            """
+        )
+        st.dataframe(
+            actions,
+            width="stretch",
+            hide_index=True,
+        )
+        st.download_button(
+            "Download complete action audit CSV",
+            data=actions.to_csv(index=False).encode("utf-8"),
+            file_name="inwarding_agent_action_audit.csv",
+            mime="text/csv",
+            key="agent_audit_download",
+        )
 
 
 def render_agentic_flow() -> None:
-    st.header("Agentic Flow")
-    st.write("Simple operating logic for the inventory agent.")
-    steps = [
-        ("1. Capture inwarding", "Create a saved GRN sheet copy and read supplier receipts, quantity, PO, plant, and arrival time."),
-        ("2. Validate GRN", "GRN Data Quality Agent flags missing part numbers, bad quantities, missing dates, discrepancies, and duplicate receipt lines."),
-        ("3. Capture outwarding", "Read production and BOM sheets, then calculate part usage from vehicle production plus servicing/manual issues."),
-        ("4. Detect plan change", "Production Change Flagging Agent compares current outwarding against the saved baseline and alerts Akshat/Abhiraj."),
-        ("5. Check coverage", "Inbound Coverage Agent compares weekly outwarding against same-week GRN receipts to find supply pressure."),
-        ("6. Assign ownership", "Supplier Ownership Agent maps risky parts to buyer and supplier owners from the SPOC Summary copy."),
-        ("7. Follow up", "Buyer uses the flagged list to follow up with the supplier or SCM owner before stock becomes a line issue."),
+    st.header("Inwarding Discrepancy Agent")
+    st.caption(
+        "Each buyer gets one workspace containing all assigned issues, grouped "
+        "by severity and ordered by age."
+    )
+    with st.expander("How to use this page", expanded=False):
+        st.markdown(
+            """
+            1. Choose your name under **Buyer workspace**.
+            2. Open the **Critical**, **High**, or **Medium** tab.
+            3. Click any row to see its evidence and record follow-up.
+            4. The **Verified resolved** tab contains only issues the agent
+               confirmed were corrected in refreshed source data.
+            """
+        )
+
+    snapshot = enrich_inwarding_buyers(
+        clean_inwarding_snapshot(
+            load_source_cache(INWARDING_SNAPSHOT_PATH)
+        ),
+        load_source_cache(BUYER_MAPPING_CACHE_PATH),
+    )
+    if snapshot.empty:
+        st.info(
+            "Refresh the Inwarding Parts sheet once before running the agent."
+        )
+        return
+
+    with st.spinner("Agent is checking inwarding data..."):
+        actions = reconcile_agent_actions(build_agent_issues(snapshot))
+    followup_notice = st.session_state.pop("agent_followup_notice", "")
+    if followup_notice:
+        st.success(followup_notice)
+
+    active_open = actions[
+        actions["Active"].eq("Yes")
+        & ~actions["Status"].isin(["Resolved", "Auto-resolved"])
+    ].copy()
+    critical = active_open[active_open["Severity"].eq("Critical")]
+    escalations = active_open[active_open["Escalation"].ne("None")]
+    production_risk = active_open[
+        active_open["Production Impact"].str.startswith("At risk", na=False)
     ]
-    for title, text in steps:
-        st.markdown(f"<div class='flow-step'><b>{title}</b><br>{text}</div>", unsafe_allow_html=True)
+
+    metric_columns = st.columns(4)
+    metric_columns[0].metric(
+        "Open actions",
+        f"{len(active_open):,}",
+        help="All currently active discrepancies across buyers.",
+        border=True,
+    )
+    metric_columns[1].metric(
+        "Critical",
+        f"{len(critical):,}",
+        help="Issues requiring immediate attention.",
+        border=True,
+    )
+    metric_columns[2].metric(
+        "Escalations due",
+        f"{len(escalations):,}",
+        help="Issues old enough to require buyer or management follow-up.",
+        border=True,
+    )
+    metric_columns[3].metric(
+        "Production risks",
+        f"{len(production_risk):,}",
+        help="Short receipts linked to the latest production/BOM demand.",
+        border=True,
+    )
+
+    st.subheader(
+        "Buyer workspace",
+        help="Select one buyer to see only their assigned issues.",
+    )
+    open_counts = active_open.groupby("Buyer Name").size().to_dict()
+    buyer_options = sorted(
+        actions["Buyer Name"].dropna().unique(),
+        key=lambda buyer: (-int(open_counts.get(buyer, 0)), buyer),
+    )
+    if not buyer_options:
+        st.info("No buyer assignments are available yet.")
+        return
+    selected_buyer = st.selectbox(
+        "Choose buyer workspace",
+        buyer_options,
+        index=0,
+        format_func=lambda buyer: (
+            f"{buyer} ({int(open_counts.get(buyer, 0))})"
+        ),
+        key="agent_buyer_workspace",
+        help="The number beside each name is that buyer's open-action count.",
+        width="stretch",
+    )
+    if not selected_buyer:
+        st.info("Choose a buyer to open their issue lists.")
+        return
+
+    buyer_actions = actions[
+        actions["Buyer Name"].eq(selected_buyer)
+    ].copy()
+    buyer_open = buyer_actions[
+        buyer_actions["Active"].eq("Yes")
+        & ~buyer_actions["Status"].isin(["Resolved", "Auto-resolved"])
+    ]
+    buyer_metrics = st.columns(4)
+    buyer_metrics[0].metric(
+        "Total open",
+        f"{len(buyer_open):,}",
+        border=True,
+    )
+    for metric_column, severity, icon in zip(
+        buyer_metrics[1:],
+        ["Critical", "High", "Medium"],
+        ["🔴", "🟠", "🟡"],
+    ):
+        metric_column.metric(
+            f"{icon} {severity}",
+            f"{int(buyer_open['Severity'].eq(severity).sum()):,}",
+            border=True,
+        )
+
+    filter_columns = st.columns([1.35, 1, 1])
+    with filter_columns[0]:
+        buyer_search = st.text_input(
+            "Search this buyer's issues",
+            placeholder="Part number, part name, or gate entry",
+            key="agent_buyer_issue_search",
+            help="Search only inside the selected buyer's workspace.",
+        )
+    with filter_columns[1]:
+        supplier_options = sorted(
+            supplier
+            for supplier in buyer_actions[
+                "Supplier Name"
+            ].dropna().unique()
+            if clean_text(supplier)
+        )
+        selected_agent_supplier = st.selectbox(
+            "Supplier",
+            ["All suppliers", *supplier_options],
+            key=(
+                "agent_buyer_supplier_"
+                + re.sub(
+                    r"[^a-z0-9]+",
+                    "_",
+                    str(selected_buyer).lower(),
+                ).strip("_")
+            ),
+            help="Choose one supplier within the selected buyer's workspace.",
+        )
+    with filter_columns[2]:
+        buyer_issue_types = st.multiselect(
+            "Problem type",
+            sorted(buyer_actions["Issue Type"].dropna().unique()),
+            placeholder="All problem types",
+            key="agent_buyer_issue_types",
+            help="Limit the lists to selected control failures.",
+        )
+    if buyer_search.strip():
+        search_text = buyer_search.strip()
+        search_mask = pd.Series(False, index=buyer_actions.index)
+        for column in [
+            "Part Number",
+            "Part Name",
+            "Gate Entry No",
+        ]:
+            search_mask |= buyer_actions[column].astype(str).str.contains(
+                search_text,
+                case=False,
+                na=False,
+                regex=False,
+            )
+        buyer_actions = buyer_actions[search_mask]
+    if selected_agent_supplier != "All suppliers":
+        buyer_actions = buyer_actions[
+            buyer_actions["Supplier Name"].eq(selected_agent_supplier)
+        ]
+    if buyer_issue_types:
+        buyer_actions = buyer_actions[
+            buyer_actions["Issue Type"].isin(buyer_issue_types)
+        ]
+
+    severity_groups = [
+        (
+            "Critical",
+            buyer_actions[
+                buyer_actions["Active"].eq("Yes")
+                & buyer_actions["Severity"].eq("Critical")
+            ],
+        ),
+        (
+            "High",
+            buyer_actions[
+                buyer_actions["Active"].eq("Yes")
+                & buyer_actions["Severity"].eq("High")
+            ],
+        ),
+        (
+            "Medium",
+            buyer_actions[
+                buyer_actions["Active"].eq("Yes")
+                & buyer_actions["Severity"].eq("Medium")
+            ],
+        ),
+        (
+            "Verified resolved",
+            buyer_actions[
+                buyer_actions["Active"].eq("No")
+                & buyer_actions["Status"].eq("Auto-resolved")
+            ],
+        ),
+    ]
+    tab_labels = [
+        f"🔴 Critical ({len(severity_groups[0][1])})",
+        f"🟠 High ({len(severity_groups[1][1])})",
+        f"🟡 Medium ({len(severity_groups[2][1])})",
+        f"🟢 Verified resolved ({len(severity_groups[3][1])})",
+    ]
+    severity_tabs = st.tabs(tab_labels)
+    for tab, (group_name, group) in zip(
+        severity_tabs,
+        severity_groups,
+    ):
+        with tab:
+            if group.empty:
+                if group_name == "Verified resolved":
+                    st.info("No verified resolved issues match these filters.")
+                else:
+                    st.success(
+                        f"No {group_name.lower()} issues match these filters."
+                    )
+                continue
+
+            group = group.copy()
+            group["_age_numeric"] = pd.to_numeric(
+                group["Age (days)"],
+                errors="coerce",
+            ).fillna(0)
+            group = group.sort_values(
+                ["_age_numeric", "Escalation", "Part Number"],
+                ascending=[False, True, True],
+            ).drop(columns="_age_numeric").reset_index(drop=True)
+            group["Production Risk"] = group["Production Impact"].map(
+                lambda value: (
+                    "At risk"
+                    if clean_text(value).startswith("At risk")
+                    else "—"
+                )
+            )
+            visible_columns = [
+                "Issue Type",
+                "Gate Entry No",
+                "Supplier Name",
+                "Part Number",
+                "Part Name",
+                "Difference Qty",
+                "Production Risk",
+                "Age (days)",
+                "Escalation",
+                "Status",
+            ]
+            queue = group[visible_columns].copy()
+            queue["Difference Qty"] = pd.to_numeric(
+                queue["Difference Qty"],
+                errors="coerce",
+            ).fillna(0)
+            queue["Age (days)"] = pd.to_numeric(
+                queue["Age (days)"],
+                errors="coerce",
+            ).fillna(0).astype(int)
+            st.caption(
+                f"{selected_buyer} has {len(group):,} "
+                f"{group_name.lower()} issue(s). Click a row for evidence "
+                "and follow-up controls."
+            )
+            workspace_key = re.sub(
+                r"[^a-z0-9]+",
+                "_",
+                f"{selected_buyer}_{group_name}".lower(),
+            ).strip("_")
+            selection = st.dataframe(
+                queue,
+                width="stretch",
+                hide_index=True,
+                height=min(460, 38 + len(queue) * 35),
+                on_select="rerun",
+                selection_mode="single-row",
+                key=f"agent_workspace_{workspace_key}",
+                column_config={
+                    "Difference Qty": st.column_config.NumberColumn(
+                        format="%.2f"
+                    ),
+                    "Age (days)": st.column_config.NumberColumn(
+                        format="%d"
+                    ),
+                },
+            )
+            selected_rows = selection.selection.rows
+            if selected_rows:
+                render_agent_action_detail(
+                    group.iloc[selected_rows[0]],
+                    actions,
+                )
+
+    with st.expander("Agent rules and complete audit history"):
+        st.markdown(
+            """
+            - Buyers see all assigned issues separated into Critical, High,
+              Medium, and Verified Resolved lists.
+            - Click a row to review the invoice, receipt, source evidence,
+              production impact, and follow-up workflow.
+            - Buyers cannot manually close an issue. The agent sets
+              `Auto-resolved` only after the discrepancy disappears from the
+              refreshed source snapshot.
+            """
+        )
+        st.dataframe(actions, width="stretch", hide_index=True)
+        st.download_button(
+            "Download complete action audit CSV",
+            data=actions.to_csv(index=False).encode("utf-8"),
+            file_name="inwarding_agent_action_audit.csv",
+            mime="text/csv",
+            key="agent_workspace_audit_download",
+        )
+
+
+def render_setup() -> None:
+    st.header("Setup")
+    st.write(
+        "The app uses saved Google Sheet snapshots for inwarding and "
+        "read-only Google data for production consumption."
+    )
+    st.markdown(
+        """
+        For two people working together:
+
+        - Code changes should happen through GitHub branches.
+        - App usage can happen through one shared Streamlit URL.
+        - Use Supplier Buyer Map to create a saved SPOC Summary copy and build buyer-supplier ownership cards.
+        - Inwarding Parts keeps showing its previous Direct Gate Entry snapshot until you press Refresh.
+        - For private Google Sheets, copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml`, paste the service-account JSON values, and share the sheet with that service-account email.
+        - Configure `[google_oauth]` for the private inwarding, production, and BOM sheets.
+        """
+    )
 
 
 oauth_callback_settings = google_oauth_settings()
-if st.query_params.get("code"):
-    if oauth_callback_settings is None:
-        st.error("Google returned an authorization code, but OAuth settings are not configured.")
-        st.query_params.clear()
-        st.stop()
+if oauth_callback_settings is not None and st.query_params.get("code"):
     if complete_google_oauth(oauth_callback_settings):
         st.session_state["google_oauth_connected_notice"] = True
         st.rerun()
@@ -3249,6 +5038,55 @@ st.markdown(
         padding: 16px 18px;
         margin: 12px 0;
         background: #ffffff;
+    }
+    .agent-legend {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin: 10px 0 18px;
+    }
+    .agent-chip {
+        border-radius: 999px;
+        display: inline-block;
+        font-size: 0.76rem;
+        font-weight: 800;
+        line-height: 1;
+        padding: 7px 10px;
+    }
+    .agent-chip.critical {
+        background: #fee2e2;
+        color: #991b1b;
+    }
+    .agent-chip.high {
+        background: #ffedd5;
+        color: #9a3412;
+    }
+    .agent-chip.medium {
+        background: #fef9c3;
+        color: #854d0e;
+    }
+    .agent-chip.resolved {
+        background: #dcfce7;
+        color: #166534;
+    }
+    .agent-review-heading {
+        align-items: center;
+        background: #f8fafc;
+        border: 1px solid #dbe3ef;
+        border-radius: 10px;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        margin: 18px 0 12px;
+        padding: 12px 14px;
+    }
+    .agent-review-heading b {
+        color: #0f172a;
+    }
+    .agent-review-heading > span:last-child {
+        color: #64748b;
+        font-size: 0.82rem;
+        margin-left: auto;
     }
     .supplier-grid {
         display: grid;
@@ -3326,10 +5164,9 @@ with st.sidebar:
         [
             "Part Inventory",
             "Supplier Buyer Map",
-            "Live Google Sheet",
             "Inwarding Parts",
             "Outwarding Parts",
-            "Agentic Flow",
+            "Setup",
         ],
         label_visibility="collapsed",
     )
@@ -3341,11 +5178,9 @@ if page == "Part Inventory":
     render_part_inventory()
 elif page == "Supplier Buyer Map":
     render_supplier_buyer_map()
-elif page == "Live Google Sheet":
-    render_live_google_sheet()
 elif page == "Inwarding Parts":
     render_inwarding()
 elif page == "Outwarding Parts":
     render_outwarding()
-elif page == "Agentic Flow":
-    render_agentic_flow()
+else:
+    render_setup()

@@ -28,3 +28,7 @@ data/live/*.json
 data/live/*.tmp
 data/live/*.pid
 data/live/logs/
+data/inwarding_sheet_snapshot.csv
+data/inwarding_sheet_snapshot.json
+data/buyer_mapping_source.csv
+data/agent_actions.csv

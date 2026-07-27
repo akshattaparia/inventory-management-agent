@@ -183,6 +183,73 @@ OAuth tokens and downloaded source caches remain local and are ignored by Git.
 - **Inbound Coverage Agent**: checks whether inwarding visibility covers outwarding pressure.
 - **Supplier Ownership Agent**: turns risky supplier/part groups into buyer follow-up rows.
 
+
+## Merged Abhiraj inwarding workflow
+
+This branch combines the existing inventory visibility agents with Abhiraj's latest inwarding workflow. The app now keeps the Google OAuth/live-sheet approach, and also includes cached Direct Gate Entry inwarding snapshots, buyer mapping, discrepancy severity, escalation, acknowledgement, follow-up notes, and auto-resolution when refreshed source data confirms that an issue has disappeared.
+## Optional Superset GRN exporter
+
+The repository still includes an optional Superset/Trino GRN export script:
+
+```text
+data/live/grn_live.csv
+```
+
+It does not read the previous app and it does not fall back to sample data.
+
+To configure it on your machine:
+
+```bash
+cp config/grn_export.env.example config/grn_export.env
+```
+
+Then fill `config/grn_export.env` with the Superset/Trino access details. Keep this file private; it is ignored by Git.
+
+To refresh once from the terminal:
+
+```bash
+python scripts/scheduled_grn_export.py
+```
+
+The exporter writes:
+
+```text
+data/live/grn_live.csv
+data/live/grn_live.json
+```
+
+Those generated files are also ignored by Git. Each laptop/server should generate its own current live file from Superset.
+## Inwarding snapshot
+
+The **Inwarding Parts** page reads the private `DIRECT GATE ENTRY` worksheet
+through the same read-only Google OAuth connection. Press **Refresh inwarding
+from Google Sheet** to replace the local snapshot. Between refreshes, the page
+continues showing the previous successful snapshot, even if the live sheet
+changes or a later refresh fails.
+
+Each inwarding row is enriched with its SCM buyer from the configured buyer
+mapping sheet. Part number is matched first, followed by a normalized supplier
+name; unresolved source rows are shown as `Not mapped`.
+## Inwarding discrepancy agent
+
+The discrepancy-agent section under **Inwarding Parts** continuously checks the
+most recently saved inwarding snapshot whenever the page is opened. It flags
+quantity differences, missing
+buyer ownership, missing critical fields, overdue unloading, and possible
+duplicate rows. Issues are assigned to the mapped buyer; unowned issues go to
+`SCM Admin`.
+
+The buyer action inbox supports acknowledgement, investigation, follow-up
+notes, ageing, escalation, and a downloadable audit history. Buyers cannot
+manually mark a discrepancy resolved. When a previously flagged source issue
+disappears after refreshed data is checked, the agent marks it `Auto-resolved`;
+if it still exists, it remains open or is reopened. Quantity shortages are also
+compared with the latest calculated production/BOM demand.
+
+Each buyer has a dedicated workspace with separate **Critical**, **High**,
+**Medium**, and **Verified resolved** tabs. Buyers can see their complete list
+at once and click a row to review its evidence or update follow-up details.
+
 ## Let another person open your running app
 
 Run Streamlit on your network:
