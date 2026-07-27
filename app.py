@@ -2877,13 +2877,6 @@ def render_rm_planning_agent() -> None:
         .unique()
         .tolist()
     )
-    suppliers = sorted(
-        queue.get("Supplier", pd.Series(dtype=str))
-        .replace("", pd.NA)
-        .dropna()
-        .unique()
-        .tolist()
-    )
     filters = st.columns([1.5, 1, 1, 0.7])
     with filters[0]:
         search = st.text_input(
@@ -2897,11 +2890,29 @@ def render_rm_planning_agent() -> None:
             ["All buyers"] + buyers,
             key="rm_agent_buyer",
         )
+    supplier_source = queue
+    if selected_buyer != "All buyers":
+        supplier_source = supplier_source[
+            supplier_source["Buyer"].eq(selected_buyer)
+        ]
+    suppliers = sorted(
+        supplier_source.get("Supplier", pd.Series(dtype=str))
+        .replace("", pd.NA)
+        .dropna()
+        .unique()
+        .tolist()
+    )
+    buyer_supplier_key = re.sub(
+        r"[^a-z0-9]+",
+        "_",
+        selected_buyer.lower(),
+    ).strip("_")
     with filters[2]:
         selected_supplier = st.selectbox(
             "Supplier",
             ["All suppliers"] + suppliers,
-            key="rm_agent_supplier",
+            key=f"rm_agent_supplier_{buyer_supplier_key}",
+            help="Shows only suppliers assigned to the selected buyer.",
         )
     with filters[3]:
         page_size = st.selectbox(
@@ -3350,15 +3361,44 @@ def render_supplier_buyer_map() -> None:
 
     filter_cols = st.columns([1.2, 1.2, 1.2, 1.6])
     with filter_cols[0]:
-        selected_buyer = st.selectbox("Buyer view", ["All buyers"] + buyers, index=0)
+        selected_buyer = st.selectbox(
+            "Buyer view",
+            ["All buyers"] + buyers,
+            index=0,
+            key="supplier_map_buyer",
+        )
     with filter_cols[1]:
         selected_statuses = st.multiselect(
             "Status",
             sorted(parts["Status"].unique().tolist()),
             default=[],
+            key="supplier_map_status",
         )
+    supplier_filter_source = parts
+    if selected_buyer != "All buyers":
+        supplier_filter_source = supplier_filter_source[
+            supplier_filter_source["Buyer"].eq(selected_buyer)
+        ]
+    buyer_supplier_values = sorted(
+        supplier_filter_source["Supplier"]
+        .replace("", pd.NA)
+        .dropna()
+        .unique()
+        .tolist()
+    )
+    buyer_supplier_key = re.sub(
+        r"[^a-z0-9]+",
+        "_",
+        selected_buyer.lower(),
+    ).strip("_")
     with filter_cols[2]:
-        selected_suppliers = st.multiselect("Supplier", supplier_values, default=[])
+        selected_suppliers = st.multiselect(
+            "Supplier",
+            buyer_supplier_values,
+            default=[],
+            key=f"supplier_map_suppliers_{buyer_supplier_key}",
+            help="Shows only suppliers assigned to the selected buyer.",
+        )
     with filter_cols[3]:
         search = st.text_input("Search part or supplier", placeholder="part no., part name, supplier")
 
@@ -3886,21 +3926,6 @@ def render_inwarding() -> None:
             key="inwarding_snapshot_part",
         )
     with filter_columns[3]:
-        supplier_options = sorted(
-            value
-            for value in filtered.get(
-                "Supplier Name",
-                pd.Series(dtype=str),
-            ).astype(str).unique()
-            if value
-        )
-        selected_suppliers = st.multiselect(
-            "Supplier",
-            supplier_options,
-            placeholder="All suppliers",
-            key="inwarding_snapshot_suppliers",
-        )
-    with filter_columns[4]:
         buyer_options = sorted(
             value
             for value in filtered.get(
@@ -3914,6 +3939,33 @@ def render_inwarding() -> None:
             buyer_options,
             placeholder="All buyers",
             key="inwarding_snapshot_buyers",
+        )
+    supplier_filter_source = filtered
+    if selected_buyers:
+        supplier_filter_source = supplier_filter_source[
+            supplier_filter_source["Buyer Name"].isin(selected_buyers)
+        ]
+    supplier_options = sorted(
+        value
+        for value in supplier_filter_source.get(
+            "Supplier Name",
+            pd.Series(dtype=str),
+        ).astype(str).unique()
+        if value
+    )
+    selected_buyers_key = "_".join(
+        sorted(
+            re.sub(r"[^a-z0-9]+", "_", buyer.lower()).strip("_")
+            for buyer in selected_buyers
+        )
+    ) or "all_buyers"
+    with filter_columns[4]:
+        selected_suppliers = st.multiselect(
+            "Supplier",
+            supplier_options,
+            placeholder="All suppliers",
+            key=f"inwarding_snapshot_suppliers_{selected_buyers_key}",
+            help="Shows only suppliers assigned to the selected buyer selection.",
         )
     with filter_columns[5]:
         status_options = sorted(
