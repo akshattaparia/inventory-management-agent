@@ -2154,7 +2154,7 @@ def render_inwarding() -> None:
         format="mixed",
     )
     valid_dates = parsed_dates.dropna()
-    filter_columns = st.columns([1.6, 1.7, 1.8, 1.5, 1.4])
+    filter_columns = st.columns([1.5, 1.2, 1.5, 1.7, 1.4, 1.3])
     with filter_columns[0]:
         if valid_dates.empty:
             selected_dates = ()
@@ -2170,12 +2170,19 @@ def render_inwarding() -> None:
                 key="inwarding_snapshot_dates",
             )
     with filter_columns[1]:
+        gate_search = st.text_input(
+            "Gate entry number",
+            placeholder="Search gate entry",
+            key="inwarding_snapshot_gate_entry",
+            help="Enter a full or partial gate entry number to fact-check a flagged issue.",
+        )
+    with filter_columns[2]:
         part_search = st.text_input(
             "Part number",
             placeholder="Search part number",
             key="inwarding_snapshot_part",
         )
-    with filter_columns[2]:
+    with filter_columns[3]:
         supplier_options = sorted(
             value
             for value in filtered.get(
@@ -2190,7 +2197,7 @@ def render_inwarding() -> None:
             placeholder="All suppliers",
             key="inwarding_snapshot_suppliers",
         )
-    with filter_columns[3]:
+    with filter_columns[4]:
         buyer_options = sorted(
             value
             for value in filtered.get(
@@ -2205,7 +2212,7 @@ def render_inwarding() -> None:
             placeholder="All buyers",
             key="inwarding_snapshot_buyers",
         )
-    with filter_columns[4]:
+    with filter_columns[5]:
         status_options = sorted(
             value
             for value in filtered.get(
@@ -2231,6 +2238,15 @@ def render_inwarding() -> None:
         filtered = filtered[
             filtered["Part Number"].astype(str).str.contains(
                 part_search.strip(),
+                case=False,
+                na=False,
+                regex=False,
+            )
+        ]
+    if gate_search.strip() and "Gate Entry No" in filtered.columns:
+        filtered = filtered[
+            filtered["Gate Entry No"].astype(str).str.contains(
+                gate_search.strip(),
                 case=False,
                 na=False,
                 regex=False,
@@ -3732,6 +3748,7 @@ def render_agentic_flow() -> None:
             )
             visible_columns = [
                 "Issue Type",
+                "Gate Entry No",
                 "Supplier Name",
                 "Part Number",
                 "Part Name",
