@@ -3642,15 +3642,36 @@ def render_agentic_flow() -> None:
             border=True,
         )
 
-    filter_columns = st.columns([1.4, 1])
+    filter_columns = st.columns([1.35, 1, 1])
     with filter_columns[0]:
         buyer_search = st.text_input(
             "Search this buyer's issues",
-            placeholder="Part number, supplier, part name, or gate entry",
+            placeholder="Part number, part name, or gate entry",
             key="agent_buyer_issue_search",
             help="Search only inside the selected buyer's workspace.",
         )
     with filter_columns[1]:
+        supplier_options = sorted(
+            supplier
+            for supplier in buyer_actions[
+                "Supplier Name"
+            ].dropna().unique()
+            if clean_text(supplier)
+        )
+        selected_agent_supplier = st.selectbox(
+            "Supplier",
+            ["All suppliers", *supplier_options],
+            key=(
+                "agent_buyer_supplier_"
+                + re.sub(
+                    r"[^a-z0-9]+",
+                    "_",
+                    str(selected_buyer).lower(),
+                ).strip("_")
+            ),
+            help="Choose one supplier within the selected buyer's workspace.",
+        )
+    with filter_columns[2]:
         buyer_issue_types = st.multiselect(
             "Problem type",
             sorted(buyer_actions["Issue Type"].dropna().unique()),
@@ -3664,7 +3685,6 @@ def render_agentic_flow() -> None:
         for column in [
             "Part Number",
             "Part Name",
-            "Supplier Name",
             "Gate Entry No",
         ]:
             search_mask |= buyer_actions[column].astype(str).str.contains(
@@ -3674,6 +3694,10 @@ def render_agentic_flow() -> None:
                 regex=False,
             )
         buyer_actions = buyer_actions[search_mask]
+    if selected_agent_supplier != "All suppliers":
+        buyer_actions = buyer_actions[
+            buyer_actions["Supplier Name"].eq(selected_agent_supplier)
+        ]
     if buyer_issue_types:
         buyer_actions = buyer_actions[
             buyer_actions["Issue Type"].isin(buyer_issue_types)
