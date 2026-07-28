@@ -20,6 +20,10 @@ data/exploded_bom.csv
 data/raw_bom.csv
 data/part_type_mapping.csv
 data/part_supplier_mapping.csv
+data/servicing_daily_usage.csv
+data/servicing_daily_usage.json
+data/sr_311_posting_movements.csv
+data/sr_311_posting_movements.json
 data/computed_part_usage.csv
 data/outwarding_plan_baseline.csv
 data/outwarding_alert_log.csv
@@ -28,6 +32,7 @@ data/inwarding_sheet_snapshot.json
 data/buyer_mapping_source.csv
 data/agent_actions.csv
 data/rm_followups.csv
+data/rm_movement_plan.csv
 data/part_inventory.csv
 data/*.tmp
 config/grn_export.env
