@@ -155,6 +155,9 @@ RM_MOVEMENT_COLUMNS = [
     "System Stock",
     "Store Stock",
     "In Transit Qty",
+    "Stock Difference Transit Qty",
+    "VIN Gap Transit Qty",
+    "Transit Source",
     "In Transit Override",
     "GA Line Need",
     "SA Line Need",
@@ -9006,20 +9009,154 @@ def allocate_capped_quantities(
     return allocation.astype(int)
 
 
+def backlog_series(values: pd.Series) -> pd.Series:
+    backlog = 0.0
+    records: list[float] = []
+    for value in pd.to_numeric(values, errors="coerce").fillna(0):
+        backlog = max(backlog + float(value), 0.0)
+        records.append(backlog)
+    return pd.Series(records, index=values.index, dtype=float)
+
+
+def build_vin_gap_transit_signal(
+    sources: dict[str, pd.DataFrame],
+    plan_date: pd.Timestamp,
+) -> pd.DataFrame:
+    columns = [
+        "Part No.",
+        "VIN Gap Transit Qty",
+        "Daily VIN Gap Part Qty",
+        "Cumulative VIN Gap Vehicles",
+        "VIN Gap Source",
+    ]
+    if not sources:
+        return pd.DataFrame(columns=columns)
+
+    sku_map = parse_sku_map(sources.get("sku_map", pd.DataFrame()))
+    plan_actual, _ = parse_vin_detail_plan_actual(
+        sources.get("vin_details", pd.DataFrame()),
+        sku_map,
+    )
+    exploded_bom = sources.get("exploded_bom", pd.DataFrame())
+    required_bom = {"FG", "Component", "Qty per FG (exploded)"}
+    if plan_actual.empty or not required_bom.issubset(exploded_bom.columns):
+        return pd.DataFrame(columns=columns)
+
+    cutoff_date = pd.Timestamp(plan_date).normalize()
+    gap = plan_actual.copy()
+    gap["Plan Date"] = pd.to_datetime(gap["Plan Date"], errors="coerce").dt.normalize()
+    gap = gap[gap["Plan Date"].notna() & gap["Plan Date"].le(cutoff_date)].copy()
+    if gap.empty:
+        return pd.DataFrame(columns=columns)
+
+    gap["FG"] = gap["FG"].astype(str).str.strip()
+    gap["Detailed Plan Qty"] = numeric(gap["Detailed Plan Qty"])
+    gap["Produced Qty"] = numeric(gap["Produced Qty"])
+    gap = (
+        gap.groupby(["Plan Date", "FG"], as_index=False)[
+            ["Detailed Plan Qty", "Produced Qty"]
+        ]
+        .sum()
+        .sort_values(["FG", "Plan Date"])
+    )
+    gap["Daily VIN Delta"] = gap["Detailed Plan Qty"] - gap["Produced Qty"]
+    gap["Daily VIN Gap Qty"] = gap["Daily VIN Delta"].clip(lower=0)
+    gap["Cumulative VIN Gap Vehicles"] = (
+        gap.groupby("FG", group_keys=False)["Daily VIN Delta"]
+        .apply(backlog_series)
+        .clip(lower=0)
+    )
+    latest_gap = gap.drop_duplicates("FG", keep="last")
+    latest_gap = latest_gap[
+        latest_gap["Cumulative VIN Gap Vehicles"].gt(0)
+        | latest_gap["Daily VIN Gap Qty"].gt(0)
+    ].copy()
+    if latest_gap.empty:
+        return pd.DataFrame(columns=columns)
+
+    bom = exploded_bom[["FG", "Component", "Qty per FG (exploded)"]].copy()
+    bom["FG"] = bom["FG"].astype(str).str.strip()
+    bom["Component"] = bom["Component"].astype(str).str.strip()
+    bom["Qty per FG"] = pd.to_numeric(
+        bom["Qty per FG (exploded)"].astype(str).str.replace(",", "", regex=False),
+        errors="coerce",
+    )
+    bom = bom[
+        bom["FG"].ne("")
+        & bom["Component"].ne("")
+        & bom["Qty per FG"].notna()
+    ].drop_duplicates(["FG", "Component"])
+    exploded_gap = latest_gap.merge(bom[["FG", "Component", "Qty per FG"]], on="FG")
+    if exploded_gap.empty:
+        return pd.DataFrame(columns=columns)
+
+    exploded_gap["VIN Gap Transit Qty"] = (
+        exploded_gap["Cumulative VIN Gap Vehicles"] * exploded_gap["Qty per FG"]
+    )
+    exploded_gap["Daily VIN Gap Part Qty"] = (
+        exploded_gap["Daily VIN Gap Qty"] * exploded_gap["Qty per FG"]
+    )
+    result = (
+        exploded_gap.groupby("Component", as_index=False)
+        .agg(
+            {
+                "VIN Gap Transit Qty": "sum",
+                "Daily VIN Gap Part Qty": "sum",
+                "Cumulative VIN Gap Vehicles": "sum",
+            }
+        )
+        .rename(columns={"Component": "Part No."})
+    )
+    result["VIN Gap Source"] = (
+        "cumulative planned/possible VIN gap x exploded BOM"
+    )
+    return result[columns]
+
+
 def build_rm_movement_input(
     inventory: pd.DataFrame,
     today_view: pd.DataFrame,
     meta: dict[str, object],
+    sources: dict[str, pd.DataFrame] | None = None,
 ) -> pd.DataFrame:
     if inventory.empty:
         return pd.DataFrame(columns=RM_MOVEMENT_COLUMNS)
 
-    plan_date = pd.Timestamp(meta.get("plan_date", pd.Timestamp.now())).strftime("%Y-%m-%d")
+    plan_ts = pd.Timestamp(meta.get("plan_date", pd.Timestamp.now())).normalize()
+    plan_date = plan_ts.strftime("%Y-%m-%d")
     base = inventory.copy()
     base["Part Key"] = base["Part No."].map(stock_part_key)
     base["System Stock"] = numeric(base.get("System Stock", pd.Series(index=base.index)))
     base["Store Stock"] = numeric(base.get("Physical Stock", pd.Series(index=base.index)))
-    base["In Transit Qty"] = (base["System Stock"] - base["Store Stock"]).clip(lower=0)
+    base["Stock Difference Transit Qty"] = (
+        base["System Stock"] - base["Store Stock"]
+    ).clip(lower=0)
+    base["VIN Gap Transit Qty"] = 0.0
+    base["Transit Source"] = "stock difference"
+    vin_gap_signal = build_vin_gap_transit_signal(sources or {}, plan_ts)
+    if not vin_gap_signal.empty:
+        vin_gap_signal = vin_gap_signal.copy()
+        vin_gap_signal["Part Key"] = vin_gap_signal["Part No."].map(stock_part_key)
+        vin_gap_signal = vin_gap_signal.drop_duplicates("Part Key").set_index("Part Key")
+        base["VIN Gap Transit Qty"] = (
+            base["Part Key"].map(vin_gap_signal["VIN Gap Transit Qty"]).fillna(0)
+        )
+    base["In Transit Qty"] = pd.concat(
+        [
+            base["Stock Difference Transit Qty"],
+            base["VIN Gap Transit Qty"],
+        ],
+        axis=1,
+    ).max(axis=1)
+    base["Transit Source"] = "stock difference"
+    base.loc[
+        base["VIN Gap Transit Qty"].gt(base["Stock Difference Transit Qty"]),
+        "Transit Source",
+    ] = "VIN gap backlog"
+    base.loc[
+        base["In Transit Qty"].le(0),
+        "Transit Source",
+    ] = "not visible"
 
     shortage = today_view.copy()
     if not shortage.empty:
@@ -9042,6 +9179,9 @@ def build_rm_movement_input(
             "System Stock",
             "Store Stock",
             "In Transit Qty",
+            "Stock Difference Transit Qty",
+            "VIN Gap Transit Qty",
+            "Transit Source",
             "GA Line Need",
             "Required By",
             "Severity",
@@ -9091,6 +9231,8 @@ def build_rm_movement_input(
         "System Stock",
         "Store Stock",
         "In Transit Qty",
+        "Stock Difference Transit Qty",
+        "VIN Gap Transit Qty",
         "GA Line Need",
         "SA Line Need",
         "Shop Need",
@@ -9127,6 +9269,9 @@ def build_rm_movement_allocations(movement_input: pd.DataFrame) -> pd.DataFrame:
         "System Stock",
         "Store Stock",
         "In Transit Qty",
+        "Stock Difference Transit Qty",
+        "VIN Gap Transit Qty",
+        "Transit Source",
         "Demand Total",
         "GA Need",
         "SA Need",
@@ -9158,12 +9303,31 @@ def build_rm_movement_allocations(movement_input: pd.DataFrame) -> pd.DataFrame:
     for _, row in movement_input.iterrows():
         system_stock = scalar_float(row.get("System Stock", 0))
         store_stock = scalar_float(row.get("Store Stock", 0))
-        default_in_transit = max(system_stock - store_stock, 0)
+        stock_difference_transit = scalar_float(
+            row.get(
+                "Stock Difference Transit Qty",
+                max(system_stock - store_stock, 0),
+            )
+        )
+        vin_gap_transit = scalar_float(row.get("VIN Gap Transit Qty", 0))
+        prepared_in_transit = scalar_float(
+            row.get(
+                "In Transit Qty",
+                max(stock_difference_transit, vin_gap_transit),
+            )
+        )
         override = pd.to_numeric(
             pd.Series([row.get("In Transit Override", "")]),
             errors="coerce",
         ).iloc[0]
-        in_transit = float(override) if pd.notna(override) and float(override) >= 0 else default_in_transit
+        in_transit = (
+            float(override)
+            if pd.notna(override) and float(override) >= 0
+            else prepared_in_transit
+        )
+        transit_source = clean_text(row.get("Transit Source", ""))
+        if pd.notna(override) and float(override) >= 0:
+            transit_source = "manual override"
 
         demands = pd.Series(
             {
@@ -9276,6 +9440,9 @@ def build_rm_movement_allocations(movement_input: pd.DataFrame) -> pd.DataFrame:
                 "System Stock": system_stock,
                 "Store Stock": store_stock,
                 "In Transit Qty": in_transit,
+                "Stock Difference Transit Qty": stock_difference_transit,
+                "VIN Gap Transit Qty": vin_gap_transit,
+                "Transit Source": transit_source,
                 "Demand Total": demand_total,
                 "GA Need": float(demands.get("GA", 0)),
                 "SA Need": float(demands.get("SA", 0)),
@@ -10134,6 +10301,7 @@ def render_rm_material_movement_agent(
     inventory: pd.DataFrame,
     views: dict[str, pd.DataFrame],
     meta: dict[str, object],
+    sources: dict[str, pd.DataFrame],
 ) -> None:
     st.subheader("RM Movement Control Flow")
     st.write(
@@ -10154,7 +10322,7 @@ def render_rm_material_movement_agent(
     )
 
     today_view = views.get("Today", pd.DataFrame())
-    movement_input = build_rm_movement_input(inventory, today_view, meta)
+    movement_input = build_rm_movement_input(inventory, today_view, meta, sources)
     if movement_input.empty:
         st.info(
             "No movement candidates were found. A part appears here when it has "
@@ -10176,7 +10344,28 @@ def render_rm_material_movement_agent(
         )
         st.caption(
             "Check equation: Allocated Transit + Unallocated Transit = In Transit Qty. "
-            "Unallocated transit is treated as surplus or stock that needs tracing."
+            "In Transit Qty now uses the higher of stock-difference transit and "
+            "VIN-gap backlog unless you enter a manual override."
+        )
+    with st.expander("VIN-gap backlog logic", expanded=False):
+        st.markdown(
+            """
+            This converts missed output into a part-level WIP/transit signal.
+
+            ```text
+            Daily VIN Delta = Planned or possible VINs - Actual VINs
+            Cumulative VIN Backlog = max(previous backlog + Daily VIN Delta, 0)
+            VIN Gap Transit Qty by part = Cumulative VIN Backlog x BOM qty per FG
+            In Transit Qty = max(System-minus-store signal, VIN Gap Transit Qty)
+            ```
+
+            So if 10 VINs could have been produced and only 8 were produced,
+            the backlog is 2 VINs. If the next day 20 could have been produced
+            and only 16 were produced, the backlog becomes 6 VINs. If a later
+            day over-produces versus plan, the backlog reduces. The optimizer
+            then tries to allocate this suspected WIP/transit so the backlog
+            does not keep bottling up.
+            """
         )
 
     editable = movement_input.head(int(max_rows)).copy()
@@ -10185,14 +10374,32 @@ def render_rm_material_movement_agent(
         use_container_width=True,
         hide_index=True,
         num_rows="dynamic",
-        disabled=["System Stock", "Store Stock", "In Transit Qty"],
+        disabled=[
+            "System Stock",
+            "Store Stock",
+            "In Transit Qty",
+            "Stock Difference Transit Qty",
+            "VIN Gap Transit Qty",
+            "Transit Source",
+        ],
         column_config={
             "System Stock": st.column_config.NumberColumn(format="%.0f"),
             "Store Stock": st.column_config.NumberColumn(format="%.0f"),
             "In Transit Qty": st.column_config.NumberColumn(format="%.0f"),
+            "Stock Difference Transit Qty": st.column_config.NumberColumn(
+                format="%.0f",
+                help="System Stock minus Store/Physical Stock, floored at zero.",
+            ),
+            "VIN Gap Transit Qty": st.column_config.NumberColumn(
+                format="%.0f",
+                help="Cumulative planned/possible VIN gap exploded through BOM.",
+            ),
             "In Transit Override": st.column_config.NumberColumn(
                 format="%.0f",
-                help="Optional: override System Stock - Store Stock for this planning run.",
+                help=(
+                    "Optional: override the prepared transit quantity for this "
+                    "planning run."
+                ),
             ),
             "GA Line Need": st.column_config.NumberColumn(format="%.0f"),
             "SA Line Need": st.column_config.NumberColumn(format="%.0f"),
@@ -10222,13 +10429,14 @@ def render_rm_material_movement_agent(
 
     st.markdown("#### 2. Escalation cockpit")
     total_in_transit = numeric(allocations["In Transit Qty"]).sum()
+    total_vin_gap_transit = numeric(allocations["VIN Gap Transit Qty"]).sum()
     total_allocated = numeric(allocations["Allocated Transit"]).sum()
     total_uncovered = numeric(allocations["Uncovered Demand"]).sum()
     critical_count = int(allocations["Severity"].eq("Critical").sum())
     high_count = int(allocations["Severity"].eq("High").sum())
     watch_count = int(allocations["Severity"].eq("Watch").sum())
     ready_count = int(allocations["Severity"].eq("OK").sum())
-    metrics = st.columns(5)
+    metrics = st.columns(7)
     with metrics[0]:
         render_metric("Critical line risk", f"{critical_count:,}", "bad" if critical_count else "ok")
     with metrics[1]:
@@ -10236,8 +10444,12 @@ def render_rm_material_movement_agent(
     with metrics[2]:
         render_metric("Trace / watch", f"{watch_count:,}", "warn" if watch_count else "ok")
     with metrics[3]:
-        render_metric("Transit allocated", display_qty(total_allocated), "ok")
+        render_metric("Visible transit", display_qty(total_in_transit), "neutral")
     with metrics[4]:
+        render_metric("VIN-gap transit", display_qty(total_vin_gap_transit), "warn" if total_vin_gap_transit else "ok")
+    with metrics[5]:
+        render_metric("Transit allocated", display_qty(total_allocated), "ok")
+    with metrics[6]:
         render_metric("Uncovered demand", display_qty(total_uncovered), "bad" if total_uncovered else "ok")
 
     route_columns = [
@@ -10358,6 +10570,8 @@ def render_rm_material_movement_agent(
         "Supplier",
         "Buyer",
         "In Transit Qty",
+        "VIN Gap Transit Qty",
+        "Transit Source",
         "Demand Total",
         "Allocated Transit",
         "Uncovered Demand",
@@ -10381,6 +10595,7 @@ def render_rm_material_movement_agent(
         selection_mode="single-row",
         column_config={
             "In Transit Qty": st.column_config.NumberColumn(format="%.0f"),
+            "VIN Gap Transit Qty": st.column_config.NumberColumn(format="%.0f"),
             "Demand Total": st.column_config.NumberColumn(format="%.0f"),
             "Allocated Transit": st.column_config.NumberColumn(format="%.0f"),
             "Uncovered Demand": st.column_config.NumberColumn(format="%.0f"),
@@ -10421,7 +10636,7 @@ def render_rm_material_movement_agent(
     st.markdown(
         f"### {escape(clean_text(selected['Part No.']))} · {escape(title)}"
     )
-    evidence = st.columns(5)
+    evidence = st.columns(6)
     with evidence[0]:
         render_metric("System stock", display_qty(selected["System Stock"]), "neutral")
     with evidence[1]:
@@ -10429,8 +10644,10 @@ def render_rm_material_movement_agent(
     with evidence[2]:
         render_metric("In transit", display_qty(selected["In Transit Qty"]), "neutral")
     with evidence[3]:
-        render_metric("Allocated", display_qty(selected["Allocated Transit"]), "ok")
+        render_metric("VIN-gap transit", display_qty(selected["VIN Gap Transit Qty"]), "warn" if scalar_float(selected["VIN Gap Transit Qty"]) else "ok")
     with evidence[4]:
+        render_metric("Allocated", display_qty(selected["Allocated Transit"]), "ok")
+    with evidence[5]:
         render_metric(
             "Uncovered",
             display_qty(selected["Uncovered Demand"]),
@@ -10496,6 +10713,7 @@ def render_rm_material_movement_agent(
         st.markdown(
             f"**Buyer:** {escape(clean_text(selected['Buyer']) or 'Unmapped')}  \n"
             f"**Supplier:** {escape(clean_text(selected['Supplier']) or 'Unmapped')}  \n"
+            f"**Transit source:** {escape(clean_text(selected['Transit Source']) or 'Unavailable')}  \n"
             f"**Decision:** {escape(clean_text(selected['Decision']))}  \n"
             f"**Owner action:** {escape(clean_text(selected['Owner Action']))}"
         )
@@ -10593,7 +10811,7 @@ def render_rm_planning_agent(show_refresh: bool = True) -> None:
         return
 
     if workspace == "Movement control flow":
-        render_rm_material_movement_agent(inventory, views, meta)
+        render_rm_material_movement_agent(inventory, views, meta, sources)
         return
 
     today_view = views["Today"]
@@ -12857,6 +13075,35 @@ def render_partwise_production_demand(combined: pd.DataFrame) -> None:
 
 
 def render_sr_311_movement_evidence() -> None:
+    credentials = load_google_credentials()
+    refresh_cols = st.columns([1.2, 4])
+    with refresh_cols[0]:
+        refresh_clicked = st.button(
+            "Refresh 311 SR postings",
+            type="primary",
+            disabled=credentials is None,
+            key="refresh_311_sr_postings",
+        )
+    with refresh_cols[1]:
+        st.caption(
+            "Pulls the live SR Posting Google Sheet and rebuilds confirmed/pending "
+            "SAP 311 movement evidence."
+        )
+        if credentials is None:
+            st.caption("Connect Google in Setup first to enable this refresh.")
+
+    if refresh_clicked and credentials is not None:
+        try:
+            with st.spinner("Refreshing 311 SR postings from Google Sheets..."):
+                movement_df, movement_meta = refresh_sr_311_posting_google_sheet(credentials)
+            st.success(
+                f"311 SR postings refreshed: {len(movement_df):,} row(s) from "
+                f"{clean_text(movement_meta.get('sheet_tab', 'SR Posting'))}."
+            )
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Could not refresh 311 SR postings: {exc}")
+
     movement = load_source_cache(SR_POSTING_SNAPSHOT_PATH)
     if movement.empty:
         st.info(
@@ -14556,6 +14803,191 @@ def render_setup() -> None:
     )
 
 
+def render_rm_material_movement_map_docs() -> None:
+    st.subheader(
+        "RM material movement map",
+        help=(
+            "Shows where HS01 and HS02 sit in the raw-material movement flow, "
+            "and which movements feed the optimizer."
+        ),
+    )
+    st.graphviz_chart(
+        """
+        digraph RM_Movement {
+            graph [rankdir=LR, bgcolor="transparent", pad="0.25", nodesep="0.55", ranksep="0.75"];
+            node [shape=box, style="rounded,filled", color="#CBD5E1", fillcolor="#F8FAFC", fontname="Arial", fontsize=12];
+            edge [color="#334155", fontname="Arial", fontsize=10, arrowsize=0.8];
+
+            HS02 [label="HS02\\nServicing / CPD stock", fillcolor="#EFF6FF", color="#93C5FD"];
+            HS02Demand [label="CPD servicing demand\\npart-wise PNA / issue need", fillcolor="#F5F3FF", color="#C4B5FD"];
+
+            subgraph cluster_hs01 {
+                label="HS01 - Production plant";
+                color="#BAE6FD";
+                penwidth=1.5;
+                style="rounded,dashed";
+                fontname="Arial";
+                fontsize=13;
+
+                Store [label="HS01 Store\\nphysical production stock"];
+                Shop [label="HS01 Shop\\nweld / battery / paint"];
+                SA [label="HS01 SA line\\nsub-assembly"];
+                GA [label="HS01 GA line\\nfinal assembly"];
+                Vehicle [label="Production order / vehicle\\nactual consumption", fillcolor="#ECFDF5", color="#86EFAC"];
+                Exception [label="HS01 exception bucket\\nretracted / rework / hold", fillcolor="#FEF2F2", color="#FCA5A5"];
+            }
+
+            HS02Demand -> HS02 [label="servicing pull\\nopen demand", color="#7C3AED"];
+            HS02 -> Store [label="HS02 to HS01 transfer\\nplant/location movement", color="#2563EB", penwidth=1.4];
+
+            Store -> GA [label="a: Store to GA\\n311"];
+            Store -> SA [label="b: Store to SA\\n311"];
+            Store -> Shop [label="c: Store to Shop\\n311"];
+            Shop -> SA [label="d: Shop to SA\\n311"];
+            Shop -> GA [label="e: Shop to GA\\n311"];
+            SA -> GA [label="f: SA to GA\\n311"];
+
+            GA -> Vehicle [label="consume part\\n261"];
+            Vehicle -> GA [label="reverse issue\\n262", style=dashed, color="#64748B"];
+            Store -> Exception [label="retract / hold\\n312 or reversal", style=dashed, color="#DC2626"];
+            Shop -> Exception [label="rework / hold", style=dashed, color="#DC2626"];
+            SA -> Exception [label="rework / hold", style=dashed, color="#DC2626"];
+            Exception -> Store [label="recovered usable qty\\nRework to HS01", style=dashed, color="#16A34A"];
+        }
+        """,
+        use_container_width=True,
+    )
+    st.caption(
+        "HS01 is the production plant containing Store, Shop, SA, GA, production "
+        "consumption, and rework/hold. HS02 is the servicing/CPD stock pool that "
+        "can transfer material into HS01 Store. The six solid HS01 arrows remain "
+        "the RM optimizer lanes and all use SAP movement type 311; dashed arrows "
+        "are exception/recovery events."
+    )
+    st.dataframe(
+        pd.DataFrame(
+            [
+                (
+                    "HS02 transfer",
+                    "HS02 CPD / servicing stock",
+                    "HS01 Store",
+                    "311 / plant-location transfer",
+                    "Confirmed by posting number or closed SR status.",
+                ),
+                (
+                    "a",
+                    "HS01 Store",
+                    "HS01 GA line",
+                    "311",
+                    "One-step internal transfer.",
+                ),
+                (
+                    "b",
+                    "HS01 Store",
+                    "HS01 SA line",
+                    "311",
+                    "One-step internal transfer.",
+                ),
+                (
+                    "c",
+                    "HS01 Store",
+                    "HS01 Shop",
+                    "311",
+                    "One-step internal transfer.",
+                ),
+                (
+                    "d",
+                    "HS01 Shop",
+                    "HS01 SA line",
+                    "311",
+                    "One-step internal transfer.",
+                ),
+                (
+                    "e",
+                    "HS01 Shop",
+                    "HS01 GA line",
+                    "311",
+                    "One-step internal transfer.",
+                ),
+                (
+                    "f",
+                    "HS01 SA line",
+                    "HS01 GA line",
+                    "311",
+                    "One-step internal transfer.",
+                ),
+                (
+                    "Consumption",
+                    "HS01 line",
+                    "Production order",
+                    "261",
+                    "Final consumption against vehicle or production order.",
+                ),
+                (
+                    "Retraction",
+                    "HS01 destination/source",
+                    "HS01 exception bucket",
+                    "312 or reversal",
+                    "Material is held until recovered, reversed, or closed.",
+                ),
+                (
+                    "Rework recovery",
+                    "HS01 rework / hold",
+                    "HS01 Store",
+                    "Rework to HS01 movement",
+                    "Recovered usable quantity becomes production stock again.",
+                ),
+                (
+                    "Production reversal",
+                    "Production order",
+                    "HS01 line/storage",
+                    "262",
+                    "Use only when 261 consumption was reversed.",
+                ),
+            ],
+            columns=[
+                "Lane / event",
+                "From",
+                "To",
+                "Likely SAP movement type",
+                "Calculation use / evidence",
+            ],
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.info(
+        "Important: all six internal movement lanes use 311, so the movement "
+        "type confirms an internal transfer but does not identify the lane by "
+        "itself. The Store/Shop/SA/GA route must come from source-destination "
+        "locations or from SR/remarks mapping when the live posting sheet does "
+        "not carry explicit locations."
+    )
+    st.markdown(
+        """
+        **VIN-delta bottleneck rule**
+
+        This is the RM Planning Agent's WIP/transit signal until scan data is
+        complete. It converts missed VIN output into part-level suspected
+        material holding.
+
+        ```text
+        Daily VIN Delta = Planned or possible VINs - Actual VINs
+        Cumulative VIN Backlog = max(previous backlog + Daily VIN Delta, 0)
+        VIN Gap Transit Qty by part = Cumulative VIN Backlog x BOM qty per FG
+        Effective In Transit Qty = max(System-minus-store signal, VIN Gap Transit Qty)
+        ```
+
+        If 10 VINs could be made and only 8 are made, the backlog is 2 VINs.
+        If the next day 20 could be made and only 16 are made, the backlog
+        becomes 6 VINs. If a later day produces more than the possible/planned
+        quantity, the backlog reduces. The optimizer should therefore choose
+        movements that reduce this backlog instead of letting material remain
+        bottled up in transit, WIP, rework, or line-side holding.
+        """
+    )
+
+
 def render_documentation() -> None:
     st.header(
         "Documentation",
@@ -14790,6 +15222,8 @@ def render_documentation() -> None:
           or scan evidence is visible.
         """
     )
+
+    render_rm_material_movement_map_docs()
 
     st.subheader("5. Inwarding and discrepancy agent")
     st.markdown(
@@ -15408,6 +15842,27 @@ def perform_master_refresh(
         refreshed_sources = {}
         failed.append(f"Production/BOM/SCM sources — {exc}")
 
+    servicing_for_usage = pd.DataFrame(columns=TABLES["outwarding_parts"]["columns"])
+    try:
+        servicing_for_usage, servicing_meta = refresh_servicing_google_sheet(credentials)
+        completed.append(
+            "CPD/PNA servicing tracker "
+            f"({len(servicing_for_usage):,} rows; latest tab "
+            f"{clean_text(servicing_meta.get('latest_tab', '')) or 'not found'})"
+        )
+    except Exception as exc:
+        failed.append(f"CPD/PNA servicing tracker — {exc}")
+
+    try:
+        sr_posting, sr_meta = refresh_sr_311_posting_google_sheet(credentials)
+        completed.append(
+            "311 SR Posting tracker "
+            f"({len(sr_posting):,} rows from "
+            f"{clean_text(sr_meta.get('sheet_tab', 'SR Posting'))})"
+        )
+    except Exception as exc:
+        failed.append(f"311 SR Posting tracker — {exc}")
+
     if refreshed_sources:
         try:
             production, _ = build_daily_production(
@@ -15423,9 +15878,7 @@ def perform_master_refresh(
             )
             computed_usage = combine_manual_outwarding(
                 production_usage,
-                pd.DataFrame(
-                    columns=TABLES["outwarding_parts"]["columns"]
-                ),
+                servicing_for_usage,
             )
             cache_copy = computed_usage.copy()
             if not cache_copy.empty:
