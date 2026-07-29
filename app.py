@@ -22,6 +22,7 @@ from google_auth_oauthlib.flow import Flow
 APP_TITLE = "Inventory Management Agent"
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
+AUTO_REFRESH_INTERVAL_SECONDS = 15 * 60
 LIVE_GRN_CSV = DATA_DIR / "live" / "grn_live.csv"
 LIVE_GRN_META = LIVE_GRN_CSV.with_suffix(".json")
 LIVE_GOOGLE_SHEET_SNAPSHOT_CSV = DATA_DIR / "live" / "google_sheet_snapshot.csv"
@@ -108,6 +109,8 @@ BUYER_MAPPING_CACHE_PATH = DATA_DIR / "buyer_mapping_source.csv"
 AGENT_ACTIONS_PATH = DATA_DIR / "agent_actions.csv"
 RM_FOLLOWUPS_PATH = DATA_DIR / "rm_followups.csv"
 PVIN_INPUTS_PATH = DATA_DIR / "pvin_variant_inputs.csv"
+HEADER_PARTS_SUPPLEMENT_PATH = DATA_DIR / "header_parts_supplement.csv"
+VARIANT_OPERATING_OVERRIDES_PATH = DATA_DIR / "variant_operating_overrides.csv"
 INVENTORY_CONTROL_CASES_PATH = DATA_DIR / "inventory_control_cases.csv"
 INVENTORY_CORRECTIONS_PATH = DATA_DIR / "inventory_correction_requests.csv"
 PVIN_INPUT_COLUMNS = [
@@ -115,6 +118,16 @@ PVIN_INPUT_COLUMNS = [
     "Variant",
     "Generated P-VIN",
     "Produced P-VIN",
+]
+VARIANT_OPERATING_OVERRIDE_COLUMNS = [
+    "Plan Date",
+    "Model",
+    "Planned Qty",
+    "Visibility Qty",
+    "P-VIN Produced Qty",
+    "VNA Qty",
+    "Free VIN Qty",
+    "Produced Qty",
 ]
 RM_FOLLOWUP_COLUMNS = [
     "Part No.",
@@ -1107,6 +1120,8 @@ def canonical_model(value: object) -> str:
     aliases = {
         "S1PROPLUS4KW": "S1PROPLUS",
         "S1XPLUS": "S1XPLUS4KW",
+        "XPLUS52": "S1XPLUS52KW",
+        "RX91KW": "RXPLUS91KW",
     }
     return aliases.get(text, text)
 
@@ -1124,6 +1139,148 @@ def parse_sku_map(df: pd.DataFrame) -> dict[tuple[str, str], str]:
         if fg:
             mapping[(canonical_model(model), canonical_color(color))] = fg
     return mapping
+
+
+def explode_raw_bom_for_fgs(
+    raw_bom: pd.DataFrame,
+    fgs: set[str],
+) -> pd.DataFrame:
+    """Build cumulative component quantities for supplemental header materials."""
+    output_columns = [
+        "FG",
+        "Component",
+        "Qty per FG (exploded)",
+        "VINs for FG",
+        "Units consumed",
+    ]
+    required = {
+        "FG",
+        "Explosion level",
+        "Component number",
+        "Comp Qty CUn",
+    }
+    if not fgs or not required.issubset(raw_bom.columns):
+        return pd.DataFrame(columns=output_columns)
+    records: list[dict[str, object]] = []
+    filtered = raw_bom[
+        raw_bom["FG"].astype(str).str.strip().isin(fgs)
+    ]
+    for fg, rows in filtered.groupby("FG", sort=False):
+        stack: dict[int, float] = {}
+        for _, row in rows.iterrows():
+            level = str(row["Explosion level"])
+            depth = len(level) - len(level.lstrip("."))
+            local_qty = pd.to_numeric(
+                row["Comp Qty CUn"],
+                errors="coerce",
+            )
+            component = clean_text(row["Component number"])
+            if depth <= 0 or pd.isna(local_qty) or not component:
+                continue
+            cumulative = float(local_qty)
+            if depth > 1:
+                if depth - 1 not in stack:
+                    continue
+                cumulative *= stack[depth - 1]
+            stack[depth] = cumulative
+            stack = {
+                current_depth: value
+                for current_depth, value in stack.items()
+                if current_depth <= depth
+            }
+            records.append(
+                {
+                    "FG": clean_text(fg),
+                    "Component": component,
+                    "Qty per FG (exploded)": cumulative,
+                }
+            )
+    if not records:
+        return pd.DataFrame(columns=output_columns)
+    exploded = (
+        pd.DataFrame(records)
+        .groupby(["FG", "Component"], as_index=False)[
+            "Qty per FG (exploded)"
+        ]
+        .sum()
+    )
+    exploded["VINs for FG"] = 0
+    exploded["Units consumed"] = 0
+    return exploded[output_columns]
+
+
+def apply_header_parts_supplement(
+    sources: dict[str, pd.DataFrame],
+) -> tuple[dict[str, pd.DataFrame], dict[str, object]]:
+    """Fill verified current-model SKU/BOM gaps from HEADER PARTS.xlsx."""
+    diagnostics: dict[str, object] = {
+        "supplemental_header_mappings": 0,
+        "supplemental_exploded_fgs": 0,
+    }
+    if not HEADER_PARTS_SUPPLEMENT_PATH.exists():
+        return sources, diagnostics
+    supplement = pd.read_csv(
+        HEADER_PARTS_SUPPLEMENT_PATH,
+        dtype=str,
+    ).fillna("")
+    required = {"Variant", "Model", "Color", "Part No."}
+    sku_map = sources.get("sku_map", pd.DataFrame()).copy()
+    if not required.issubset(supplement.columns) or sku_map.shape[1] < 5:
+        return sources, diagnostics
+
+    supplement_rows = pd.DataFrame(
+        {
+            sku_map.columns[0]: range(
+                len(sku_map) + 1,
+                len(sku_map) + len(supplement) + 1,
+            ),
+            sku_map.columns[1]: supplement["Variant"],
+            sku_map.columns[2]: supplement["Model"],
+            sku_map.columns[3]: supplement["Color"],
+            sku_map.columns[4]: supplement["Part No."],
+        }
+    )
+    existing_mapping = parse_sku_map(sku_map)
+    supplement_rows = supplement_rows[
+        ~supplement_rows.apply(
+            lambda row: (
+                canonical_model(row.iloc[2]),
+                canonical_color(row.iloc[3]),
+            )
+            in existing_mapping,
+            axis=1,
+        )
+    ]
+    sources = {key: value.copy() for key, value in sources.items()}
+    if not supplement_rows.empty:
+        sources["sku_map"] = pd.concat(
+            [sku_map, supplement_rows],
+            ignore_index=True,
+        )
+    diagnostics["supplemental_header_mappings"] = len(supplement_rows)
+
+    exploded = sources.get("exploded_bom", pd.DataFrame()).copy()
+    existing_fgs = set(
+        exploded.get("FG", pd.Series(dtype=str))
+        .astype(str)
+        .str.strip()
+    )
+    supplemental_fgs = set(supplement["Part No."].str.strip()) - existing_fgs
+    supplemental_explosion = explode_raw_bom_for_fgs(
+        sources.get("raw_bom", pd.DataFrame()),
+        supplemental_fgs,
+    )
+    if not supplemental_explosion.empty:
+        sources["exploded_bom"] = pd.concat(
+            [exploded, supplemental_explosion],
+            ignore_index=True,
+        )
+    diagnostics["supplemental_exploded_fgs"] = int(
+        supplemental_explosion["FG"].nunique()
+        if not supplemental_explosion.empty
+        else 0
+    )
+    return sources, diagnostics
 
 
 def parse_sheet_date(value: object) -> pd.Timestamp:
@@ -1289,7 +1446,8 @@ def parse_production_plan_breakup(df: pd.DataFrame) -> pd.DataFrame:
                         "Produced Qty": produced,
                     }
                 )
-    return pd.DataFrame(records, columns=columns)
+    parsed = pd.DataFrame(records, columns=columns)
+    return apply_variant_operating_overrides(parsed)
 
 
 def parse_vin_detail_plan_actual(
@@ -1892,6 +2050,86 @@ def load_pvin_inputs() -> pd.DataFrame:
     for column in ["Generated P-VIN", "Produced P-VIN"]:
         frame[column] = pd.to_numeric(frame[column], errors="coerce").fillna(0)
     return frame[PVIN_INPUT_COLUMNS]
+
+
+def load_variant_operating_overrides() -> pd.DataFrame:
+    if not VARIANT_OPERATING_OVERRIDES_PATH.exists():
+        return pd.DataFrame(columns=VARIANT_OPERATING_OVERRIDE_COLUMNS)
+    frame = pd.read_csv(
+        VARIANT_OPERATING_OVERRIDES_PATH,
+        dtype=str,
+    ).fillna("")
+    for column in VARIANT_OPERATING_OVERRIDE_COLUMNS:
+        if column not in frame:
+            frame[column] = ""
+    frame["Plan Date"] = pd.to_datetime(
+        frame["Plan Date"],
+        errors="coerce",
+    ).dt.normalize()
+    frame["Model"] = frame["Model"].map(clean_text)
+    for column in VARIANT_OPERATING_OVERRIDE_COLUMNS[2:]:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    return frame[VARIANT_OPERATING_OVERRIDE_COLUMNS]
+
+
+def save_variant_operating_overrides(frame: pd.DataFrame) -> None:
+    cleaned = frame.copy()
+    for column in VARIANT_OPERATING_OVERRIDE_COLUMNS:
+        if column not in cleaned:
+            cleaned[column] = pd.NA
+    cleaned["Plan Date"] = pd.to_datetime(
+        cleaned["Plan Date"],
+        errors="coerce",
+    ).dt.strftime("%Y-%m-%d")
+    cleaned["Model"] = cleaned["Model"].map(clean_text)
+    for column in VARIANT_OPERATING_OVERRIDE_COLUMNS[2:]:
+        cleaned[column] = (
+            pd.to_numeric(cleaned[column], errors="coerce")
+            .clip(lower=0)
+            .round()
+        )
+    cleaned = cleaned[
+        cleaned["Plan Date"].ne("") & cleaned["Model"].ne("")
+    ][VARIANT_OPERATING_OVERRIDE_COLUMNS].drop_duplicates(
+        ["Plan Date", "Model"],
+        keep="last",
+    )
+    VARIANT_OPERATING_OVERRIDES_PATH.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    temporary = VARIANT_OPERATING_OVERRIDES_PATH.with_suffix(".tmp")
+    cleaned.to_csv(temporary, index=False)
+    temporary.replace(VARIANT_OPERATING_OVERRIDES_PATH)
+
+
+def apply_variant_operating_overrides(
+    frame: pd.DataFrame,
+) -> pd.DataFrame:
+    overrides = load_variant_operating_overrides()
+    if frame.empty or overrides.empty:
+        return frame
+    result = frame.copy()
+    override_lookup = {
+        (
+            pd.Timestamp(row["Plan Date"]).normalize(),
+            canonical_model(row["Model"]),
+        ): row
+        for _, row in overrides.dropna(subset=["Plan Date"]).iterrows()
+    }
+    value_columns = VARIANT_OPERATING_OVERRIDE_COLUMNS[2:]
+    for index, row in result.iterrows():
+        key = (
+            pd.Timestamp(row["Plan Date"]).normalize(),
+            canonical_model(row["Model"]),
+        )
+        override = override_lookup.get(key)
+        if override is None:
+            continue
+        for column in value_columns:
+            if pd.notna(override[column]):
+                result.at[index, column] = override[column]
+    return result
 
 
 def save_pvin_inputs(frame: pd.DataFrame) -> None:
@@ -2974,7 +3212,12 @@ def build_inventory_status(df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
-def render_metric(label: str, value: object, tone: str = "neutral") -> None:
+def render_metric(
+    label: str,
+    value: object,
+    tone: str = "neutral",
+    help_text: str = "",
+) -> None:
     colors = {
         "neutral": ("#eff6ff", "#2563eb"),
         "ok": ("#ecfdf5", "#16a34a"),
@@ -2982,10 +3225,17 @@ def render_metric(label: str, value: object, tone: str = "neutral") -> None:
         "bad": ("#fef2f2", "#dc2626"),
     }
     bg, accent = colors.get(tone, colors["neutral"])
+    tooltip = escape(help_text, quote=True)
+    info_icon = (
+        f'<span class="metric-info" title="{tooltip}" '
+        f'aria-label="{tooltip}">ⓘ</span>'
+        if help_text
+        else ""
+    )
     st.markdown(
         f"""
-        <div class="metric-card" style="background:{bg}; border-left-color:{accent};">
-            <div class="metric-label">{label}</div>
+        <div class="metric-card" title="{tooltip}" style="background:{bg}; border-left-color:{accent};">
+            <div class="metric-label">{label}{info_icon}</div>
             <div class="metric-value">{value}</div>
         </div>
         """,
@@ -3062,6 +3312,9 @@ def load_inventory_workspace_snapshot() -> tuple[
         key: load_source_cache(source["cache"])
         for key, source in SOURCE_SHEETS.items()
     }
+    sources, supplement_diagnostics = apply_header_parts_supplement(
+        sources
+    )
     inventory, diagnostics = build_part_inventory_plan(
         load_table("part_inventory"),
         sources,
@@ -3069,6 +3322,7 @@ def load_inventory_workspace_snapshot() -> tuple[
             st.session_state.get("pvin_delta_threshold", 10.0)
         ),
     )
+    diagnostics.update(supplement_diagnostics)
     return inventory, sources, diagnostics
 
 
@@ -3196,7 +3450,7 @@ def render_inventory_executive_overview() -> None:
             str(
                 diagnostics.get(
                     "error",
-                    "No inventory snapshot is available. Refresh all data once.",
+                    "No inventory snapshot is available. Refresh all sources once.",
                 )
             )
         )
@@ -3210,14 +3464,8 @@ def render_inventory_executive_overview() -> None:
     stock_available = inventory["Stock Data Status"].eq("Available")
     operational_shortage = numeric(inventory["Operational Shortage"])
     supplier_required = numeric(inventory["Required Qty"])
-    critical_parts = int(
-        (stock_available & inventory["Status"].eq("Critical")).sum()
-    )
     shortage_parts = int(
         (stock_available & operational_shortage.gt(0)).sum()
-    )
-    supplier_parts = int(
-        (stock_available & supplier_required.gt(0)).sum()
     )
     missing_parts = int((~stock_available).sum())
     unmapped_mask = inventory["Buyer"].isin(["", "Unmapped buyer"])
@@ -3262,12 +3510,24 @@ def render_inventory_executive_overview() -> None:
         unsafe_allow_html=True,
     )
 
+    render_agent_activity_centre(
+        inventory=inventory,
+        sources=sources,
+        diagnostics=diagnostics,
+        potential_excess=excess,
+        overdue_count=overdue_count,
+    )
+
     metric_columns = st.columns(5)
     with metric_columns[0]:
         render_metric(
             "Plan / produced",
             f"{plan_target} / {total_production}",
             "neutral",
+            (
+                "Today's vehicle production target versus total vehicles completed "
+                "so far. Total production is separate from Produced P-VIN."
+            ),
         )
         st.button(
             "Open requirements",
@@ -3278,7 +3538,15 @@ def render_inventory_executive_overview() -> None:
             width="stretch",
         )
     with metric_columns[1]:
-        render_metric("Line-risk parts", f"{shortage_parts:,}", "warn")
+        render_metric(
+            "Line-risk parts",
+            f"{shortage_parts:,}",
+            "warn",
+            (
+                "Number of parts with known Physical Stock where the remaining "
+                "production need is greater than the stock physically available."
+            ),
+        )
         st.button(
             "Open stock health",
             key="overview_open_stock_health",
@@ -3292,6 +3560,10 @@ def render_inventory_executive_overview() -> None:
             "Supplier quantity required",
             display_qty(supplier_required_qty),
             "warn",
+            (
+                "Total additional quantity suppliers must provide to cover the "
+                "remaining requirement. Calculated from System Stock, not Physical Stock."
+            ),
         )
         st.button(
             "Open requirements",
@@ -3306,6 +3578,11 @@ def render_inventory_executive_overview() -> None:
             "Unmapped / missing stock",
             f"{data_issue_parts:,}",
             "neutral",
+            (
+                "Parts that either have no mapped buyer or do not have usable stock "
+                "data. These require data correction before the agent can assign or "
+                "assess them reliably."
+            ),
         )
         st.button(
             "Open audit",
@@ -3320,6 +3597,10 @@ def render_inventory_executive_overview() -> None:
             "Overdue commitments",
             f"{overdue_count:,}",
             "bad" if overdue_count else "ok",
+            (
+                "Saved supplier follow-ups due on or before the selected plan date "
+                "that have not been marked Received."
+            ),
         )
         st.button(
             "Open action centre",
@@ -3330,201 +3611,1017 @@ def render_inventory_executive_overview() -> None:
             width="stretch",
         )
 
-    st.subheader(
-        "Recommended management actions",
-        help="A deterministic daily brief generated from the current exception queues.",
+def build_variant_flow_view(
+    inventory: pd.DataFrame,
+    sources: dict[str, pd.DataFrame],
+) -> tuple[pd.DataFrame, pd.Timestamp | None]:
+    """Build one variant-level control table from the same source state as parts."""
+    plan_dates = pd.to_datetime(
+        inventory.get("Plan Date", pd.Series(dtype=str)),
+        errors="coerce",
+    ).dropna()
+    if plan_dates.empty:
+        return pd.DataFrame(), None
+    plan_date = plan_dates.max().normalize()
+    variant_plan = parse_production_plan_breakup(
+        sources.get("production_plan_breakup", pd.DataFrame())
     )
-    action_columns = st.columns(3)
-    action_cards = [
-        (
-            "Protect production",
-            "bad",
-            f"Prioritize {critical_parts:,} critical and {shortage_parts:,} total "
-            "line-risk parts by required-by date.",
-        ),
-        (
-            "Control supply",
-            "warn",
-            f"Confirm quantities and ETAs for {supplier_parts:,} parts with a "
-            "system-stock requirement.",
-        ),
-        (
-            "Prevent excess",
-            "neutral",
-            f"Review {len(excess):,} potential month-end excess signals before "
-            "changing any supplier commitment.",
-        ),
-    ]
-    for column, (title, tone, description) in zip(action_columns, action_cards):
-        with column:
-            with st.container(border=True):
-                st.markdown(f"**{title}**")
-                st.caption(description)
-
-    shortage_queue = inventory[
-        stock_available & operational_shortage.gt(0)
+    variant_plan = variant_plan[
+        variant_plan["Plan Date"].eq(plan_date)
     ].copy()
-    shortage_queue["Operational Shortage"] = operational_shortage.loc[
-        shortage_queue.index
-    ]
-    shortage_queue = shortage_queue.sort_values(
-        "Operational Shortage",
-        ascending=False,
-    ).head(5)
-    delta_queue = inventory[inventory["Delta Flag"].eq("Review")].copy()
-    delta_queue = delta_queue.reindex(
-        delta_queue["Unexplained Delta"].abs().sort_values(
-            ascending=False
-        ).index
-    ).head(5)
-    master_queue = inventory[
-        ~stock_available | unmapped_mask
-    ].head(5)
-    if not overdue.empty:
-        overdue = overdue.merge(
-            inventory[
-                ["Part No.", "Part Name", "Buyer", "Supplier"]
-            ].drop_duplicates("Part No."),
-            on="Part No.",
-            how="left",
+    if variant_plan.empty:
+        return pd.DataFrame(), plan_date
+
+    pvin = pvin_input_template(sources, plan_date).rename(
+        columns={"Variant": "Model"}
+    )
+    pvin = pvin[["Model", "Generated P-VIN"]].drop_duplicates(
+        "Model",
+        keep="last",
+    )
+    view = variant_plan.merge(pvin, on="Model", how="left")
+    view["Generated P-VIN"] = numeric(view["Generated P-VIN"])
+    view["Produced P-VIN"] = pd.to_numeric(
+        view["P-VIN Produced Qty"],
+        errors="coerce",
+    )
+    view["Daily Plan"] = numeric(view["Planned Qty"]).round().astype(int)
+    view["Total Production"] = numeric(view["Produced Qty"]).round().astype(int)
+    view["Plan Balance"] = (
+        view["Daily Plan"] - view["Total Production"]
+    ).clip(lower=0)
+    view["Generated–Produced Gap"] = (
+        view["Generated P-VIN"]
+        - view["Produced P-VIN"].fillna(0)
+    )
+    view["Completion"] = (
+        view["Total Production"]
+        / view["Daily Plan"].replace(0, pd.NA)
+        * 100
+    )
+    view["System Trigger"] = view["Generated P-VIN"].map(
+        lambda value: f"Deduct BOM × {display_qty(value)}"
+    )
+    view["Physical Trigger"] = view["Produced P-VIN"].map(
+        lambda value: (
+            f"Deduct BOM × {display_qty(value)}"
+            if pd.notna(value)
+            else "P‑VIN data unavailable"
         )
-    inventory_cases = load_inventory_control_cases()
+    )
+    return (
+        view[
+            [
+                "Model",
+                "Daily Plan",
+                "Total Production",
+                "Visibility Qty",
+                "Generated P-VIN",
+                "Produced P-VIN",
+                "VNA Qty",
+                "Free VIN Qty",
+                "Plan Balance",
+                "Generated–Produced Gap",
+                "Completion",
+                "System Trigger",
+                "Physical Trigger",
+            ]
+        ].rename(columns={"Model": "Variant"}),
+        plan_date,
+    )
+
+
+def build_variant_part_index(
+    exploded_bom: pd.DataFrame,
+    sku_mapping: pd.DataFrame,
+) -> dict[str, set[str]]:
+    """Return every mapped component key for each production variant."""
+    if not {"FG", "Component"}.issubset(exploded_bom.columns):
+        return {}
+    fg_variants: dict[str, set[str]] = {}
+    for row in sku_mapping.itertuples(index=False, name=None):
+        if len(row) < 5:
+            continue
+        variant = clean_text(row[2])
+        fg = clean_text(row[4])
+        if variant and fg:
+            fg_variants.setdefault(fg, set()).add(variant)
+    variant_parts: dict[str, set[str]] = {}
+    for fg, component in exploded_bom[
+        ["FG", "Component"]
+    ].drop_duplicates().itertuples(index=False, name=None):
+        fg = clean_text(fg)
+        component_key = stock_part_key(component)
+        if not component_key:
+            continue
+        for variant in fg_variants.get(fg, set()):
+            variant_parts.setdefault(variant, set()).add(component_key)
+    return variant_parts
+
+
+def render_agent_activity_centre(
+    inventory: pd.DataFrame,
+    sources: dict[str, pd.DataFrame],
+    diagnostics: dict[str, object],
+    potential_excess: pd.DataFrame,
+    overdue_count: int,
+) -> None:
+    """Show only agent exceptions that require a person to decide or act."""
+    stock_known = inventory["Stock Data Status"].eq("Available")
+    shortage_mask = (
+        stock_known
+        & numeric(inventory["Operational Shortage"]).gt(0)
+    )
+    shortage_count = int(
+        shortage_mask.sum()
+    )
+    delta_mask = inventory["Delta Flag"].eq("Review")
+    delta_count = int(delta_mask.sum())
+    missing_stock_mask = ~stock_known
+    unmapped_mask = (
+        inventory["Buyer"].isin(["", "Unmapped buyer"])
+        | inventory["Supplier"].isin(["", "Unmapped supplier"])
+    )
+    mapping_count = int(
+        (unmapped_mask | missing_stock_mask).sum()
+    )
     inwarding_actions = load_agent_actions()
-    resolved_dates = pd.concat(
-        [
-            pd.to_datetime(
-                inventory_cases.get("Resolved At", pd.Series(dtype=str)),
-                errors="coerce",
+    open_inwarding_mask = (
+        inwarding_actions.get(
+            "Active",
+            pd.Series("", index=inwarding_actions.index),
+        ).eq("Yes")
+        & ~inwarding_actions.get(
+            "Status",
+            pd.Series("", index=inwarding_actions.index),
+        ).isin(["Resolved", "Auto-resolved"])
+    )
+    open_inwarding_rows = inwarding_actions[open_inwarding_mask].copy()
+    open_inwarding = len(open_inwarding_rows)
+    produced_available = bool(
+        diagnostics.get("produced_pvin_source_available")
+    )
+    generated_total = float(diagnostics.get("generated_pvin_total", 0))
+
+    def top_owner(frame: pd.DataFrame, column: str) -> str:
+        if frame.empty or column not in frame.columns:
+            return "Unassigned"
+        owners = frame[column].map(clean_text)
+        owners = owners[
+            ~owners.isin(
+                ["", "Unmapped buyer", "Unmapped supplier", "Unassigned"]
+            )
+        ]
+        if owners.empty:
+            return "Unassigned"
+        return clean_text(owners.value_counts().index[0])
+
+    actions: list[dict[str, str]] = []
+    if mapping_count:
+        actions.append(
+            {
+                "priority": "DATA BLOCKER",
+                "tone": "warn",
+                "title": "Repair inventory data gaps",
+                "impact": (
+                    f"{mapping_count:,} parts have missing stock or ownership mapping; "
+                    "agent conclusions for them require validation."
+                ),
+                "owner": "Master Data + SCM",
+                "due": "Before the next decision run",
+                "button": "Open data audit",
+                "page": "Inventory Management Agent",
+                "workflow": "Audit & Evidence",
+            }
+        )
+    if not produced_available or generated_total <= 0:
+        missing_signal = (
+            "explicit Produced P‑VIN source"
+            if not produced_available
+            else "Generated P‑VIN input"
+        )
+        actions.append(
+            {
+                "priority": "INPUT NEEDED",
+                "tone": "warn",
+                "title": "Complete P‑VIN consumption inputs",
+                "impact": (
+                    f"Missing {missing_signal}; System/Physical consumption cannot "
+                    "be treated as a complete live stock movement."
+                ),
+                "owner": "Production Control",
+                "due": "Before stock reconciliation",
+                "button": "Open live flow",
+                "page": "Inventory Management Agent",
+                "workflow": "Live Flow",
+            }
+        )
+    if shortage_count:
+        shortage_rows = inventory[shortage_mask]
+        critical_count = int(
+            shortage_rows.get(
+                "Status",
+                pd.Series("", index=shortage_rows.index),
+            ).eq("Critical").sum()
+        )
+        actions.append(
+            {
+                "priority": "PRODUCTION RISK",
+                "tone": "bad",
+                "title": "Protect the production plan",
+                "impact": (
+                    f"{shortage_count:,} parts are line-risk"
+                    + (
+                        f", including {critical_count:,} critical."
+                        if critical_count
+                        else "."
+                    )
+                ),
+                "owner": top_owner(shortage_rows, "Buyer"),
+                "due": "Today",
+                "button": "Open shortage queue",
+                "page": "Inventory Management Agent",
+                "workflow": "Stock Health",
+            }
+        )
+    if open_inwarding:
+        inwarding_critical = int(
+            open_inwarding_rows.get(
+                "Severity",
+                pd.Series("", index=open_inwarding_rows.index),
+            ).eq("Critical").sum()
+        )
+        oldest_age = pd.to_numeric(
+            open_inwarding_rows.get(
+                "Age (days)",
+                pd.Series(dtype=float),
             ),
-            pd.to_datetime(
-                inwarding_actions.get("Resolved At", pd.Series(dtype=str)),
-                errors="coerce",
+            errors="coerce",
+        ).max()
+        age_text = (
+            f" Oldest case is {int(oldest_age):,} days."
+            if pd.notna(oldest_age)
+            else ""
+        )
+        actions.append(
+            {
+                "priority": "CONTROL ACTION",
+                "tone": "bad" if inwarding_critical else "warn",
+                "title": "Close inwarding exceptions",
+                "impact": (
+                    f"{open_inwarding:,} open cases"
+                    + (
+                        f", including {inwarding_critical:,} critical."
+                        if inwarding_critical
+                        else "."
+                    )
+                    + age_text
+                ),
+                "owner": top_owner(open_inwarding_rows, "Buyer Name"),
+                "due": "Today" if inwarding_critical else "Within control SLA",
+                "button": "Open inwarding cases",
+                "page": "Inwarding Parts",
+                "workflow": "",
+            }
+        )
+    if overdue_count:
+        followups = load_rm_followups()
+        actions.append(
+            {
+                "priority": "OVERDUE",
+                "tone": "bad",
+                "title": "Recover supplier commitments",
+                "impact": (
+                    f"{overdue_count:,} supplier follow-ups are due and have not "
+                    "been marked Received."
+                ),
+                "owner": top_owner(followups, "Follow-up Owner"),
+                "due": "Overdue",
+                "button": "Open action centre",
+                "page": "Inventory Management Agent",
+                "workflow": "Action Centre",
+            }
+        )
+    if delta_count:
+        delta_rows = inventory[delta_mask]
+        actions.append(
+            {
+                "priority": "RECONCILE",
+                "tone": "warn",
+                "title": "Explain stock deltas",
+                "impact": (
+                    f"{delta_count:,} parts exceed the unexplained-delta threshold "
+                    "after P‑VIN timing and COGI allowances."
+                ),
+                "owner": top_owner(delta_rows, "Buyer"),
+                "due": "Before stock sign-off",
+                "button": "Open reconciliation",
+                "page": "Inventory Management Agent",
+                "workflow": "Audit & Evidence",
+            }
+        )
+    if not potential_excess.empty:
+        actions.append(
+            {
+                "priority": "VALIDATE",
+                "tone": "neutral",
+                "title": "Review potential excess",
+                "impact": (
+                    f"{len(potential_excess):,} indicative signals need open-PO "
+                    "and safety-stock validation before changing supply."
+                ),
+                "owner": top_owner(potential_excess, "Buyer"),
+                "due": "Before supplier commitment changes",
+                "button": "Open excess review",
+                "page": "Inventory Management Agent",
+                "workflow": "Requirements",
+            }
+        )
+
+    st.subheader(
+        "Today's Agent Actions",
+        help=(
+            "Exceptions that need a decision or follow-up now. Each card states the "
+            "business impact, accountable owner, urgency, and exact work queue."
+        ),
+    )
+    if actions:
+        st.caption(
+            f"{len(actions):,} action group(s) require attention. Start with red "
+            "production/control risks, then clear inputs and validation decisions."
+        )
+        for start in range(0, len(actions), 3):
+            action_columns = st.columns(3)
+            for column, action in zip(
+                action_columns,
+                actions[start : start + 3],
+            ):
+                with column:
+                    with st.container(border=True):
+                        st.markdown(
+                            f'<span class="agent-action-pill {action["tone"]}">'
+                            f'{escape(action["priority"])}</span>',
+                            unsafe_allow_html=True,
+                        )
+                        st.markdown(f"#### {action['title']}")
+                        st.caption(action["impact"])
+                        detail_columns = st.columns(2)
+                        with detail_columns[0]:
+                            st.markdown("**Owner**")
+                            st.caption(action["owner"])
+                        with detail_columns[1]:
+                            st.markdown("**Due**")
+                            st.caption(action["due"])
+                        st.button(
+                            action["button"],
+                            key=(
+                                "agent_action_"
+                                + re.sub(
+                                    r"[^a-z0-9]+",
+                                    "_",
+                                    action["title"].lower(),
+                                ).strip("_")
+                            ),
+                            width="stretch",
+                            on_click=lambda selected=action: (
+                                st.session_state.update(
+                                    {
+                                        "app_navigation": selected["page"],
+                                        **(
+                                            {
+                                                "inventory_management_workflow":
+                                                    selected["workflow"]
+                                            }
+                                            if selected["workflow"]
+                                            else {}
+                                        ),
+                                    }
+                                )
+                            ),
+                        )
+    else:
+        st.success(
+            "No agent exception currently requires a decision or follow-up."
+        )
+
+    healthy_agents = []
+    if mapping_count == 0:
+        healthy_agents.append("Data readiness")
+    if produced_available and generated_total > 0:
+        healthy_agents.append("P‑VIN consumption")
+    if delta_count == 0:
+        healthy_agents.append("Reconciliation")
+    if shortage_count == 0:
+        healthy_agents.append("Shortage prevention")
+    if open_inwarding == 0:
+        healthy_agents.append("Inwarding control")
+    if overdue_count == 0:
+        healthy_agents.append("Supplier commitments")
+    healthy_agents.append("PPC scenario engine available on demand")
+    st.caption("System health · " + " · ".join(healthy_agents))
+
+
+def render_inventory_live_flow() -> None:
+    """Render the live, variant-to-part inventory recalculation workflow."""
+    inventory, sources, diagnostics = load_inventory_workspace_snapshot()
+    st.header(
+        "Live Inventory Flow",
+        help=(
+            "The controlled path from vehicle plan and P‑VIN activity through BOM "
+            "consumption, stock positions, requirements, exceptions and actions."
+        ),
+    )
+    st.caption(
+        "Any saved Generated P‑VIN change reruns the same shared calculation used by "
+        "Stock Health, Requirements, Excess, buyer queues and audit evidence."
+    )
+    if diagnostics.get("error") or inventory.empty:
+        st.warning(
+            str(
+                diagnostics.get(
+                    "error",
+                    "No inventory snapshot is available. Refresh all sources once.",
+                )
+            )
+        )
+        return
+
+    variant_view, plan_date = build_variant_flow_view(inventory, sources)
+    excess, _ = build_potential_excess_view(
+        inventory,
+        sources,
+        "Remaining Month",
+    )
+    stock_known = inventory["Stock Data Status"].eq("Available")
+    operational_shortage = numeric(inventory["Operational Shortage"])
+    supplier_required = numeric(inventory["Required Qty"])
+    flow_steps = [
+        (
+            "1 · Vehicle signal",
+            (
+                f"{display_qty(diagnostics.get('daily_target', 0))} plan · "
+                f"{display_qty(diagnostics.get('produced_target', 0))} total production"
             ),
-        ],
+            "Plan and production are read variant-wise. Total production is never treated as Produced P‑VIN.",
+        ),
+        (
+            "2 · P‑VIN and BOM",
+            (
+                f"{display_qty(diagnostics.get('generated_pvin_total', 0))} generated · "
+                f"{display_qty(diagnostics.get('produced_pvin_total', 0))} produced"
+            ),
+            "Generated P‑VIN drives System consumption; Produced P‑VIN drives Physical consumption.",
+        ),
+        (
+            "3 · Stock position",
+            (
+                f"{int(stock_known.sum()):,} available · "
+                f"{int((~stock_known).sum()):,} data gaps"
+            ),
+            "Movements, COGI and explained P‑VIN timing are retained separately.",
+        ),
+        (
+            "4 · Decisions",
+            (
+                f"{int((stock_known & operational_shortage.gt(0)).sum()):,} shortages · "
+                f"{len(excess):,} potential excess"
+            ),
+            "Supplier requirement uses System Stock; operational shortage uses Physical Stock.",
+        ),
+    ]
+    step_columns = st.columns(4)
+    for column, (title, value, detail) in zip(step_columns, flow_steps):
+        with column:
+            st.markdown(
+                f'<div class="flow-control-card">'
+                f'<div class="flow-control-step">{escape(title)}</div>'
+                f'<div class="flow-control-value">{escape(value)}</div>'
+                f'<div class="flow-control-detail">{escape(detail)}</div>'
+                "</div>",
+                unsafe_allow_html=True,
+            )
+
+    st.subheader(
+        "Variant control",
+        help=(
+            "Review plan, total production, Generated P‑VIN and Produced P‑VIN by "
+            "variant. Saving Generated P‑VIN immediately recalculates every affected part."
+        ),
+    )
+    if plan_date is None or variant_view.empty:
+        st.warning("No variant-wise production plan is available for the selected date.")
+        return
+
+    pvin_template = pvin_input_template(sources, plan_date)
+    input_col, explanation_col = st.columns([1.8, 1])
+    with input_col:
+        with st.container(border=True):
+            st.subheader(
+                "Generated and Produced P‑VIN",
+                help=(
+                    "Generated P‑VIN is the controlled input until its source is "
+                    "integrated. Produced P‑VIN is source-controlled and cannot be edited."
+                ),
+            )
+            edited_pvin = st.data_editor(
+                pvin_template,
+                width="stretch",
+                hide_index=True,
+                disabled=["Plan Date", "Variant", "Produced P-VIN"],
+                key="live_flow_pvin_editor",
+                column_config={
+                    "Generated P-VIN": st.column_config.NumberColumn(
+                        min_value=0,
+                        step=1,
+                        help="Reduces System Stock through the variant BOM.",
+                    ),
+                    "Produced P-VIN": st.column_config.NumberColumn(
+                        min_value=0,
+                        step=1,
+                        help=(
+                            "Read only from the explicit P‑VIN production source. "
+                            "Reduces Physical Stock through the variant BOM."
+                        ),
+                    ),
+                },
+            )
+            save_col, threshold_col = st.columns([1, 1])
+            with save_col:
+                if st.button(
+                    "Save and recalculate",
+                    type="primary",
+                    key="live_flow_save_pvin",
+                    width="stretch",
+                    help=(
+                        "Save the variant input and rerun all part, stock, shortage, "
+                        "excess, reconciliation and action calculations."
+                    ),
+                ):
+                    all_inputs = load_pvin_inputs()
+                    date_label = plan_date.strftime("%Y-%m-%d")
+                    all_inputs = all_inputs[
+                        ~all_inputs["Plan Date"].eq(date_label)
+                    ]
+                    save_pvin_inputs(
+                        pd.concat(
+                            [all_inputs, edited_pvin],
+                            ignore_index=True,
+                        )
+                    )
+                    st.success(
+                        "P‑VIN figures saved. All dependent inventory views were recalculated."
+                    )
+                    st.rerun()
+            with threshold_col:
+                st.number_input(
+                    "Delta alert threshold",
+                    min_value=0.0,
+                    value=float(
+                        st.session_state.get("pvin_delta_threshold", 10.0)
+                    ),
+                    step=1.0,
+                    key="live_flow_delta_threshold",
+                    help=(
+                        "Create reconciliation review when the absolute unexplained "
+                        "System-versus-Physical difference exceeds this quantity."
+                    ),
+                )
+                st.session_state["pvin_delta_threshold"] = float(
+                    st.session_state["live_flow_delta_threshold"]
+                )
+    with explanation_col:
+        with st.container(border=True):
+            st.subheader(
+                "Calculation rules",
+                help="The independent stock triggers used throughout the application.",
+            )
+            st.markdown(
+                "- **Generated P‑VIN × BOM** → System consumption\n"
+                "- **Produced P‑VIN × BOM** → Physical consumption\n"
+                "- System Stock floors at zero; remainder becomes **COGI**\n"
+                "- Total Production remains a separate production KPI\n"
+                "- Only the newly saved state is used on the next calculation"
+            )
+            if not diagnostics.get("produced_pvin_source_available"):
+                st.warning(
+                    "Produced P‑VIN is unavailable. The app has not substituted "
+                    "Total Production."
+                )
+
+    st.subheader(
+        "Variant-wise operating table",
+        help=(
+            "The table keeps total production, Generated P‑VIN and Produced P‑VIN "
+            "separate and shows the stock trigger created by each quantity."
+        ),
+    )
+    total_columns = [
+        "Daily Plan",
+        "Total Production",
+        "Visibility Qty",
+        "Generated P-VIN",
+        "Produced P-VIN",
+        "VNA Qty",
+        "Free VIN Qty",
+        "Plan Balance",
+        "Generated–Produced Gap",
+    ]
+    total_row: dict[str, object] = {
+        column: variant_view[column].sum(min_count=1)
+        for column in total_columns
+    }
+    total_row["Variant"] = "TOTAL"
+    total_daily_plan = float(total_row["Daily Plan"] or 0)
+    total_production = float(total_row["Total Production"] or 0)
+    total_row["Completion"] = (
+        total_production / total_daily_plan * 100
+        if total_daily_plan > 0
+        else pd.NA
+    )
+    total_row["System Trigger"] = "Combined generated P‑VIN"
+    total_row["Physical Trigger"] = "Combined produced P‑VIN"
+    variant_table = pd.concat(
+        [variant_view, pd.DataFrame([total_row])],
         ignore_index=True,
     )
-    newly_resolved = int(
-        resolved_dates.dt.normalize().eq(plan_date).sum()
+    total_row_index = len(variant_table) - 1
+    whole_number_columns = [
+        "Daily Plan",
+        "Total Production",
+        "Visibility Qty",
+        "Generated P-VIN",
+        "Produced P-VIN",
+        "VNA Qty",
+        "Free VIN Qty",
+        "Plan Balance",
+        "Generated–Produced Gap",
+    ]
+    variant_styler = (
+        variant_table.style.format(
+            {column: "{:.0f}" for column in whole_number_columns},
+            na_rep="—",
+        )
+        .apply(
+            lambda row: (
+                [
+                    "background-color:#f1f5f9;font-weight:800;color:#162033"
+                ]
+                * len(row)
+                if row.name == total_row_index
+                else [""] * len(row)
+            ),
+            axis=1,
+        )
     )
-    overdue_buyers = sorted(
-        overdue.get("Buyer", pd.Series(dtype=str))
+    st.dataframe(
+        variant_styler,
+        width="stretch",
+        hide_index=True,
+        height=min(555, 42 + len(variant_table) * 35),
+        column_config={
+            "Daily Plan": st.column_config.NumberColumn(format="%d"),
+            "Visibility Qty": st.column_config.NumberColumn(format="%d"),
+            "Generated P-VIN": st.column_config.NumberColumn(format="%d"),
+            "Produced P-VIN": st.column_config.NumberColumn(
+                format="%d",
+                help="Explicit source P‑VIN only; blank means unavailable."
+            ),
+            "Total Production": st.column_config.NumberColumn(
+                format="%d",
+                help="Visibility / total vehicles completed. Not Produced P‑VIN."
+            ),
+            "VNA Qty": st.column_config.NumberColumn(format="%d"),
+            "Free VIN Qty": st.column_config.NumberColumn(format="%d"),
+            "Plan Balance": st.column_config.NumberColumn(format="%d"),
+            "Generated–Produced Gap": st.column_config.NumberColumn(
+                format="%d"
+            ),
+            "Completion": st.column_config.ProgressColumn(
+                format="%.0f%%",
+                min_value=0,
+                max_value=100,
+            ),
+        },
+    )
+
+    st.subheader(
+        "Inventory master sheet",
+        help=(
+            "The complete part-level calculation base used by Stock Health, "
+            "Shortage, Excess, Reconciliation and buyer-action agents."
+        ),
+    )
+    st.caption(
+        "Search the full master, change the working view, or select one row to "
+        "audit its end-to-end demand, movement and stock calculation."
+    )
+    master = inventory.copy()
+    master["Supplier Required Qty"] = supplier_required
+    master["Operational Shortage"] = operational_shortage
+    filter_columns = st.columns([1.7, 1, 1, 1, 0.75])
+    with filter_columns[0]:
+        master_search = st.text_input(
+            "Search master",
+            placeholder="Part number, part name, buyer or supplier",
+            key="live_flow_master_search",
+        )
+    with filter_columns[1]:
+        health_options = [
+            "All stock health",
+            *sorted(master["Status"].replace("", pd.NA).dropna().unique()),
+        ]
+        master_health = st.selectbox(
+            "Stock health",
+            health_options,
+            key="live_flow_master_health",
+        )
+    buyer_options = sorted(
+        master["Buyer"].replace("", pd.NA).dropna().unique().tolist()
+    )
+    with filter_columns[2]:
+        master_buyer = st.selectbox(
+            "Buyer",
+            ["All buyers", *buyer_options],
+            key="live_flow_master_buyer",
+        )
+    supplier_source = master
+    if master_buyer != "All buyers":
+        supplier_source = supplier_source[
+            supplier_source["Buyer"].eq(master_buyer)
+        ]
+    supplier_options = sorted(
+        supplier_source["Supplier"]
         .replace("", pd.NA)
         .dropna()
         .unique()
         .tolist()
     )
+    buyer_key = re.sub(
+        r"[^a-z0-9]+",
+        "_",
+        master_buyer.lower(),
+    ).strip("_")
+    with filter_columns[3]:
+        master_supplier = st.selectbox(
+            "Supplier",
+            ["All suppliers", *supplier_options],
+            key=f"live_flow_master_supplier_{buyer_key}",
+            help="Supplier choices are limited to the selected buyer.",
+        )
+    with filter_columns[4]:
+        master_view = st.selectbox(
+            "Columns",
+            ["Decision", "Movement", "Complete"],
+            key="live_flow_master_view",
+            help="Switch between focused decision columns, movement evidence and the complete calculation base.",
+        )
+
+    filtered = master.copy()
+    if master_health != "All stock health":
+        filtered = filtered[filtered["Status"].eq(master_health)]
+    if master_buyer != "All buyers":
+        filtered = filtered[filtered["Buyer"].eq(master_buyer)]
+    if master_supplier != "All suppliers":
+        filtered = filtered[filtered["Supplier"].eq(master_supplier)]
+    if master_search.strip():
+        term = master_search.strip()
+        filtered = filtered[
+            filtered[
+                ["Part No.", "Part Name", "Buyer", "Supplier"]
+            ]
+            .astype(str)
+            .apply(
+                lambda column: column.str.contains(
+                    term,
+                    case=False,
+                    na=False,
+                    regex=False,
+                )
+            )
+            .any(axis=1)
+        ]
+
+    master_metrics = st.columns(6)
+    master_metric_values = [
+        ("Parts shown", len(filtered), "neutral"),
+        ("Healthy", int(filtered["Status"].eq("Healthy").sum()), "ok"),
+        (
+            "Below required",
+            int(filtered["Status"].eq("Below required").sum()),
+            "warn",
+        ),
+        ("Critical", int(filtered["Status"].eq("Critical").sum()), "bad"),
+        (
+            "Stock missing",
+            int(filtered["Status"].eq("Stock data missing").sum()),
+            "warn",
+        ),
+        (
+            "Delta review",
+            int(filtered["Delta Flag"].eq("Review").sum()),
+            "warn",
+        ),
+    ]
+    for column, (label, value, tone) in zip(
+        master_metrics,
+        master_metric_values,
+    ):
+        with column:
+            render_metric(label, value, tone)
+
+    view_columns = {
+        "Decision": [
+            "Part No.",
+            "Part Name",
+            "Buyer",
+            "Supplier",
+            "System Stock",
+            "Physical Stock",
+            "Remaining Part Need",
+            "Supplier Required Qty",
+            "Operational Shortage",
+            "Status",
+            "Delta Flag",
+        ],
+        "Movement": [
+            "Part No.",
+            "Part Name",
+            "Today's OS",
+            "Parts Inwarded",
+            "Production Outwarded",
+            "Other Outwarded",
+            "Parts Outwarded",
+            "Tomorrow's OS",
+            "Generated Consumption",
+            "Produced Consumption",
+            "COGI Qty",
+        ],
+        "Complete": [
+            "Buyer",
+            "Supplier",
+            "Part No.",
+            "Part Name",
+            "Plan Date",
+            "Daily Production Plan",
+            "Produced So Far",
+            "Planned Part Consumption",
+            "Consumed So Far",
+            "Remaining Part Need",
+            "Supplier Required Qty",
+            "Operational Shortage",
+            "Today's OS",
+            "Parts Inwarded",
+            "Production Outwarded",
+            "Other Outwarded",
+            "Parts Outwarded",
+            "Tomorrow's OS",
+            "System Stock",
+            "Physical Stock",
+            "Generated Consumption",
+            "Produced Consumption",
+            "COGI Qty",
+            "Stock Delta",
+            "Expected Delta",
+            "Unexplained Delta",
+            "Delta Flag",
+            "SCM Stock Match",
+            "Stock Data Status",
+            "Status",
+            "Remarks",
+        ],
+    }
+    visible_columns = view_columns[master_view]
+    master_table = filtered[visible_columns].copy()
+    numeric_columns = [
+        column
+        for column in visible_columns
+        if column
+        in {
+            "Daily Production Plan",
+            "Produced So Far",
+            "Planned Part Consumption",
+            "Consumed So Far",
+            "Remaining Part Need",
+            "Supplier Required Qty",
+            "Operational Shortage",
+            "Today's OS",
+            "Parts Inwarded",
+            "Production Outwarded",
+            "Other Outwarded",
+            "Parts Outwarded",
+            "Tomorrow's OS",
+            "System Stock",
+            "Physical Stock",
+            "Generated Consumption",
+            "Produced Consumption",
+            "COGI Qty",
+            "Stock Delta",
+            "Expected Delta",
+            "Unexplained Delta",
+        }
+    ]
+    for column in numeric_columns:
+        master_table[column] = pd.to_numeric(
+            master_table[column],
+            errors="coerce",
+        )
+    master_actions = st.columns([1, 5])
+    with master_actions[0]:
+        st.download_button(
+            "Download master CSV",
+            filtered.to_csv(index=False),
+            file_name="inventory_master_sheet.csv",
+            mime="text/csv",
+            key="live_flow_master_download",
+            width="stretch",
+        )
+    with master_actions[1]:
+        st.caption(
+            f"Showing {len(filtered):,} of {len(master):,} parts · "
+            f"{master_view.lower()} column view"
+        )
+    selection = st.dataframe(
+        master_table,
+        width="stretch",
+        hide_index=True,
+        height=560,
+        on_select="rerun",
+        selection_mode="single-row",
+        key=f"live_flow_master_{master_view.lower()}",
+    )
+    selected_rows = (
+        selection.selection.rows
+        if hasattr(selection, "selection")
+        else selection.get("selection", {}).get("rows", [])
+    )
+    if not selected_rows:
+        st.caption(
+            "Select one part to open its complete calculation and movement evidence."
+        )
+        return
+    part = filtered.iloc[selected_rows[0]]
     st.subheader(
-        "Management briefing",
+        "Part calculation evidence",
         help=(
-            "The top five risks, overdue commitments, unexplained deltas and "
-            "master-data decisions requiring attention."
+            "The complete result chain for the selected variant component, using the "
+            "same quantities shown in all agent workspaces."
         ),
     )
-    (
-        risk_tab,
-        overdue_tab,
-        delta_tab,
-        master_tab,
-    ) = st.tabs(
-        [
-            f"Top risks ({len(shortage_queue):,})",
-            f"Overdue commitments ({overdue_count:,})",
-            f"Delta review ({len(delta_queue):,})",
-            f"Data decisions ({len(master_queue):,})",
-        ]
+    calculation_tab, movement_tab, decision_tab = st.tabs(
+        ["Demand and stock", "Movements and P‑VIN", "Decision output"]
     )
-    with risk_tab:
-        if shortage_queue.empty:
-            st.success("No operational shortages in the current snapshot.")
-        else:
-            st.dataframe(
-                shortage_queue[
-                    [
-                        "Part No.",
-                        "Part Name",
-                        "Buyer",
-                        "Operational Shortage",
-                        "Status",
-                    ]
+    with calculation_tab:
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    ("Planned Part Consumption", part["Planned Part Consumption"]),
+                    ("Consumed So Far", part["Consumed So Far"]),
+                    ("Remaining Part Need", part["Remaining Part Need"]),
+                    ("System Stock", part["System Stock"]),
+                    ("Physical Stock", part["Physical Stock"]),
+                    ("Supplier Required Qty", part["Supplier Required Qty"]),
+                    ("Operational Shortage", part["Operational Shortage"]),
                 ],
-                width="stretch",
-                hide_index=True,
-                height=240,
-            )
-    with overdue_tab:
-        if overdue.empty:
-            st.success("No supplier commitment is overdue.")
-        else:
-            st.dataframe(
-                overdue.head(5)[
-                    [
-                        "Part No.",
-                        "Part Name",
-                        "Buyer",
-                        "Supplier",
-                        "Next Expected Qty",
-                        "Expected Delivery",
-                        "Next Follow-up",
-                        "Supplier Status",
-                    ]
+                columns=["Stage", "Result"],
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+    with movement_tab:
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    ("Today's OS", part["Today's OS"]),
+                    ("Parts Inwarded", part["Parts Inwarded"]),
+                    ("Generated-PVIN consumption", part["Generated Consumption"]),
+                    ("Produced-PVIN consumption", part["Produced Consumption"]),
+                    ("Production Outwarded", part["Production Outwarded"]),
+                    ("Other Outwarded", part["Other Outwarded"]),
+                    ("Tomorrow's OS", part["Tomorrow's OS"]),
+                    ("COGI", part["COGI Qty"]),
                 ],
-                width="stretch",
-                hide_index=True,
-                height=240,
+                columns=["Movement", "Quantity"],
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+    with decision_tab:
+        st.write(
+            f"**Stock health:** {part['Status']}  \n"
+            f"**Delta state:** {part['Delta Flag']}  \n"
+            f"**Buyer:** {part['Buyer']}  \n"
+            f"**Supplier:** {part['Supplier']}"
+        )
+        if float(part["Operational Shortage"]) > 0:
+            st.error(
+                "Shortage Agent: protect production and confirm the required supplier quantity."
             )
-    with delta_tab:
-        if delta_queue.empty:
-            st.success("No unexplained stock delta exceeds the alert threshold.")
+        elif part["Delta Flag"] == "Review":
+            st.warning(
+                "Reconciliation Agent: recount and review missing postings before changing supply."
+            )
         else:
-            st.dataframe(
-                delta_queue[
-                    [
-                        "Part No.",
-                        "Part Name",
-                        "Buyer",
-                        "Stock Delta",
-                        "Expected Delta",
-                        "Unexplained Delta",
-                    ]
-                ],
-                width="stretch",
-                hide_index=True,
-                height=240,
-            )
-    with master_tab:
-        if master_queue.empty:
-            st.success("No missing-stock or buyer-mapping decision is open.")
-        else:
-            st.dataframe(
-                master_queue[
-                    [
-                        "Part No.",
-                        "Part Name",
-                        "Buyer",
-                        "Supplier",
-                        "Stock Data Status",
-                        "SCM Stock Match",
-                    ]
-                ],
-                width="stretch",
-                hide_index=True,
-                height=240,
-            )
-
-    st.info(
-        f"**Management decision:** protect {critical_parts:,} critical parts, close "
-        f"{overdue_count:,} overdue supplier commitments, review "
-        f"{len(delta_queue):,} large unexplained deltas, and validate "
-        f"{len(excess):,} potential month-end excess signals. Potential excess "
-        "remains indicative until open POs and safety stock are available."
-    )
-    st.caption(
-        f"Potential production impact is shown in each selected risk · "
-        f"buyers with overdue actions: "
-        f"{', '.join(overdue_buyers[:6]) if overdue_buyers else 'none'} · "
-        f"newly verified resolved today: {newly_resolved:,} · "
-        f"decisions requiring validation: {len(delta_queue) + len(excess):,}."
-    )
+            st.success("No immediate shortage or unexplained-delta action is required.")
 
 
 def render_buyer_command_centre() -> None:
@@ -3545,7 +4642,7 @@ def render_buyer_command_centre() -> None:
             str(
                 diagnostics.get(
                     "error",
-                    "No inventory snapshot is available. Refresh all data once.",
+                    "No inventory snapshot is available. Refresh all sources once.",
                 )
             )
         )
@@ -3943,7 +5040,7 @@ def render_stock_health_workspace() -> None:
             str(
                 diagnostics.get(
                     "error",
-                    "No inventory snapshot is available. Refresh all data once.",
+                    "No inventory snapshot is available. Refresh all sources once.",
                 )
             )
         )
@@ -4258,7 +5355,7 @@ def render_requirements_workspace() -> None:
             str(
                 diagnostics.get(
                     "error",
-                    "No inventory snapshot is available. Refresh all data once.",
+                    "No inventory snapshot is available. Refresh all sources once.",
                 )
             )
         )
@@ -4802,7 +5899,7 @@ def render_excess_prevention_agent() -> None:
             str(
                 diagnostics.get(
                     "error",
-                    "No inventory snapshot is available. Refresh all data once.",
+                    "No inventory snapshot is available. Refresh all sources once.",
                 )
             )
         )
@@ -9025,7 +10122,7 @@ def render_setup() -> None:
 
         - Code changes should happen through GitHub branches.
         - App usage can happen through one shared Streamlit URL.
-        - Use Supplier Buyer Map to create a saved SPOC Summary copy and build buyer-supplier ownership cards.
+        - The master refresh maintains the saved buyer-supplier ownership mapping used across the app.
         - Inwarding Parts keeps showing its previous Direct Gate Entry snapshot until you press Refresh.
         - For private Google Sheets, copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml`, paste the service-account JSON values, and share the sheet with that service-account email.
         - Configure `[google_oauth]` for the private inwarding, production, and BOM sheets.
@@ -9166,6 +10263,35 @@ def render_documentation() -> None:
                 "Physical Stock divided by Horizon Demand. It does not yet include "
                 "safety stock, open orders, lead time or MOQ.",
             ),
+            (
+                "Plan / Produced",
+                "Today's total vehicle plan versus Total Production completed so far. "
+                "The produced figure is not Produced P-VIN.",
+            ),
+            (
+                "Line-risk Parts",
+                "Count of parts with known Physical Stock where remaining production "
+                "need is greater than physically available stock.",
+            ),
+            (
+                "Unmapped / Missing Stock",
+                "Unique parts with either no mapped buyer or no usable stock data. "
+                "They require data correction before reliable assignment or assessment.",
+            ),
+            (
+                "Overdue Commitments",
+                "Saved supplier follow-ups due on or before the plan date that are "
+                "not marked Received.",
+            ),
+            (
+                "Data Freshness",
+                "Age of the oldest required saved source used by the control cycle.",
+            ),
+            (
+                "Data Health",
+                "Ready only when the required snapshots are saved and the current "
+                "inventory view has no stock-data gaps; otherwise Attention.",
+            ),
         ],
         columns=["Column", "Meaning"],
     )
@@ -9199,40 +10325,45 @@ def render_documentation() -> None:
 
     with quick_start_tab:
         st.subheader(
-            "Five-stage daily workflow",
+            "Six-stage daily workflow",
             help="The shortest path from refreshed source data to assigned action.",
         )
-        workflow_columns = st.columns(5)
         workflow_steps = [
             (
-                "1 · Readiness",
-                "Refresh and verify source freshness, coverage, and data health.",
+                "1 · Overview",
+                "Check source freshness and required-agent status before trusting decisions.",
             ),
             (
-                "2 · Stock",
+                "2 · Live Flow",
+                "Review variant plan, total production and separate Generated/Produced P‑VIN controls.",
+            ),
+            (
+                "3 · Stock",
                 "Use **Stock Health** for critical, short, missing, and delta-review queues.",
             ),
             (
-                "3 · Requirements",
+                "4 · Requirements",
                 "Review today, seven-day, month and potential-excess requirements.",
             ),
             (
-                "4 · Action",
+                "5 · Action",
                 "Use **Action Centre** for buyer queues, commitments, and PPC recovery.",
             ),
             (
-                "5 · Verify",
+                "6 · Verify",
                 "Use **Audit & Evidence** to reconcile movements and verify resolution.",
             ),
         ]
-        for column, (title, description) in zip(
-            workflow_columns,
-            workflow_steps,
-        ):
-            with column:
-                with st.container(border=True):
-                    st.markdown(f"**{title}**")
-                    st.caption(description)
+        for start in range(0, len(workflow_steps), 3):
+            workflow_columns = st.columns(3)
+            for column, (title, description) in zip(
+                workflow_columns,
+                workflow_steps[start : start + 3],
+            ):
+                with column:
+                    with st.container(border=True):
+                        st.markdown(f"**{title}**")
+                        st.caption(description)
 
         st.subheader(
             "Where should I go?",
@@ -9243,7 +10374,12 @@ def render_documentation() -> None:
                 [
                     (
                         "Inventory Management Agent · Overview",
-                        "Management brief, top risks, supplier actions, excess signals, and data gaps",
+                        "Control-cycle readiness, today's assigned agent actions, "
+                        "headline production, shortage, mapping, and commitment indicators",
+                    ),
+                    (
+                        "Inventory Management Agent · Live Flow",
+                        "Variant plan, total production, Generated/Produced P‑VIN, BOM impact and end-to-end part evidence",
                     ),
                     (
                         "Inventory Management Agent · Stock Health",
@@ -9261,7 +10397,6 @@ def render_documentation() -> None:
                         "Inventory Management Agent · Audit & Evidence",
                         "Readiness, movement reconciliation, master data, calculation evidence and resolution history",
                     ),
-                    ("Supplier Buyer Map", "Find who owns a supplier or part"),
                     ("Inwarding Parts", "Check gate entries and buyer-owned discrepancies"),
                     ("Outwarding Parts", "Review calculated daily production consumption"),
                     ("Setup", "Connect Google and confirm refresh access"),
@@ -9275,8 +10410,11 @@ def render_documentation() -> None:
             st.markdown(
                 """
                 - The app keeps showing the **last saved copy** until Refresh is pressed.
-                - **Refresh all data** updates production, BOM, SCM stock, outwarding,
+                - **Refresh all sources** updates production, BOM, SCM stock, outwarding,
                   inwarding, buyer mapping, and discrepancy checks.
+                - **Auto-refresh every 15 minutes** runs that same complete workflow
+                  while this app session is open and Google remains connected.
+                - A manual master refresh resets the 15-minute countdown.
                 - A failed source keeps its previous saved copy.
                 - Google access is **read-only**; this app does not edit the source sheets.
                 - **Total production so far** is Visibility: P-VIN + VNA + Free
@@ -9285,6 +10423,47 @@ def render_documentation() -> None:
                   column. It is never inferred from total production.
                 """
             )
+        st.subheader(
+            "Overview KPI guide",
+            help=(
+                "The exact meaning of the five decision indicators shown on the "
+                "Overview page. Hover over the ⓘ beside a card for the same summary."
+            ),
+        )
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    (
+                        "Plan / produced",
+                        "Today's vehicle target / total vehicles completed so far",
+                        "Requirements",
+                    ),
+                    (
+                        "Line-risk parts",
+                        "Parts with known Physical Stock and a positive operational shortage",
+                        "Stock Health",
+                    ),
+                    (
+                        "Supplier quantity required",
+                        "Sum of positive remaining need after System Stock",
+                        "Requirements",
+                    ),
+                    (
+                        "Unmapped / missing stock",
+                        "Parts with no buyer mapping or no usable stock value",
+                        "Audit & Evidence",
+                    ),
+                    (
+                        "Overdue commitments",
+                        "Supplier follow-ups due by the plan date and not marked Received",
+                        "Action Centre",
+                    ),
+                ],
+                columns=["Indicator", "What it signifies", "Button opens"],
+            ),
+            width="stretch",
+            hide_index=True,
+        )
 
     with inventory_tab:
         st.subheader(
@@ -9431,6 +10610,24 @@ def render_documentation() -> None:
             st.write(
                 "If today's colour mix is blank, the app uses the most recent "
                 "saved non-zero mix for that model and displays the fallback date."
+            )
+        with st.expander("HEADER PARTS BOM gap-fill rule"):
+            st.markdown(
+                """
+                - The primary production mapping remains **Daywise SKU Plan**, and
+                  the primary component source remains the connected BOM workbook.
+                - A reviewed local **HEADER PARTS** supplement fills only verified
+                  current-model model/colour mappings absent from Daywise SKU Plan.
+                - For a supplemented finished good missing from Exploded BOM, the
+                  app reconstructs its component quantities from Raw BOM by
+                  multiplying quantities through each explosion level.
+                - Existing connected mappings are never overwritten by the supplement.
+                - The current supplement adds six verified finished-good mappings:
+                  five Gen‑3 X+ 5.2 colour combinations and M3 RX 9.1 KWH
+                  Champions edition.
+                - The master-refresh result explicitly reports when this gap fill
+                  was applied, so its use remains visible and auditable.
+                """
             )
         st.subheader(
             "Connected source register",
@@ -9592,9 +10789,19 @@ def render_documentation() -> None:
             pd.DataFrame(
                 [
                     (
-                        "Inventory Control",
+                        "Data Readiness & Mapping",
                         "Active",
-                        "Creates persistent unexplained-delta cases, verifies disappearance, and logs reason/requester/approver for correction requests.",
+                        "Blocks unreliable conclusions when stock, BOM, variant, buyer or supplier data is missing.",
+                    ),
+                    (
+                        "P‑VIN Consumption",
+                        "Active with controlled input",
+                        "Keeps total production separate; Generated P‑VIN drives System consumption and explicit Produced P‑VIN drives Physical consumption.",
+                    ),
+                    (
+                        "Inventory Reconciliation",
+                        "Active",
+                        "Separates expected P‑VIN timing and COGI, creates persistent unexplained-delta cases and verifies resolution.",
                     ),
                     (
                         "Shortage Prevention",
@@ -9602,29 +10809,24 @@ def render_documentation() -> None:
                         "Calculates today/7-day/month requirements, required-by date, severity and buyer ownership.",
                     ),
                     (
-                        "Supplier Follow-up",
+                        "Excess Prevention",
+                        "Indicative",
+                        "Screens seven-day and month-end potential excess. Open POs, safety stock and lead time are still required before cancellation decisions.",
+                    ),
+                    (
+                        "Inwarding Control",
+                        "Active",
+                        "Checks gate entry, invoice/receipt quantity, unloading age and buyer assignment; resolution is refresh-verified.",
+                    ),
+                    (
+                        "Supplier Action",
                         "Active with approval",
-                        "Tracks quantity, ETA and follow-up; drafts a message but requires a human to send it.",
+                        "Tracks quantity, ETA and follow-up and drafts expedite/defer actions; a human must approve and send them.",
                     ),
                     (
-                        "Production Recovery",
+                        "PPC Plan Response",
                         "Planning estimate",
-                        "Provides expedite, affected-production cap and resequencing scenarios.",
-                    ),
-                    (
-                        "Movement Reconciliation",
-                        "Active",
-                        "Separates COGI, unexplained deltas, invoice/receipt differences and possible duplicates.",
-                    ),
-                    (
-                        "Master Data",
-                        "Detection active",
-                        "Finds missing ownership, supplier, descriptions and SCM revision/match issues; edits require confirmation.",
-                    ),
-                    (
-                        "Management Briefing",
-                        "Active",
-                        "Summarizes top risks, overdue commitments, delta reviews and decisions requiring attention.",
+                        "Shows affected variants, production caps and resequencing scenarios without automatically changing the plan.",
                     ),
                 ],
                 columns=["Agent", "Status", "What it does"],
@@ -9689,6 +10891,9 @@ def perform_master_refresh(
 
     if refreshed_sources:
         try:
+            refreshed_sources, supplement_diagnostics = (
+                apply_header_parts_supplement(refreshed_sources)
+            )
             production, _ = build_daily_production(
                 refreshed_sources["vin_details"],
                 refreshed_sources["sku_map"],
@@ -9716,6 +10921,14 @@ def perform_master_refresh(
             completed.append(
                 f"Outwarding production usage ({len(cache_copy):,} rows)"
             )
+            if supplement_diagnostics["supplemental_header_mappings"]:
+                completed.append(
+                    "HEADER PARTS gap fill "
+                    f"({supplement_diagnostics['supplemental_header_mappings']:,} "
+                    "SKU mappings; "
+                    f"{supplement_diagnostics['supplemental_exploded_fgs']:,} "
+                    "BOMs reconstructed)"
+                )
         except Exception as exc:
             failed.append(f"Outwarding calculation — {exc}")
 
@@ -9782,6 +10995,52 @@ def perform_master_refresh(
     return completed, failed
 
 
+@st.fragment(run_every=AUTO_REFRESH_INTERVAL_SECONDS)
+def render_auto_refresh_control(
+    credentials: Credentials | None,
+) -> None:
+    """Run the master refresh every 15 minutes while this app session is open."""
+    enabled = st.toggle(
+        "Auto-refresh every 15 minutes",
+        value=True,
+        key="inventory_auto_refresh_enabled",
+        disabled=credentials is None,
+        help=(
+            "While this page is open, run the same full workflow as Refresh all "
+            "sources every 15 minutes. Previous saved copies remain available if "
+            "a source fails."
+        ),
+    )
+    now = datetime.now()
+    if "inventory_auto_refresh_last_run" not in st.session_state:
+        st.session_state["inventory_auto_refresh_last_run"] = now
+
+    last_run = st.session_state["inventory_auto_refresh_last_run"]
+    if not isinstance(last_run, datetime):
+        last_run = now
+        st.session_state["inventory_auto_refresh_last_run"] = last_run
+
+    if enabled and credentials is not None:
+        elapsed = (now - last_run).total_seconds()
+        if elapsed >= AUTO_REFRESH_INTERVAL_SECONDS:
+            with st.spinner("Running scheduled 15-minute refresh..."):
+                completed, failed = perform_master_refresh(credentials)
+            st.session_state["inventory_auto_refresh_last_run"] = now
+            st.session_state["inventory_auto_refresh_result"] = {
+                "completed": completed,
+                "failed": failed,
+                "finished_at": now.strftime("%H:%M"),
+            }
+            st.rerun()
+
+        next_run = last_run + timedelta(
+            seconds=AUTO_REFRESH_INTERVAL_SECONDS
+        )
+        st.caption(f"Next automatic refresh around {next_run:%H:%M}.")
+    elif credentials is None:
+        st.caption("Connect Google in Setup to enable automatic refresh.")
+
+
 oauth_callback_settings = google_oauth_settings()
 if oauth_callback_settings is not None and st.query_params.get("code"):
     if complete_google_oauth(oauth_callback_settings):
@@ -9795,20 +11054,416 @@ if st.session_state.pop("google_oauth_connected_notice", False):
 st.markdown(
     """
     <style>
-    .block-container { padding-top: 2rem; max-width: 1440px; }
-    h1, h2, h3 { letter-spacing: 0; }
+    :root {
+        --im-ink: #172033;
+        --im-muted: #667085;
+        --im-border: #dfe4ec;
+        --im-surface: #ffffff;
+        --im-canvas: #f3f5f8;
+        --im-accent: #ff4f38;
+        --im-accent-soft: #fff0ed;
+        --im-success: #169b62;
+        --im-warning: #d97706;
+        --im-danger: #dc2626;
+    }
+    .stApp { background: #f4f7fb; }
+    .block-container {
+        padding: 1.25rem 2rem 3rem;
+        max-width: 1580px;
+    }
+    h1, h2, h3 {
+        color: var(--im-ink);
+        letter-spacing: -0.025em;
+    }
+    h1 { font-size: 2.25rem !important; }
+    h2 { font-size: 1.55rem !important; }
+    h3 { font-size: 1.08rem !important; }
+    [data-testid="stHeader"] { background: rgba(244, 247, 251, 0.92); }
+    [data-testid="stSidebar"] {
+        background: #ffffff;
+        border-right: 1px solid #e2e8f0;
+    }
+    [data-testid="stSidebar"] > div:first-child {
+        padding-top: 0.85rem;
+    }
+    .sidebar-brand {
+        align-items: center;
+        display: flex;
+        gap: 12px;
+        margin: 4px 2px 28px;
+        padding: 4px 2px;
+    }
+    .sidebar-brand-mark {
+        align-items: center;
+        background: linear-gradient(145deg, #ff6b55, #f43f2b);
+        border-radius: 12px;
+        box-shadow: 0 8px 16px rgba(255, 79, 56, 0.22);
+        color: #ffffff;
+        display: flex;
+        font-size: 0.84rem;
+        font-weight: 900;
+        height: 42px;
+        justify-content: center;
+        letter-spacing: 0.03em;
+        width: 42px;
+    }
+    .sidebar-brand-name {
+        color: var(--im-ink);
+        font-size: 1.05rem;
+        font-weight: 850;
+    }
+    .sidebar-brand-subtitle {
+        color: #98a2b3;
+        font-size: 0.7rem;
+        font-weight: 650;
+        margin-top: 1px;
+    }
+    .sidebar-section-label {
+        color: #98a2b3;
+        font-size: 0.66rem;
+        font-weight: 850;
+        letter-spacing: 0.13em;
+        margin: 0 8px 8px;
+    }
+    .sidebar-lower-label { margin-top: 28px; }
+    .sidebar-context-card {
+        align-items: center;
+        background: #f8fafc;
+        border: 1px solid var(--im-border);
+        border-radius: 10px;
+        display: flex;
+        gap: 10px;
+        margin: 0 4px;
+        padding: 11px 12px;
+    }
+    .sidebar-context-dot {
+        background: var(--im-success);
+        border: 3px solid #d9f6e8;
+        border-radius: 50%;
+        height: 12px;
+        width: 12px;
+    }
+    .sidebar-context-card b {
+        color: var(--im-ink);
+        display: block;
+        font-size: 0.77rem;
+    }
+    .sidebar-context-card small {
+        color: #98a2b3;
+        display: block;
+        font-size: 0.64rem;
+        margin-top: 2px;
+    }
+    [data-testid="stSidebar"] [role="radiogroup"] {
+        gap: 4px;
+    }
+    [data-testid="stSidebar"] [role="radiogroup"] label {
+        border-radius: 9px;
+        color: #586174;
+        font-size: 0.88rem;
+        font-weight: 700;
+        margin: 0;
+        padding: 8px 10px;
+        transition: background 120ms ease, color 120ms ease;
+    }
+    [data-testid="stSidebar"] [role="radiogroup"] label:hover {
+        background: #f8fafc;
+        color: var(--im-ink);
+    }
+    [data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked) {
+        background: var(--im-accent-soft);
+        color: var(--im-accent);
+    }
+    [data-testid="stSidebar"] [role="radiogroup"] label > div:first-child {
+        display: none;
+    }
+    .app-topbar {
+        align-items: center;
+        background: var(--im-surface);
+        border: 1px solid var(--im-border);
+        border-radius: 14px;
+        display: flex;
+        justify-content: space-between;
+        margin-bottom: 14px;
+        padding: 18px 22px;
+    }
+    .app-breadcrumb {
+        color: var(--im-accent);
+        font-size: 0.64rem;
+        font-weight: 900;
+        letter-spacing: 0.12em;
+    }
+    .app-topbar-title {
+        color: var(--im-ink);
+        font-size: 1.38rem;
+        font-weight: 880;
+        letter-spacing: -0.025em;
+        margin-top: 4px;
+    }
+    .app-topbar-subtitle {
+        color: var(--im-muted);
+        font-size: 0.76rem;
+        margin-top: 2px;
+    }
+    .app-topbar-user {
+        align-items: center;
+        display: flex;
+        gap: 12px;
+        text-align: right;
+    }
+    .app-topbar-user b {
+        color: var(--im-ink);
+        display: block;
+        font-size: 0.77rem;
+    }
+    .app-topbar-user span {
+        color: #98a2b3;
+        display: block;
+        font-size: 0.67rem;
+        margin-top: 2px;
+    }
+    .app-user-avatar {
+        align-items: center;
+        background: #eef2f7;
+        border: 1px solid var(--im-border);
+        border-radius: 50%;
+        color: #4b5565;
+        display: flex;
+        font-size: 0.65rem;
+        font-weight: 900;
+        height: 42px;
+        justify-content: center;
+        width: 42px;
+    }
+    .workflow-caption {
+        align-items: center;
+        color: #7c8799;
+        display: flex;
+        flex-wrap: wrap;
+        font-size: 0.69rem;
+        font-weight: 700;
+        gap: 7px;
+        margin: 16px 2px 8px;
+    }
+    .workflow-caption span {
+        align-items: center;
+        background: #e8edf4;
+        border-radius: 50%;
+        color: #566176;
+        display: inline-flex;
+        font-size: 0.62rem;
+        font-style: normal;
+        height: 20px;
+        justify-content: center;
+        width: 20px;
+    }
+    .workflow-caption i {
+        color: #c2c8d2;
+        font-style: normal;
+    }
+    [data-testid="stMain"] [role="radiogroup"][aria-label="Inventory workflow"] {
+        background: #ffffff;
+        border: 1px solid var(--im-border);
+        border-radius: 12px;
+        display: grid;
+        grid-template-columns: repeat(6, minmax(0, 1fr));
+        gap: 5px;
+        padding: 5px;
+        width: 100%;
+    }
+    [data-testid="stMain"] [role="radiogroup"][aria-label="Inventory workflow"] label {
+        align-items: center;
+        border-radius: 8px;
+        color: #687386;
+        display: flex;
+        font-size: 0.72rem;
+        font-weight: 750;
+        justify-content: center;
+        min-height: 42px;
+        padding: 7px 6px;
+        text-align: center;
+        width: 100%;
+    }
+    [data-testid="stMain"] [role="radiogroup"][aria-label="Inventory workflow"] label p {
+        color: #687386 !important;
+        font-size: inherit;
+        line-height: 1.15;
+        margin: 0;
+        white-space: nowrap;
+    }
+    [data-testid="stMain"] [role="radiogroup"][aria-label="Inventory workflow"] label:has(input:checked) {
+        background: var(--im-ink);
+        color: #ffffff;
+    }
+    [data-testid="stMain"] [role="radiogroup"][aria-label="Inventory workflow"] label:has(input:checked) p {
+        color: #ffffff !important;
+    }
+    [data-testid="stMain"] [role="radiogroup"][aria-label="Inventory workflow"] label > div:first-child {
+        display: none;
+    }
+    [data-testid="stMain"] [role="radiogroup"][aria-label="Inventory workflow"] label > div:last-child {
+        width: 100%;
+    }
+    [data-testid="stMetric"] {
+        background: #ffffff;
+        border: 1px solid #dbe3ef;
+        border-radius: 12px;
+        padding: 14px 16px;
+    }
+    div[data-testid="stDataFrame"],
+    div[data-testid="stDataEditor"] {
+        background: #ffffff;
+        border-radius: 12px;
+    }
+    div[data-testid="stVerticalBlockBorderWrapper"] {
+        background: rgba(255,255,255,0.84);
+        border-color: var(--im-border) !important;
+        border-radius: 14px !important;
+        box-shadow: 0 3px 12px rgba(23, 32, 51, 0.035);
+    }
+    .stButton > button[kind="primary"] {
+        background: var(--im-accent);
+        border-color: var(--im-accent);
+        border-radius: 9px;
+        box-shadow: none;
+        font-weight: 800;
+    }
+    .stButton > button[kind="primary"]:hover {
+        background: #ed3f2b;
+        border-color: #ed3f2b;
+    }
+    .stButton > button:not([kind="primary"]),
+    .stDownloadButton > button {
+        background: #ffffff;
+        border-color: var(--im-border);
+        border-radius: 9px;
+        color: var(--im-ink);
+        font-weight: 750;
+    }
+    .agent-status-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 12px;
+        margin: 8px 0 22px;
+    }
+    .agent-status-card {
+        background: #ffffff;
+        border: 1px solid #dbe3ef;
+        border-top: 4px solid #2563eb;
+        border-radius: 12px;
+        min-height: 112px;
+        padding: 14px 15px;
+        box-shadow: 0 4px 12px rgba(15, 23, 42, 0.04);
+    }
+    .agent-status-card.ok { border-top-color: #16a34a; }
+    .agent-status-card.warn { border-top-color: #d97706; }
+    .agent-status-card.bad { border-top-color: #dc2626; }
+    .agent-status-title {
+        color: #0f172a;
+        font-size: 0.9rem;
+        font-weight: 800;
+        margin-bottom: 9px;
+    }
+    .agent-status-pill {
+        background: #eff6ff;
+        border-radius: 999px;
+        color: #1d4ed8;
+        display: inline-block;
+        font-size: 0.68rem;
+        font-weight: 850;
+        letter-spacing: 0.04em;
+        padding: 5px 8px;
+    }
+    .agent-status-card.ok .agent-status-pill {
+        background: #dcfce7;
+        color: #166534;
+    }
+    .agent-status-card.warn .agent-status-pill {
+        background: #fef3c7;
+        color: #92400e;
+    }
+    .agent-status-card.bad .agent-status-pill {
+        background: #fee2e2;
+        color: #991b1b;
+    }
+    .agent-status-detail {
+        color: #64748b;
+        font-size: 0.78rem;
+        margin-top: 9px;
+    }
+    .agent-action-pill {
+        background: #eff6ff;
+        border-radius: 999px;
+        color: #1d4ed8;
+        display: inline-block;
+        font-size: 0.68rem;
+        font-weight: 850;
+        letter-spacing: 0.05em;
+        padding: 5px 9px;
+    }
+    .agent-action-pill.warn {
+        background: #fef3c7;
+        color: #92400e;
+    }
+    .agent-action-pill.bad {
+        background: #fee2e2;
+        color: #991b1b;
+    }
+    .agent-action-pill.neutral {
+        background: #e8eefc;
+        color: #334e9e;
+    }
+    .flow-control-card {
+        background: #ffffff;
+        border: 1px solid #dbe3ef;
+        border-radius: 12px;
+        min-height: 160px;
+        padding: 17px;
+        box-shadow: 0 4px 12px rgba(15, 23, 42, 0.04);
+    }
+    .flow-control-step {
+        color: #2563eb;
+        font-size: 0.72rem;
+        font-weight: 850;
+        letter-spacing: 0.04em;
+        margin-bottom: 10px;
+        text-transform: uppercase;
+    }
+    .flow-control-value {
+        color: #0f172a;
+        font-size: 1.18rem;
+        font-weight: 850;
+        line-height: 1.25;
+        margin-bottom: 10px;
+    }
+    .flow-control-detail {
+        color: #64748b;
+        font-size: 0.77rem;
+        line-height: 1.45;
+    }
     .metric-card {
         border: 1px solid #dbe3ef;
         border-left: 6px solid #2563eb;
-        border-radius: 8px;
+        border-radius: 12px;
         padding: 18px 18px;
         min-height: 112px;
+        box-shadow: 0 4px 12px rgba(15, 23, 42, 0.04);
     }
     .metric-label {
         color: #64748b;
+        display: flex;
+        gap: 7px;
+        align-items: center;
         font-weight: 700;
         font-size: 0.9rem;
         margin-bottom: 12px;
+    }
+    .metric-info {
+        color: #7c8799;
+        cursor: help;
+        flex: 0 0 auto;
+        font-size: 0.88rem;
+        line-height: 1;
     }
     .metric-value {
         color: #0f172a;
@@ -10022,10 +11677,15 @@ st.markdown(
         padding: 16px;
     }
     @media (max-width: 1000px) {
+        [data-testid="stMain"] [role="radiogroup"][aria-label="Inventory workflow"] {
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+        }
+        .agent-status-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
         .supplier-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
         .rm-owner-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
     @media (max-width: 720px) {
+        .agent-status-grid { grid-template-columns: 1fr; }
         .supplier-grid { grid-template-columns: 1fr; }
         .rm-owner-cards { grid-template-columns: 1fr; }
     }
@@ -10036,34 +11696,73 @@ st.markdown(
 
 
 with st.sidebar:
+    st.markdown(
+        '<div class="sidebar-brand">'
+        '<div class="sidebar-brand-mark">IM</div>'
+        '<div>'
+        '<div class="sidebar-brand-name">InventoryOS</div>'
+        '<div class="sidebar-brand-subtitle">Material intelligence</div>'
+        '</div>'
+        '</div>'
+        '<div class="sidebar-section-label">OPERATIONS</div>',
+        unsafe_allow_html=True,
+    )
+    sidebar_labels = {
+        "Inventory Management Agent": "▦  Inventory Command",
+        "Inwarding Parts": "↓  Inwarding Control",
+        "Outwarding Parts": "↑  Outwarding Control",
+        "Documentation": "◫  Documentation",
+        "Setup": "⚙  Setup",
+    }
+    page = st.radio(
+        "Navigation",
+        list(sidebar_labels),
+        format_func=lambda value: sidebar_labels[value],
+        label_visibility="collapsed",
+        key="app_navigation",
+    )
+    st.markdown(
+        '<div class="sidebar-section-label sidebar-lower-label">WORKSPACE</div>'
+        '<div class="sidebar-context-card">'
+        '<span class="sidebar-context-dot"></span>'
+        '<div>'
+        '<b>HS01 · Stores</b>'
+        '<small>Saved-data workspace</small>'
+        '</div>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+
+if page == "Inventory Management Agent":
+    st.markdown(
+        '<div class="app-topbar">'
+        '<div>'
+        '<div class="app-breadcrumb">OPERATIONS · INVENTORY</div>'
+        '<div class="app-topbar-title">Inventory Command Centre</div>'
+        '<div class="app-topbar-subtitle">'
+        'Stock, production and supplier decisions'
+        '</div>'
+        '</div>'
+        '<div class="app-topbar-user">'
+        '<div>'
+        '<b>HS01 Control</b>'
+        f'<span>{datetime.now():%d %b %Y · %H:%M}</span>'
+        '</div>'
+        '<div class="app-user-avatar">SCM</div>'
+        '</div>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+else:
     st.title(
         APP_TITLE,
         help=(
-            "Use the navigation below to review stock, ownership, inwarding, "
-            "outwarding, documentation, and setup."
+            "A single workspace for part requirements, stock health, material "
+            "movement, discrepancy control, and supplier follow-up."
         ),
     )
-    page = st.radio(
-        "Navigation",
-        [
-            "Inventory Management Agent",
-            "Supplier Buyer Map",
-            "Inwarding Parts",
-            "Outwarding Parts",
-            "Documentation",
-            "Setup",
-        ],
-        label_visibility="collapsed",
-    )
 
-
-st.title(
-    APP_TITLE,
-    help=(
-        "A single workspace for part requirements, stock health, material "
-        "movement, discrepancy control, and supplier follow-up."
-    ),
-)
 
 if page == "Inventory Management Agent":
     credentials = load_google_credentials()
@@ -10123,51 +11822,82 @@ if page == "Inventory Management Agent":
         and stock_gaps == 0
         else "Attention"
     )
-    command_bar = st.columns([1, 1, 1, 1.15, 1.15])
-    with command_bar[0]:
-        st.metric("Production date", selected_plan_date)
-    with command_bar[1]:
-        st.metric(
-            "Data freshness",
-            (
-                f"{freshness_hours:.1f} h"
-                if freshness_hours is not None
-                else "Unavailable"
-            ),
-            help="Age of the oldest required saved source.",
-        )
-    with command_bar[2]:
-        st.metric(
-            "Data health",
-            overall_health,
+    with st.container(border=True):
+        st.subheader(
+            "Control cycle",
             help=(
-                f"{missing_cache_count} source(s) missing and "
-                f"{stock_gaps} stock-data gap(s)."
+                "The production date and saved-source state used by every stock, "
+                "requirement and agent calculation on this page."
             ),
         )
-    with command_bar[3]:
-        st.metric(
-            "Last successful save",
-            (
-                latest_saved.strftime("%d %b · %H:%M")
-                if latest_saved is not None
-                else "Unavailable"
-            ),
-        )
-    with command_bar[4]:
-        master_refresh_clicked = st.button(
-            "Refresh all data",
-            type="primary",
-            disabled=credentials is None,
-            help=(
-                "Refresh production, BOM, SCM stock, outwarding, inwarding, "
-                "buyer mapping, and agent checks."
-            ),
-            width="stretch",
-        )
-        st.caption(
-            "Previous copies remain if a source fails."
-        )
+        command_bar = st.columns([1, 1, 1, 1.15, 1.15])
+        with command_bar[0]:
+            st.metric(
+                "Production date",
+                selected_plan_date,
+                help="Latest eligible positive production-plan date in the saved source.",
+            )
+        with command_bar[1]:
+            st.metric(
+                "Data freshness",
+                (
+                    f"{freshness_hours:.1f} h"
+                    if freshness_hours is not None
+                    else "Unavailable"
+                ),
+                help="Age of the oldest required saved source.",
+            )
+        with command_bar[2]:
+            st.metric(
+                "Data health",
+                overall_health,
+                help=(
+                    f"{missing_cache_count} source(s) missing and "
+                    f"{stock_gaps} stock-data gap(s)."
+                ),
+            )
+        with command_bar[3]:
+            st.metric(
+                "Last successful save",
+                (
+                    latest_saved.strftime("%d %b · %H:%M")
+                    if latest_saved is not None
+                    else "Unavailable"
+                ),
+                help="Most recent timestamp among the saved source snapshots.",
+            )
+        with command_bar[4]:
+            master_refresh_clicked = st.button(
+                "Refresh all sources",
+                type="primary",
+                disabled=credentials is None,
+                help=(
+                    "Refresh production, BOM, SCM stock, outwarding, inwarding, "
+                    "buyer mapping, and agent checks."
+                ),
+                width="stretch",
+            )
+            st.caption("Previous copies remain if a source fails.")
+            render_auto_refresh_control(credentials)
+    auto_refresh_result = st.session_state.pop(
+        "inventory_auto_refresh_result",
+        None,
+    )
+    if auto_refresh_result:
+        completed_count = len(auto_refresh_result.get("completed", []))
+        failed_count = len(auto_refresh_result.get("failed", []))
+        if failed_count:
+            st.toast(
+                f"15-minute refresh saved {completed_count} source group(s); "
+                f"{failed_count} kept their previous copy.",
+                icon="⚠️",
+            )
+        else:
+            st.toast(
+                f"15-minute refresh completed at "
+                f"{auto_refresh_result.get('finished_at', '')}.",
+                icon="✅",
+            )
     if credentials is None:
         st.caption(
             "Connect Google in Setup to enable refresh. Saved data remains available."
@@ -10175,6 +11905,7 @@ if page == "Inventory Management Agent":
     if master_refresh_clicked:
         with st.spinner("Refreshing all inventory sources and agent checks..."):
             completed, failed = perform_master_refresh(credentials)
+        st.session_state["inventory_auto_refresh_last_run"] = datetime.now()
         if completed:
             st.success(
                 "Master refresh completed:\n\n"
@@ -10185,14 +11916,22 @@ if page == "Inventory Management Agent":
                 "Some sources kept their previous saved copy:\n\n"
                 + "\n".join(f"- {item}" for item in failed)
             )
-    st.caption(
-        "1 · Data readiness → 2 · Stock position → 3 · Shortage risk → "
-        "4 · Supplier & PPC actions → 5 · Resolution & audit"
+    st.markdown(
+        '<div class="workflow-caption">'
+        '<span>1</span> Overview <i>→</i>'
+        '<span>2</span> Live flow <i>→</i>'
+        '<span>3</span> Stock health <i>→</i>'
+        '<span>4</span> Requirements <i>→</i>'
+        '<span>5</span> Actions <i>→</i>'
+        '<span>6</span> Audit'
+        '</div>',
+        unsafe_allow_html=True,
     )
     inventory_workspace = st.radio(
         "Inventory workflow",
         [
             "Overview",
+            "Live Flow",
             "Stock Health",
             "Requirements",
             "Action Centre",
@@ -10205,6 +11944,8 @@ if page == "Inventory Management Agent":
     st.divider()
     if inventory_workspace == "Overview":
         render_inventory_executive_overview()
+    elif inventory_workspace == "Live Flow":
+        render_inventory_live_flow()
     elif inventory_workspace == "Stock Health":
         render_stock_health_workspace()
     elif inventory_workspace == "Requirements":
@@ -10213,8 +11954,6 @@ if page == "Inventory Management Agent":
         render_action_centre()
     else:
         render_audit_evidence_workspace()
-elif page == "Supplier Buyer Map":
-    render_supplier_buyer_map()
 elif page == "Inwarding Parts":
     render_inwarding()
 elif page == "Outwarding Parts":

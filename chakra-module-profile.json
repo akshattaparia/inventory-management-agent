@@ -1,0 +1,2346 @@
+{
+  "platform": {
+    "id": "inventory-management-agent",
+    "name": "Inventory Management Agent",
+    "repository": "inventory-management-agent",
+    "owner_team": "Requires team confirmation.",
+    "business_owner": "Requires team confirmation.",
+    "technical_owner": "Requires team confirmation.",
+    "description": "A plant-material control workspace that combines production plans, BOM consumption, stock snapshots, inbound receipts, buyer ownership and supplier follow-up into daily inventory decisions.",
+    "business_outcome": "Protect planned production from material shortages while identifying possible excess and maintaining evidence for inventory and inwarding exceptions.",
+    "maturity": "Working MVP on localhost; production readiness is not evidenced.",
+    "environment": "Localhost only; no staging or production deployment is evidenced.",
+    "cadence": [
+      "daily",
+      "intraday",
+      "ad hoc"
+    ],
+    "planning_horizon": [
+      "current day",
+      "rolling seven days",
+      "remaining month"
+    ],
+    "granularity": [
+      "plant/HS01",
+      "material/part",
+      "supplier",
+      "buyer",
+      "product variant",
+      "finished-good code",
+      "vehicle/VIN",
+      "gate entry",
+      "invoice",
+      "purchase order"
+    ],
+    "primary_users": [
+      "SCM buyers",
+      "plant materials/controllers",
+      "stores and inwarding users",
+      "PPC/production-control users"
+    ],
+    "secondary_users": [
+      "SCM leadership",
+      "plant management",
+      "master-data administrators",
+      "auditors"
+    ],
+    "repository_evidence": [
+      "app.py:22 defines the application title.",
+      "app.py:11710-11723 defines the active specialist navigation.",
+      "app.py:11930-11964 defines the active inventory workspaces.",
+      "README.md documents local Streamlit startup.",
+      "requirements.txt identifies Streamlit, pandas, Google API/OAuth and Trino dependencies."
+    ]
+  },
+  "chakra_position": {
+    "recommended_l0_block": "Daily Operations",
+    "alternative_l0_block": "Plant Materials Control",
+    "display_label": "Material Control",
+    "subtitle": "Daily stock, requirements, receipts, consumption and buyer action control.",
+    "status": "Pilot candidate; currently a working local MVP.",
+    "purpose": "Coordinate plant-material availability and exceptions against daily production execution.",
+    "upstream_blocks": [
+      "Production Planning",
+      "Supplier and Procurement Operations",
+      "Plant Inventory Records"
+    ],
+    "downstream_blocks": [
+      "Daily Production Execution",
+      "Supplier Follow-up",
+      "Management and Audit"
+    ],
+    "home_map_card": {
+      "business_outcome": "Protect production and reduce avoidable material shortages or excess.",
+      "operating_cadence": "Daily and intraday",
+      "primary_user": "SCM buyers and plant-material controllers",
+      "current_status": "Working local MVP",
+      "child_module_labels": [
+        "Data Readiness",
+        "Inventory Position",
+        "Material Requirements",
+        "Inbound Control",
+        "Consumption Control"
+      ],
+      "upstream_connection": "Production, BOM, stock, receipt and ownership spreadsheets",
+      "downstream_connection": "Buyer work queues, supplier follow-ups, PPC responses and audit evidence",
+      "most_important_human_action": "Confirm supplier quantity and delivery timing for production-critical parts.",
+      "most_important_automation": "Variant-to-part demand and stock requirement calculation.",
+      "suggested_icon_category": "warehouse-materials",
+      "suggested_capability_state": "Pilot",
+      "tooltip": "Controls daily material readiness by combining plans, BOM demand, stock, inwarding and buyer-owned exceptions."
+    }
+  },
+  "modules": [
+    {
+      "id": "M1",
+      "name": "Data Intake and Readiness",
+      "level": "L1",
+      "purpose": "Acquire, cache and assess the source data needed for material control.",
+      "primary_user": "Plant-material controller or application operator",
+      "cadence": "Manual or every 15 minutes while an enabled Streamlit session is open",
+      "status": "Working locally for Google Sheets; optional GRN export is an unrouted prototype.",
+      "workflows": [
+        {
+          "id": "W1",
+          "name": "Refresh and retain source snapshots",
+          "level": "L2",
+          "trigger": "A user selects Refresh all sources, or the enabled in-session 15-minute fragment runs.",
+          "end_condition": "Each available source has a saved local CSV snapshot and failures are reported without replacing the previous copy.",
+          "inputs": [
+            "Read-only Google Sheets credentials",
+            "production plan and VIN data",
+            "BOM and SKU mapping",
+            "SCM stock summary",
+            "inwarding and buyer mapping",
+            "part, supplier and material-type mappings"
+          ],
+          "outputs": [
+            "Local CSV snapshots",
+            "refresh summary",
+            "data-readiness diagnostics"
+          ],
+          "steps": [
+            "Authenticate to Google Sheets with read-only scope.",
+            "Fetch each configured sheet.",
+            "Normalize source frames and save snapshots atomically.",
+            "Recompute dependent material and issue views.",
+            "Retain previous snapshots for any failed source and show a partial-failure summary."
+          ],
+          "human_roles": [
+            "Application operator"
+          ],
+          "agents": [
+            "Master Source Refresh",
+            "Session Auto Refresh"
+          ],
+          "approvals": [],
+          "exceptions": [
+            "OAuth missing or insufficient",
+            "source unavailable",
+            "partial refresh failure",
+            "missing cached snapshot",
+            "stale source"
+          ],
+          "technical_references": [
+            "app.py:46-99",
+            "app.py:911-1112",
+            "app.py:10868-11041",
+            ".streamlit/secrets.toml.example"
+          ]
+        },
+        {
+          "id": "W2",
+          "name": "Optional GRN data export",
+          "level": "L2",
+          "trigger": "A human runs the export script with environment configuration; no repository scheduler is evidenced.",
+          "end_condition": "A deduplicated CSV and metadata file are written, or the script exits with an error.",
+          "inputs": [
+            "Trino or Superset credentials",
+            "GRN SQL query",
+            "environment configuration"
+          ],
+          "outputs": [
+            "Local GRN CSV",
+            "GRN metadata JSON"
+          ],
+          "steps": [
+            "Read environment configuration.",
+            "Query Trino directly or call the Superset API.",
+            "Validate expected columns.",
+            "Deduplicate records.",
+            "Write output and metadata atomically."
+          ],
+          "human_roles": [
+            "Technical operator"
+          ],
+          "agents": [
+            "GRN Export Script"
+          ],
+          "approvals": [],
+          "exceptions": [
+            "credential failure",
+            "query/API failure",
+            "timeout",
+            "unexpected schema"
+          ],
+          "technical_references": [
+            "scripts/scheduled_grn_export.py",
+            "config/grn_export.env.example",
+            "sql/superset_grn_export.sql",
+            "sql/superset_grn_export_mysql.sql",
+            "app.py:7900 defines an unrouted display function"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "M2",
+      "name": "Inventory Position and Reconciliation",
+      "level": "L1",
+      "purpose": "Calculate operational and system stock views, expose health queues and retain correction evidence.",
+      "primary_user": "Plant-material controller and auditor",
+      "cadence": "Daily and intraday",
+      "status": "Working locally with important source and authorization limitations.",
+      "workflows": [
+        {
+          "id": "W3",
+          "name": "Calculate daily inventory position",
+          "level": "L2",
+          "trigger": "Source snapshots or editable variant operating inputs change and the Streamlit app reruns.",
+          "end_condition": "Part-level stock, movement, requirement, shortage, delta and status fields are calculated.",
+          "inputs": [
+            "SCM opening stock",
+            "inwarded invoice quantity",
+            "produced-part consumption",
+            "generated P-VIN consumption",
+            "manual other outwarding if present in data",
+            "BOM mappings"
+          ],
+          "outputs": [
+            "tomorrow opening stock",
+            "system stock",
+            "physical stock",
+            "COGI quantity",
+            "supplier required quantity",
+            "operational shortage",
+            "stock-health status"
+          ],
+          "steps": [
+            "Match planned parts to exact SCM stock records.",
+            "Aggregate selected-date inwarding and outwarding.",
+            "Calculate generated and produced P-VIN component consumption.",
+            "Calculate tomorrow opening stock as today's opening stock plus inwarding minus outwarding.",
+            "Calculate system stock, physical stock and COGI.",
+            "Calculate supplier requirement from system stock and operational shortage from physical stock.",
+            "Classify stock health and unexplained deltas."
+          ],
+          "human_roles": [
+            "Plant-material controller",
+            "PPC user"
+          ],
+          "agents": [
+            "Inventory Calculation Engine",
+            "Movement Reconciliation Rules"
+          ],
+          "approvals": [],
+          "exceptions": [
+            "missing stock",
+            "SCM revision mismatch",
+            "unmapped part",
+            "unexplained system/physical delta",
+            "COGI"
+          ],
+          "technical_references": [
+            "app.py:1975-2042",
+            "app.py:2215-2736",
+            "app.py:3183-3214",
+            "app.py:4024-4626",
+            "app.py:5029-5333"
+          ]
+        },
+        {
+          "id": "W4",
+          "name": "Investigate and record inventory corrections",
+          "level": "L2",
+          "trigger": "A user opens Audit and Evidence or identifies an exception in a stock queue.",
+          "end_condition": "Evidence is reviewed and a correction request has a recorded decision; source stock is not automatically changed.",
+          "inputs": [
+            "calculation evidence",
+            "movement reconciliation queue",
+            "master-data exceptions",
+            "proposed correction and reason"
+          ],
+          "outputs": [
+            "local correction request",
+            "approval status",
+            "decision timestamp"
+          ],
+          "steps": [
+            "Inspect part-level calculation evidence or exception queue.",
+            "Enter proposed stock value, reason, requester and approver.",
+            "Save a pending correction request.",
+            "An approver records Approved, Rejected or Applied externally.",
+            "Any actual source-system correction occurs outside this application."
+          ],
+          "human_roles": [
+            "Correction requester",
+            "Correction approver",
+            "Auditor"
+          ],
+          "agents": [
+            "Movement Reconciliation Rules",
+            "Master Data Rules"
+          ],
+          "approvals": [
+            "Correction decision is recorded by a human approver; identity and permissions are not enforced."
+          ],
+          "exceptions": [
+            "missing reason",
+            "missing requester",
+            "missing approver",
+            "rejected correction",
+            "write-back unavailable"
+          ],
+          "technical_references": [
+            "app.py:2761-2895",
+            "app.py:5484-5858",
+            "data/inventory_control_cases.csv"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "M3",
+      "name": "Material Requirements and Supplier Control",
+      "level": "L1",
+      "purpose": "Convert material demand and stock into buyer-owned shortage or excess queues and supplier follow-up records.",
+      "primary_user": "SCM buyer and PPC user",
+      "cadence": "Daily and intraday",
+      "status": "Working locally; supplier communications, open POs, safety stock and enforced approvals are not integrated.",
+      "workflows": [
+        {
+          "id": "W5",
+          "name": "Plan shortage coverage and supplier follow-up",
+          "level": "L2",
+          "trigger": "A current inventory calculation is available and a user selects Today, Rolling 7 Days or Remaining Month.",
+          "end_condition": "A buyer has saved a complete supplier action, or the requirement is otherwise reviewed outside the application.",
+          "inputs": [
+            "planned part demand",
+            "system and physical stock",
+            "part-to-buyer mapping",
+            "part-to-supplier mapping",
+            "planning horizon"
+          ],
+          "outputs": [
+            "required-by date",
+            "severity",
+            "supplier required quantity",
+            "buyer work queue",
+            "local supplier follow-up record",
+            "PPC recommendation"
+          ],
+          "steps": [
+            "Aggregate part demand across the selected horizon.",
+            "Compare demand with stock and find the first shortage date.",
+            "Classify Critical, High or Medium severity.",
+            "Filter the queue by buyer and that buyer's suppliers.",
+            "Capture supplier status, expected quantity, delivery date, next follow-up, owner and notes.",
+            "Generate deterministic quantity, timing and PPC response bullets.",
+            "Save the follow-up locally."
+          ],
+          "human_roles": [
+            "SCM buyer",
+            "PPC user"
+          ],
+          "agents": [
+            "Shortage Prevention Rules",
+            "Supplier Follow-up Recommendation Rules"
+          ],
+          "approvals": [
+            "PPC plan adjustment is presented as a recommendation; approval/execution is not implemented."
+          ],
+          "exceptions": [
+            "missing buyer",
+            "missing supplier",
+            "missing stock",
+            "missing required follow-up fields",
+            "delayed supplier",
+            "delivery later than required-by date",
+            "human non-response not automatically escalated"
+          ],
+          "technical_references": [
+            "app.py:2739-2758",
+            "app.py:2926-3170",
+            "app.py:4627-4864",
+            "app.py:5334-5470",
+            "app.py:6941-7634"
+          ]
+        },
+        {
+          "id": "W6",
+          "name": "Screen potential excess",
+          "level": "L2",
+          "trigger": "A user switches Requirements to Potential excess and selects a planning horizon.",
+          "end_condition": "Potential-excess parts are reviewed; no automatic supply change is made.",
+          "inputs": [
+            "physical stock",
+            "forecast/planned demand",
+            "selected planning horizon",
+            "buyer and supplier mapping"
+          ],
+          "outputs": [
+            "potential-excess queue",
+            "estimated excess quantity",
+            "buyer-owned review list"
+          ],
+          "steps": [
+            "Aggregate demand for the chosen horizon.",
+            "Compare physical stock with planned consumption.",
+            "Flag possible surplus.",
+            "Present filters and review evidence.",
+            "Require human validation before changing supplier commitments."
+          ],
+          "human_roles": [
+            "SCM buyer",
+            "Plant-material controller"
+          ],
+          "agents": [
+            "Excess Prevention Rules"
+          ],
+          "approvals": [
+            "Any reduction or cancellation of supply requires an external human decision."
+          ],
+          "exceptions": [
+            "open purchase orders unavailable",
+            "safety stock unavailable",
+            "lead time unavailable",
+            "potential signal may be false positive"
+          ],
+          "technical_references": [
+            "app.py:3329-3438",
+            "app.py:5334-5342",
+            "app.py:5884-6072"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "M4",
+      "name": "Inbound Materials Control",
+      "level": "L1",
+      "purpose": "Fact-check direct gate entries, assign issues to buyers and maintain a verifiable discrepancy lifecycle.",
+      "primary_user": "Stores/inwarding user and SCM buyer",
+      "cadence": "Intraday and ad hoc",
+      "status": "Working locally against saved Google Sheet snapshots; no source write-back or notification integration.",
+      "workflows": [
+        {
+          "id": "W7",
+          "name": "Refresh and review inwarding",
+          "level": "L2",
+          "trigger": "A connected user selects Refresh on Inwarding Parts or the master refresh includes the source.",
+          "end_condition": "The latest valid direct-gate-entry snapshot is saved and can be filtered or downloaded.",
+          "inputs": [
+            "Direct Gate Entry sheet",
+            "buyer mapping/SPOC summary"
+          ],
+          "outputs": [
+            "saved inwarding snapshot",
+            "buyer-enriched gate-entry table",
+            "filtered CSV download"
+          ],
+          "steps": [
+            "Read the gate-entry and buyer-mapping sheets.",
+            "Clean and cache the data.",
+            "Map buyer by part first and supplier as fallback.",
+            "Filter by date, gate entry, part, buyer, supplier and unloading status.",
+            "Show receipt totals, latest entry and mapping coverage."
+          ],
+          "human_roles": [
+            "Stores/inwarding user",
+            "SCM buyer"
+          ],
+          "agents": [
+            "Inbound Buyer Mapping Rules"
+          ],
+          "approvals": [],
+          "exceptions": [
+            "Google authorization missing",
+            "refresh failure",
+            "buyer not mapped",
+            "invalid dates",
+            "no snapshot"
+          ],
+          "technical_references": [
+            "app.py:804-909",
+            "app.py:8246-8559",
+            "app.py:10868-10995"
+          ]
+        },
+        {
+          "id": "W8",
+          "name": "Resolve inwarding discrepancies",
+          "level": "L2",
+          "trigger": "A refreshed inwarding snapshot is reconciled against persistent action records.",
+          "end_condition": "A refreshed source no longer contains the issue and the action is auto-resolved, or the issue remains assigned for human follow-up.",
+          "inputs": [
+            "buyer-enriched inwarding snapshot",
+            "persistent action history"
+          ],
+          "outputs": [
+            "buyer-owned issue queue",
+            "severity and escalation",
+            "follow-up status and notes",
+            "auto-resolution/reopen history"
+          ],
+          "steps": [
+            "Detect quantity, ownership, required-field, unloading and duplicate issues.",
+            "Assign severity, age, production risk and escalation.",
+            "Map the issue to a buyer or SCM Admin fallback.",
+            "Allow the buyer to acknowledge, investigate or await source correction.",
+            "Reconcile on refresh and auto-resolve only when source evidence is clean.",
+            "Reopen a previously resolved case if it recurs."
+          ],
+          "human_roles": [
+            "SCM buyer",
+            "Stores/inwarding user",
+            "SCM administrator"
+          ],
+          "agents": [
+            "Inwarding Discrepancy Rules",
+            "Issue Lifecycle Reconciler"
+          ],
+          "approvals": [
+            "Manual resolution is intentionally not permitted; refreshed source evidence verifies closure."
+          ],
+          "exceptions": [
+            "invoice/receipt difference",
+            "missing buyer",
+            "missing PO",
+            "missing invoice",
+            "missing part",
+            "missing supplier",
+            "unloading overdue",
+            "possible duplicate",
+            "issue recurrence"
+          ],
+          "technical_references": [
+            "app.py:8840-9335",
+            "app.py:9774-10106",
+            "data/agent_actions.csv is a local ignored runtime artifact when present"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "M5",
+      "name": "Production Consumption and Outwarding",
+      "level": "L1",
+      "purpose": "Translate variant production and P-VIN activity through the BOM into component consumption and outwarding evidence.",
+      "primary_user": "PPC user and plant-material controller",
+      "cadence": "Daily and intraday",
+      "status": "Working locally from saved sources and editable local overrides; no transaction posting to ERP/MES.",
+      "workflows": [
+        {
+          "id": "W9",
+          "name": "Calculate variant and P-VIN material consumption",
+          "level": "L2",
+          "trigger": "Production-plan, VIN, variant-operating or P-VIN input data changes.",
+          "end_condition": "Variant-level totals and component-level generated/produced consumption are recalculated.",
+          "inputs": [
+            "daily variant plan",
+            "total production",
+            "generated P-VIN",
+            "produced P-VIN",
+            "VNA quantity",
+            "Free VIN quantity",
+            "SKU mapping",
+            "exploded BOM",
+            "HEADER PARTS supplement"
+          ],
+          "outputs": [
+            "variant operating table",
+            "generated component consumption",
+            "produced component consumption",
+            "plan balance",
+            "generated-produced gap"
+          ],
+          "steps": [
+            "Parse the daily plan and production break-up.",
+            "Apply locally saved editable variant operating values.",
+            "Map variants to finished-good codes.",
+            "Explode finished-good quantities through BOM usage.",
+            "Calculate generated and produced P-VIN part consumption.",
+            "Feed all dependent inventory, requirement and reconciliation calculations."
+          ],
+          "human_roles": [
+            "PPC user",
+            "Plant-material controller"
+          ],
+          "agents": [
+            "Variant-to-Part Consumption Engine"
+          ],
+          "approvals": [],
+          "exceptions": [
+            "unmapped variant",
+            "missing finished-good mapping",
+            "missing BOM",
+            "aggregate production excluded",
+            "manual override may diverge from source"
+          ],
+          "technical_references": [
+            "app.py:1115-1285",
+            "app.py:1294-1974",
+            "app.py:2043-2375",
+            "app.py:3614-4626"
+          ]
+        },
+        {
+          "id": "W10",
+          "name": "Calculate and review daily outwarding",
+          "level": "L2",
+          "trigger": "A user refreshes calculation sources or opens the saved Outwarding Parts view.",
+          "end_condition": "Daily part usage is calculated, cached, filtered and optionally downloaded.",
+          "inputs": [
+            "actual finished-goods production",
+            "SKU map",
+            "exploded/raw BOM",
+            "part types",
+            "supplier mapping",
+            "manual outwarding data if available"
+          ],
+          "outputs": [
+            "daily finished-goods production evidence",
+            "production-used quantity",
+            "servicing/manual used quantity",
+            "total outwarding quantity",
+            "filtered CSV download"
+          ],
+          "steps": [
+            "Build exact finished-goods production by day.",
+            "Multiply actual output by BOM quantities.",
+            "Group component consumption by date and part.",
+            "Combine any manual outwarding records.",
+            "Show and download filtered usage.",
+            "Report unmapped production and missing BOM finished-good codes."
+          ],
+          "human_roles": [
+            "PPC user",
+            "Plant-material controller"
+          ],
+          "agents": [
+            "Daily Outwarding Calculation"
+          ],
+          "approvals": [],
+          "exceptions": [
+            "source OAuth missing",
+            "source refresh failure",
+            "unmapped finished-good output",
+            "missing BOM",
+            "no computable rows"
+          ],
+          "technical_references": [
+            "app.py:1552-1839",
+            "app.py:8560-8839"
+          ]
+        }
+      ]
+    }
+  ],
+  "capabilities": [
+    {
+      "id": "C01",
+      "name": "Connect read-only Google Sheets",
+      "module": "M1",
+      "workflow": "W1",
+      "user_action": "Authorize a Google account with access to configured sheets.",
+      "automation": "Manual authorization with automated token refresh.",
+      "frontend": "Setup and source pages",
+      "backend": "google_oauth_settings, begin_google_oauth, load_google_credentials",
+      "input": "OAuth client configuration and Google account consent",
+      "output": "Local read-only credentials",
+      "read_write": "Read only to Google; local credential write",
+      "permission": "Google Sheets readonly scope",
+      "approval": "Google consent",
+      "status": "Working locally",
+      "evidence": "app.py:46-49, app.py:911-1029, .streamlit/secrets.toml.example",
+      "team_confirmation_required": false
+    },
+    {
+      "id": "C02",
+      "name": "Refresh all source sheets",
+      "module": "M1",
+      "workflow": "W1",
+      "user_action": "Select Refresh all sources.",
+      "automation": "Deterministic source acquisition and cache update.",
+      "frontend": "Inventory Management Agent control cycle",
+      "backend": "refresh_inventory_source_snapshots",
+      "input": "Configured Google Sheets",
+      "output": "Saved local snapshots and refresh result",
+      "read_write": "Read external; write local CSV",
+      "permission": "Google sheet viewer access",
+      "approval": "None",
+      "status": "Working locally",
+      "evidence": "app.py:10868-10995, app.py:11767-11918",
+      "team_confirmation_required": false
+    },
+    {
+      "id": "C03",
+      "name": "Auto-refresh sources every 15 minutes",
+      "module": "M1",
+      "workflow": "W1",
+      "user_action": "Enable the auto-refresh toggle and keep the session open.",
+      "automation": "In-session Streamlit fragment timer.",
+      "frontend": "Inventory Management Agent control cycle",
+      "backend": "render_auto_refresh_control",
+      "input": "Enabled toggle, valid credentials and open session",
+      "output": "Updated local snapshots",
+      "read_write": "Read external; write local CSV",
+      "permission": "Google sheet viewer access",
+      "approval": "None",
+      "status": "Working locally with session-lifetime limitation",
+      "evidence": "app.py:10998-11041",
+      "team_confirmation_required": false
+    },
+    {
+      "id": "C04",
+      "name": "Retain prior snapshots on source failure",
+      "module": "M1",
+      "workflow": "W1",
+      "user_action": "Review the partial-failure message and continue with the saved copy.",
+      "automation": "Atomic local cache behavior.",
+      "frontend": "Control cycle and source pages",
+      "backend": "save_source_cache, refresh_inventory_source_snapshots",
+      "input": "Successful or failed source response",
+      "output": "Previous or refreshed CSV snapshot",
+      "read_write": "Local write",
+      "permission": "Local filesystem access",
+      "approval": "None",
+      "status": "Working locally",
+      "evidence": "app.py:1102-1112, app.py:10868-10995",
+      "team_confirmation_required": false
+    },
+    {
+      "id": "C05",
+      "name": "Export GRN data",
+      "module": "M1",
+      "workflow": "W2",
+      "user_action": "Run a configured command-line script.",
+      "automation": "Scheduled-script design, but no scheduler is configured in the repository.",
+      "frontend": "No active route; an unrouted prototype function exists.",
+      "backend": "scripts/scheduled_grn_export.py",
+      "input": "Trino or Superset query result",
+      "output": "GRN CSV and metadata",
+      "read_write": "Read external; write local file",
+      "permission": "Trino/Superset credentials",
+      "approval": "None evidenced",
+      "status": "Prototype (unrouted and unscheduled)",
+      "evidence": "scripts/scheduled_grn_export.py, config/grn_export.env.example, app.py:7900",
+      "team_confirmation_required": true
+    },
+    {
+      "id": "C06",
+      "name": "Edit variant operating inputs",
+      "module": "M5",
+      "workflow": "W9",
+      "user_action": "Edit variant-wise plan/production/P-VIN values and save.",
+      "automation": "Local override persistence and dependent recalculation.",
+      "frontend": "Inventory Management Agent Live Flow",
+      "backend": "load_variant_operating_overrides, save_variant_operating_overrides, save_pvin_inputs",
+      "input": "Variant-level numeric values",
+      "output": "Local override and P-VIN CSV records",
+      "read_write": "Local read/write",
+      "permission": "No role enforcement",
+      "approval": "None implemented",
+      "status": "Working locally",
+      "evidence": "app.py:2043-2135, app.py:3614-4626",
+      "team_confirmation_required": true
+    },
+    {
+      "id": "C07",
+      "name": "Map variants to parts through BOM",
+      "module": "M5",
+      "workflow": "W9",
+      "user_action": "Review variant and component impact.",
+      "automation": "Deterministic SKU and recursive BOM calculation.",
+      "frontend": "Inventory Management Agent Live Flow",
+      "backend": "parse_sku_map, build_header_parts_supplement, build_pvin_part_consumption",
+      "input": "Variant, FG/SKU and BOM data",
+      "output": "Variant-to-part consumption",
+      "read_write": "Read source and local cache",
+      "permission": "Source viewer access",
+      "approval": "None",
+      "status": "Working locally",
+      "evidence": "app.py:1115-1285, app.py:2215-2375",
+      "team_confirmation_required": false
+    },
+    {
+      "id": "C08",
+      "name": "Calculate generated and produced P-VIN consumption",
+      "module": "M5",
+      "workflow": "W9",
+      "user_action": "Enter or refresh variant P-VIN values.",
+      "automation": "Deterministic quantity multiplication through BOM.",
+      "frontend": "Inventory Management Agent Live Flow",
+      "backend": "allocate_variant_pvin_to_fgs, build_pvin_part_consumption",
+      "input": "Generated/produced P-VIN by variant",
+      "output": "Part-level generated and produced consumption",
+      "read_write": "Local read/write",
+      "permission": "No role enforcement",
+      "approval": "None",
+      "status": "Working locally; source-of-truth input needs confirmation",
+      "evidence": "app.py:2215-2375",
+      "team_confirmation_required": true
+    },
+    {
+      "id": "C09",
+      "name": "Calculate daily outwarding",
+      "module": "M5",
+      "workflow": "W10",
+      "user_action": "Refresh calculation, filter and download daily usage.",
+      "automation": "Production multiplied by BOM and grouped by part/date.",
+      "frontend": "Outwarding Parts",
+      "backend": "build_daily_production, compute_production_part_usage, combine_manual_outwarding",
+      "input": "Production, SKU and BOM sources",
+      "output": "Daily part outwarding",
+      "read_write": "Read source; write local cache/download",
+      "permission": "Google sheet viewer access",
+      "approval": "None",
+      "status": "Working locally",
+      "evidence": "app.py:1552-1839, app.py:8560-8839",
+      "team_confirmation_required": false
+    },
+    {
+      "id": "C10",
+      "name": "Calculate inventory movement and stock position",
+      "module": "M2",
+      "workflow": "W3",
+      "user_action": "Refresh or change dependent source inputs.",
+      "automation": "Deterministic part-level formulas.",
+      "frontend": "Inventory Management Agent Live Flow and Stock Health",
+      "backend": "build_daily_part_movements, build_part_inventory_plan",
+      "input": "Opening stock, inwarding and outwarding",
+      "output": "Tomorrow OS, system stock, physical stock and movement totals",
+      "read_write": "Read source/local cache",
+      "permission": "Source access",
+      "approval": "None",
+      "status": "Working locally",
+      "evidence": "app.py:2376-2736",
+      "team_confirmation_required": false
+    },
+    {
+      "id": "C11",
+      "name": "Separate supplier requirement and operational shortage",
+      "module": "M2",
+      "workflow": "W3",
+      "user_action": "Review part-level requirement evidence.",
+      "automation": "System-stock and physical-stock formulas.",
+      "frontend": "Inventory Management Agent Stock Health and Calculation Evidence",
+      "backend": "build_part_inventory_plan",
+      "input": "Remaining part need, system stock and physical stock",
+      "output": "Supplier required quantity and operational shortage",
+      "read_write": "Read only",
+      "permission": "No role enforcement",
+      "approval": "None",
+      "status": "Working locally",
+      "evidence": "app.py:2690-2725",
+      "team_confirmation_required": false
+    },
+    {
+      "id": "C12",
+      "name": "Classify stock health",
+      "module": "M2",
+      "workflow": "W3",
+      "user_action": "Filter Critical, Below required, Delta review, Missing stock or Healthy.",
+      "automation": "Deterministic status rules.",
+      "frontend": "Inventory Management Agent Stock Health",
+      "backend": "build_inventory_status, render_stock_health_workspace",
+      "input": "Part-level inventory calculation",
+      "output": "Stock-health queues",
+      "read_write": "Read only",
+      "permission": "No role enforcement",
+      "approval": "None",
+      "status": "Working locally",
+      "evidence": "app.py:3183-3214, app.py:5029-5333",
+      "team_confirmation_required": false
+    },
+    {
+      "id": "C13",
+      "name": "Reconcile COGI and stock deltas",
+      "module": "M2",
+      "workflow": "W4",
+      "user_action": "Review exception evidence and recommended action.",
+      "automation": "Deterministic exception queue.",
+      "frontend": "Audit & Evidence > Movement reconciliation",
+      "backend": "build_movement_reconciliation_queue",
+      "input": "Inventory deltas, COGI and inwarding records",
+      "output": "Reconciliation queue",
+      "read_write": "Read only",
+      "permission": "No role enforcement",
+      "approval": "None",
+      "status": "Working locally",
+      "evidence": "app.py:5484-5615",
+      "team_confirmation_required": false
+    },
+    {
+      "id": "C14",
+      "name": "Log stock correction requests",
+      "module": "M2",
+      "workflow": "W4",
+      "user_action": "Submit reasoned correction and record approval decision.",
+      "automation": "Local audit-record persistence; no source write-back.",
+      "frontend": "Audit & Evidence > Correction requests",
+      "backend": "load_inventory_corrections, save_inventory_corrections, render_inventory_correction_log",
+      "input": "Part, field, proposed value, reason, requester and approver",
+      "output": "Correction record and decision status",
+      "read_write": "Local write",
+      "permission": "No authenticated role enforcement",
+      "approval": "Human decision recorded but not enforced",
+      "status": "Partial",
+      "evidence": "app.py:2872-2895, app.py:5700-5858",
+      "team_confirmation_required": true
+    },
+    {
+      "id": "C15",
+      "name": "Calculate multi-horizon shortages",
+      "module": "M3",
+      "workflow": "W5",
+      "user_action": "Select Today, Rolling 7 Days or Remaining Month.",
+      "automation": "Deterministic cumulative demand and first-shortage date.",
+      "frontend": "Inventory Management Agent Requirements",
+      "backend": "build_rm_planning_views, render_requirements_workspace",
+      "input": "Part demand and stock",
+      "output": "Requirement queue by horizon",
+      "read_write": "Read only",
+      "permission": "No role enforcement",
+      "approval": "None",
+      "status": "Working locally",
+      "evidence": "app.py:2991-3170, app.py:5334-5470",
+      "team_confirmation_required": false
+    },
+    {
+      "id": "C16",
+      "name": "Filter buyer-owned supplier queues",
+      "module": "M3",
+      "workflow": "W5",
+      "user_action": "Select buyer and then one of that buyer's suppliers.",
+      "automation": "Dependent filtering.",
+      "frontend": "Requirements, Buyer work queues and RM Planning",
+      "backend": "render_requirements_workspace, render_buyer_command_centre, render_rm_planning_agent",
+      "input": "Buyer-supplier-part mappings",
+      "output": "Scoped work queue",
+      "read_write": "Read only",
+      "permission": "Selection is not identity-based",
+      "approval": "None",
+      "status": "Working locally",
+      "evidence": "app.py:4627-4864, app.py:5334-5470, app.py:6961-7634",
+      "team_confirmation_required": true
+    },
+    {
+      "id": "C17",
+      "name": "Record supplier commitment and follow-up",
+      "module": "M3",
+      "workflow": "W5",
+      "user_action": "Enter status, expected quantity, dates and notes, then save.",
+      "automation": "Validation and local CSV persistence.",
+      "frontend": "Action Centre > Supplier & PPC actions",
+      "backend": "save_rm_followup_record, render_rm_planning_agent",
+      "input": "Supplier commitment details",
+      "output": "Local follow-up schedule",
+      "read_write": "Local write",
+      "permission": "No authenticated role enforcement",
+      "approval": "None enforced",
+      "status": "Working locally",
+      "evidence": "app.py:2739-2758, app.py:6941-7634",
+      "team_confirmation_required": true
+    },
+    {
+      "id": "C18",
+      "name": "Recommend PPC or supplier response",
+      "module": "M3",
+      "workflow": "W5",
+      "user_action": "Review actionable recommendation bullets.",
+      "automation": "Deterministic rules, not an AI/LLM agent.",
+      "frontend": "Action Centre > Supplier & PPC actions",
+      "backend": "rm_recommendation",
+      "input": "Shortage, required-by date, supplier status and ETA",
+      "output": "Action recommendations",
+      "read_write": "Read only",
+      "permission": "No role enforcement",
+      "approval": "PPC change remains external",
+      "status": "Working locally as recommendation only",
+      "evidence": "app.py:2926-2988, app.py:6961-7634",
+      "team_confirmation_required": true
+    },
+    {
+      "id": "C19",
+      "name": "Screen potential excess",
+      "module": "M3",
+      "workflow": "W6",
+      "user_action": "Select horizon and review potential surplus.",
+      "automation": "Indicative deterministic rules.",
+      "frontend": "Requirements > Potential excess",
+      "backend": "build_potential_excess_view, render_excess_prevention_agent",
+      "input": "Physical stock and planned demand",
+      "output": "Potential excess queue",
+      "read_write": "Read only",
+      "permission": "No role enforcement",
+      "approval": "External validation required before supply change",
+      "status": "Partial/indicative",
+      "evidence": "app.py:3329-3438, app.py:5884-6072",
+      "team_confirmation_required": true
+    },
+    {
+      "id": "C20",
+      "name": "Review and filter direct gate entries",
+      "module": "M4",
+      "workflow": "W7",
+      "user_action": "Filter by date, gate entry, part, buyer, supplier or status.",
+      "automation": "Snapshot cleaning and buyer enrichment.",
+      "frontend": "Inwarding Parts",
+      "backend": "render_inwarding",
+      "input": "Direct Gate Entry and buyer mapping sheets",
+      "output": "Filtered inwarding view and CSV",
+      "read_write": "Read external; write local cache/download",
+      "permission": "Google sheet viewer access",
+      "approval": "None",
+      "status": "Working locally",
+      "evidence": "app.py:8246-8559",
+      "team_confirmation_required": false
+    },
+    {
+      "id": "C21",
+      "name": "Detect inwarding discrepancies",
+      "module": "M4",
+      "workflow": "W8",
+      "user_action": "Review buyer and severity queues.",
+      "automation": "Deterministic rules engine.",
+      "frontend": "Inwarding Parts discrepancy workspace",
+      "backend": "build_agent_issues",
+      "input": "Buyer-enriched inwarding snapshot",
+      "output": "Issues with severity, owner and escalation",
+      "read_write": "Read source; write local action file",
+      "permission": "No role enforcement",
+      "approval": "None",
+      "status": "Working locally",
+      "evidence": "app.py:8886-9134",
+      "team_confirmation_required": false
+    },
+    {
+      "id": "C22",
+      "name": "Manage inwarding issue follow-up",
+      "module": "M4",
+      "workflow": "W8",
+      "user_action": "Acknowledge, investigate, await correction and record notes.",
+      "automation": "Persistent local action lifecycle.",
+      "frontend": "Inwarding Parts buyer workspace",
+      "backend": "save_agent_followup, render_agent_action_detail, render_agentic_flow",
+      "input": "Selected action and human follow-up",
+      "output": "Updated action record",
+      "read_write": "Local write",
+      "permission": "Buyer is selected, not authenticated",
+      "approval": "Manual resolve is prohibited",
+      "status": "Working locally",
+      "evidence": "app.py:9193-9335, app.py:9774-10106",
+      "team_confirmation_required": true
+    },
+    {
+      "id": "C23",
+      "name": "Auto-resolve and reopen inwarding issues",
+      "module": "M4",
+      "workflow": "W8",
+      "user_action": "Refresh source data.",
+      "automation": "Evidence-based lifecycle reconciler.",
+      "frontend": "Inwarding Parts discrepancy workspace",
+      "backend": "reconcile_agent_actions",
+      "input": "Current issues and prior action records",
+      "output": "Auto-resolved or reopened actions",
+      "read_write": "Local write",
+      "permission": "Source viewer access",
+      "approval": "Resolution verified by source evidence",
+      "status": "Working locally",
+      "evidence": "app.py:9137-9190",
+      "team_confirmation_required": false
+    },
+    {
+      "id": "C24",
+      "name": "Inspect master data and calculation evidence",
+      "module": "M2",
+      "workflow": "W4",
+      "user_action": "Review unmapped ownership, invalid descriptions, revision mismatches and end-to-end calculations.",
+      "automation": "Deterministic diagnostics.",
+      "frontend": "Audit & Evidence",
+      "backend": "render_master_data_agent, render_part_inventory",
+      "input": "Current planned-part inventory",
+      "output": "Diagnostic queues and calculation trace",
+      "read_write": "Read only",
+      "permission": "No role enforcement",
+      "approval": "Master-data edits occur outside the app",
+      "status": "Working locally as diagnostic only",
+      "evidence": "app.py:5616-5699, app.py:6073-6940",
+      "team_confirmation_required": true
+    }
+  ],
+  "agents": [
+    {
+      "name": "Master Source Refresh",
+      "type": "Deterministic automation",
+      "purpose": "Refresh configured source snapshots and dependent calculations.",
+      "trigger": "Manual button or session auto-refresh",
+      "inputs": [
+        "Google Sheets",
+        "valid OAuth credentials"
+      ],
+      "tools_apis": [
+        "Google Sheets API",
+        "local filesystem"
+      ],
+      "decisions": [
+        "Keep prior snapshot if a source fails"
+      ],
+      "actions": [
+        "Fetch",
+        "clean",
+        "cache",
+        "reconcile"
+      ],
+      "human_interaction": "Operator authorizes and initiates or enables refresh.",
+      "approval": "Google consent only",
+      "output": "Source snapshots and refresh summary",
+      "failure_behavior": "Reports failed sources and retains previous copies.",
+      "retry_behavior": "Manual retry or next enabled in-session interval; no backoff queue.",
+      "escalation_behavior": "User-visible message only.",
+      "status": "Working locally",
+      "evidence": "app.py:10868-11041"
+    },
+    {
+      "name": "Inventory Calculation Engine",
+      "type": "Deterministic rules/calculation engine",
+      "purpose": "Calculate movements, stock positions, shortages and deltas.",
+      "trigger": "Streamlit rerun with available snapshots",
+      "inputs": [
+        "stock",
+        "inwarding",
+        "production",
+        "P-VIN",
+        "BOM"
+      ],
+      "tools_apis": [
+        "pandas"
+      ],
+      "decisions": [
+        "stock status",
+        "delta flag",
+        "COGI quantity"
+      ],
+      "actions": [
+        "join",
+        "aggregate",
+        "calculate",
+        "classify"
+      ],
+      "human_interaction": "Users review outputs and exceptions.",
+      "approval": "None",
+      "output": "Part-level inventory plan",
+      "failure_behavior": "Returns empty/diagnostic views or propagates visible Streamlit error paths.",
+      "retry_behavior": "Rerun after correcting or refreshing data.",
+      "escalation_behavior": "Queues exceptions; no external notification.",
+      "status": "Working locally",
+      "evidence": "app.py:2376-2736"
+    },
+    {
+      "name": "Variant-to-Part Consumption Engine",
+      "type": "Deterministic calculation engine",
+      "purpose": "Translate variant and finished-good activity into component demand.",
+      "trigger": "Production/P-VIN/BOM data availability or local input edit",
+      "inputs": [
+        "variant activity",
+        "FG map",
+        "BOM"
+      ],
+      "tools_apis": [
+        "pandas"
+      ],
+      "decisions": [
+        "exclude unmapped or BOM-missing quantities"
+      ],
+      "actions": [
+        "map",
+        "explode",
+        "multiply",
+        "aggregate"
+      ],
+      "human_interaction": "PPC user reviews diagnostics and may edit local values.",
+      "approval": "None",
+      "output": "Part consumption",
+      "failure_behavior": "Unmapped production and missing BOM codes are shown as diagnostics.",
+      "retry_behavior": "Refresh or correct source mappings.",
+      "escalation_behavior": "User-visible warning only.",
+      "status": "Working locally",
+      "evidence": "app.py:1115-1974, app.py:2043-2375"
+    },
+    {
+      "name": "Shortage Prevention Rules",
+      "type": "Deterministic rules engine",
+      "purpose": "Prioritize part shortages by horizon and required-by date.",
+      "trigger": "Inventory and plan view calculation",
+      "inputs": [
+        "part demand",
+        "stock",
+        "planning dates"
+      ],
+      "tools_apis": [
+        "pandas"
+      ],
+      "decisions": [
+        "Critical, High or Medium",
+        "first required-by date"
+      ],
+      "actions": [
+        "create buyer queue",
+        "calculate required quantity"
+      ],
+      "human_interaction": "Buyer confirms supply response.",
+      "approval": "Supplier/PPC action remains human.",
+      "output": "Requirement queue",
+      "failure_behavior": "Missing stock is separated rather than treated as zero.",
+      "retry_behavior": "Recalculate on refresh.",
+      "escalation_behavior": "UI severity only; no notification.",
+      "status": "Working locally",
+      "evidence": "app.py:2991-3170, app.py:5334-5470"
+    },
+    {
+      "name": "Supplier Follow-up Recommendation Rules",
+      "type": "Deterministic recommendation rules",
+      "purpose": "Suggest quantity, timing, supplier follow-up and PPC response.",
+      "trigger": "A shortage row and supplier action values are selected.",
+      "inputs": [
+        "required quantity",
+        "required-by date",
+        "supplier status",
+        "ETA"
+      ],
+      "tools_apis": [],
+      "decisions": [
+        "whether ETA is late",
+        "whether alternate build response is needed"
+      ],
+      "actions": [
+        "render action bullets"
+      ],
+      "human_interaction": "Buyer completes and saves the action; PPC decides outside the app.",
+      "approval": "External human approval",
+      "output": "Recommendation and local follow-up",
+      "failure_behavior": "Save is disabled until required fields are complete.",
+      "retry_behavior": "User completes missing fields.",
+      "escalation_behavior": "No external escalation.",
+      "status": "Working locally; not AI/LLM",
+      "evidence": "app.py:2926-2988, app.py:6941-7634"
+    },
+    {
+      "name": "Excess Prevention Rules",
+      "type": "Indicative deterministic rules",
+      "purpose": "Identify physical stock that may exceed selected-horizon demand.",
+      "trigger": "Potential excess view selection",
+      "inputs": [
+        "physical stock",
+        "planned demand"
+      ],
+      "tools_apis": [
+        "pandas"
+      ],
+      "decisions": [
+        "potential excess signal"
+      ],
+      "actions": [
+        "create review queue"
+      ],
+      "human_interaction": "Buyer validates before changing supply.",
+      "approval": "External human validation",
+      "output": "Potential excess queue",
+      "failure_behavior": "UI discloses missing PO and safety-stock limitations.",
+      "retry_behavior": "Recalculate when better data is available.",
+      "escalation_behavior": "None",
+      "status": "Partial/indicative",
+      "evidence": "app.py:3329-3438, app.py:5884-6072"
+    },
+    {
+      "name": "Inwarding Discrepancy Rules",
+      "type": "Deterministic rules engine",
+      "purpose": "Detect and prioritize gate-entry exceptions.",
+      "trigger": "Inwarding snapshot refresh/reconciliation",
+      "inputs": [
+        "gate-entry snapshot",
+        "buyer mapping"
+      ],
+      "tools_apis": [
+        "pandas"
+      ],
+      "decisions": [
+        "issue type",
+        "severity",
+        "owner",
+        "escalation"
+      ],
+      "actions": [
+        "create or update action records"
+      ],
+      "human_interaction": "Buyer investigates and records status/notes.",
+      "approval": "Source evidence controls resolution.",
+      "output": "Buyer-owned issue queue",
+      "failure_behavior": "Fallback owner is SCM Admin for unmapped cases.",
+      "retry_behavior": "Re-evaluate on next refresh.",
+      "escalation_behavior": "Critical/High/age rules in UI; no external notification.",
+      "status": "Working locally",
+      "evidence": "app.py:8886-9190"
+    },
+    {
+      "name": "Movement Reconciliation Rules",
+      "type": "Deterministic exception rules",
+      "purpose": "Unify unexplained deltas, COGI, invoice/receipt differences and duplicate inwarding evidence.",
+      "trigger": "Audit workspace load",
+      "inputs": [
+        "inventory calculation",
+        "inwarding snapshot"
+      ],
+      "tools_apis": [
+        "pandas"
+      ],
+      "decisions": [
+        "exception type"
+      ],
+      "actions": [
+        "create evidence queue"
+      ],
+      "human_interaction": "Controller investigates outside the app.",
+      "approval": "None",
+      "output": "Reconciliation queue",
+      "failure_behavior": "No external incident or notification.",
+      "retry_behavior": "Recalculate on rerun.",
+      "escalation_behavior": "Recommended action text only.",
+      "status": "Working locally",
+      "evidence": "app.py:5484-5615"
+    },
+    {
+      "name": "GRN Export Script",
+      "type": "Command-line integration script",
+      "purpose": "Acquire GRN movements from Trino or Superset.",
+      "trigger": "Manual command; scheduler not evidenced",
+      "inputs": [
+        "environment settings",
+        "SQL"
+      ],
+      "tools_apis": [
+        "Trino",
+        "Superset API"
+      ],
+      "decisions": [
+        "direct-query or Superset mode"
+      ],
+      "actions": [
+        "query",
+        "validate",
+        "deduplicate",
+        "write"
+      ],
+      "human_interaction": "Technical operator configures and runs it.",
+      "approval": "Requires team confirmation.",
+      "output": "GRN CSV and metadata",
+      "failure_behavior": "Exits with an error message.",
+      "retry_behavior": "No automatic retry loop evidenced.",
+      "escalation_behavior": "None evidenced.",
+      "status": "Prototype/unrouted",
+      "evidence": "scripts/scheduled_grn_export.py, config/grn_export.env.example"
+    }
+  ],
+  "human_roles": [
+    {
+      "role": "Application operator",
+      "team": "Requires team confirmation.",
+      "inputs": "OAuth setup and refresh initiation",
+      "decisions": "Whether to refresh and whether partial snapshots are acceptable",
+      "approvals": "Google consent only",
+      "tasks": "Connect sources, refresh, inspect data health",
+      "notifications": "In-app success/warning/error messages",
+      "non_response": "Saved data becomes stale; no automatic external escalation",
+      "escalation_owner": "Requires team confirmation.",
+      "response_time": "Requires team confirmation.",
+      "status": "Implemented as unauthenticated UI actions"
+    },
+    {
+      "role": "SCM buyer",
+      "team": "SCM, inferred from UI; requires team confirmation.",
+      "inputs": "Supplier status, expected quantity, ETA, next follow-up and notes",
+      "decisions": "Supplier follow-up and shortage response",
+      "approvals": "No enforced approval; external procurement authority requires confirmation",
+      "tasks": "Review assigned shortage and inwarding issues",
+      "notifications": "None; queues are visible only in the app",
+      "non_response": "Age/escalation may appear in UI, but no message is sent",
+      "escalation_owner": "SCM Admin fallback appears in inwarding rules; accountable owner requires confirmation",
+      "response_time": "Inwarding escalation rules use age thresholds; business SLA requires confirmation.",
+      "status": "Partially implemented"
+    },
+    {
+      "role": "Stores/inwarding user",
+      "team": "Stores, inferred from UI; requires team confirmation.",
+      "inputs": "Source gate-entry and receipt data is external",
+      "decisions": "Fact-check receipt and unloading evidence",
+      "approvals": "None in app",
+      "tasks": "Review gate-entry issues and correct source externally",
+      "notifications": "None",
+      "non_response": "Issue ages and may be escalated in UI",
+      "escalation_owner": "Assigned buyer/SCM Admin fallback",
+      "response_time": "One-day and three-day unloading rules are implemented; SLA requires confirmation.",
+      "status": "Expected role inferred from workflow"
+    },
+    {
+      "role": "PPC/production-control user",
+      "team": "PPC, inferred from labels; requires team confirmation.",
+      "inputs": "Variant production/P-VIN values and plan context",
+      "decisions": "Whether to adjust build sequence or plan",
+      "approvals": "Plan adjustment approval is not implemented",
+      "tasks": "Review variant flow, shortage impact and recommendations",
+      "notifications": "None",
+      "non_response": "No implemented escalation",
+      "escalation_owner": "Requires team confirmation.",
+      "response_time": "Requires team confirmation.",
+      "status": "Partially implemented"
+    },
+    {
+      "role": "Correction requester",
+      "team": "Requires team confirmation.",
+      "inputs": "Proposed value, evidence and identity text",
+      "decisions": "Whether to raise a correction",
+      "approvals": "Requests approval",
+      "tasks": "Create correction request",
+      "notifications": "None",
+      "non_response": "No request is created",
+      "escalation_owner": "Requires team confirmation.",
+      "response_time": "Requires team confirmation.",
+      "status": "Implemented without authentication"
+    },
+    {
+      "role": "Correction approver",
+      "team": "Requires team confirmation.",
+      "inputs": "Correction request evidence",
+      "decisions": "Approve, reject or mark applied externally",
+      "approvals": "Stock correction decision",
+      "tasks": "Edit approval status",
+      "notifications": "None",
+      "non_response": "Request remains pending; no escalation",
+      "escalation_owner": "Requires team confirmation.",
+      "response_time": "Requires team confirmation.",
+      "status": "Decision logging implemented; identity/permission/write-back missing"
+    },
+    {
+      "role": "SCM/plant management",
+      "team": "Requires team confirmation.",
+      "inputs": "Management metrics and exception queues",
+      "decisions": "Priorities and cross-functional response",
+      "approvals": "No management approval flow implemented",
+      "tasks": "Review dashboards and queues",
+      "notifications": "None",
+      "non_response": "No implemented escalation",
+      "escalation_owner": "Requires team confirmation.",
+      "response_time": "Requires team confirmation.",
+      "status": "Expected consumer; role not enforced"
+    }
+  ],
+  "inputs": [
+    {
+      "name": "Daily production plan and breakup",
+      "meaning": "Variant-level plan and operating values",
+      "source": "Google Sheets production workbook",
+      "format": "Google Sheets to local CSV cache",
+      "frequency": "Daily/intraday on refresh",
+      "granularity": "date and variant",
+      "required_fields": [
+        "date",
+        "variant",
+        "daily plan"
+      ],
+      "freshness": "Current operating day; exact SLA requires team confirmation.",
+      "integration": "Read-only Google Sheets API",
+      "source_of_truth": "Requires team confirmation.",
+      "unavailable_behavior": "Prior local snapshot remains; missing views show warnings.",
+      "evidence": "app.py:50-99, app.py:1294-1452"
+    },
+    {
+      "name": "VIN and production details",
+      "meaning": "Actual finished-goods/VIN production",
+      "source": "Google Sheets",
+      "format": "Google Sheets to local CSV cache",
+      "frequency": "Intraday on refresh",
+      "granularity": "VIN/finished good/date",
+      "required_fields": [
+        "VIN/FG identifiers",
+        "date",
+        "production status/quantity"
+      ],
+      "freshness": "Intraday expectation inferred; requires team confirmation.",
+      "integration": "Read-only Google Sheets API",
+      "source_of_truth": "Requires team confirmation.",
+      "unavailable_behavior": "Saved copy or no computable output.",
+      "evidence": "app.py:1453-1609"
+    },
+    {
+      "name": "Exploded and raw BOM",
+      "meaning": "Component usage by finished-good code",
+      "source": "Google Sheets plus local HEADER PARTS supplement",
+      "format": "Google Sheets/local CSV",
+      "frequency": "On refresh or file update",
+      "granularity": "finished good and component part",
+      "required_fields": [
+        "FG code",
+        "part number",
+        "usage quantity"
+      ],
+      "freshness": "Requires team confirmation.",
+      "integration": "Read-only sheets and local file",
+      "source_of_truth": "Requires team confirmation.",
+      "unavailable_behavior": "Affected production is excluded and warned.",
+      "evidence": "app.py:1115-1285, app.py:1611-1738"
+    },
+    {
+      "name": "SCM stock summary",
+      "meaning": "System opening stock by part",
+      "source": "SCM Summary Google Sheet",
+      "format": "Google Sheets to local CSV cache",
+      "frequency": "On refresh",
+      "granularity": "part/revision",
+      "required_fields": [
+        "part number",
+        "system opening stock"
+      ],
+      "freshness": "Current-day expectation inferred; requires team confirmation.",
+      "integration": "Read-only Google Sheets API",
+      "source_of_truth": "SCM Summary is treated as source-controlled in UI; formal ownership requires confirmation.",
+      "unavailable_behavior": "Part is placed in missing-stock/revision queue.",
+      "evidence": "app.py:1975-2042, app.py:2551-2595"
+    },
+    {
+      "name": "Direct Gate Entry",
+      "meaning": "Inbound supplier vehicle, invoice, PO, part, quantity and unloading records",
+      "source": "Google Sheets",
+      "format": "Google Sheets to local CSV cache",
+      "frequency": "On manual/master/auto refresh",
+      "granularity": "gate entry, invoice and part",
+      "required_fields": [
+        "Gate Entry No",
+        "Date",
+        "Supplier Name",
+        "Part Number",
+        "Invoice Qty",
+        "Receipt Qty"
+      ],
+      "freshness": "Intraday expectation inferred; requires team confirmation.",
+      "integration": "Read-only Google Sheets API",
+      "source_of_truth": "Requires team confirmation.",
+      "unavailable_behavior": "Previous snapshot remains and refresh failure is shown.",
+      "evidence": "app.py:8270-8559, app.py:8907-9134"
+    },
+    {
+      "name": "Buyer and supplier ownership mappings",
+      "meaning": "Assignment of parts/suppliers to SCM buyers",
+      "source": "SPOC/summary and mapping Google Sheets",
+      "format": "Google Sheets to local CSV cache",
+      "frequency": "On refresh",
+      "granularity": "part and supplier",
+      "required_fields": [
+        "part or supplier",
+        "buyer"
+      ],
+      "freshness": "Requires team confirmation.",
+      "integration": "Read-only Google Sheets API",
+      "source_of_truth": "Requires team confirmation.",
+      "unavailable_behavior": "Unmapped buyer or SCM Admin fallback.",
+      "evidence": "app.py:804-909, app.py:2597-2610"
+    },
+    {
+      "name": "Variant operating and P-VIN overrides",
+      "meaning": "Locally editable plan, production and P-VIN values",
+      "source": "Human input in Streamlit",
+      "format": "Local CSV",
+      "frequency": "Ad hoc/intraday",
+      "granularity": "date and variant",
+      "required_fields": [
+        "production date",
+        "variant",
+        "numeric values"
+      ],
+      "freshness": "Current day",
+      "integration": "Local data editor",
+      "source_of_truth": "Requires team confirmation.",
+      "unavailable_behavior": "Saved source values or zeros are displayed depending on field availability.",
+      "evidence": "app.py:2043-2135, data/pvin_variant_inputs.csv"
+    },
+    {
+      "name": "Supplier follow-up input",
+      "meaning": "Buyer-entered commitment and action schedule",
+      "source": "Human input",
+      "format": "Local CSV",
+      "frequency": "Ad hoc",
+      "granularity": "part/supplier action",
+      "required_fields": [
+        "supplier status",
+        "next expected quantity",
+        "expected delivery",
+        "next follow-up",
+        "mapped owner",
+        "notes"
+      ],
+      "freshness": "By follow-up date; SLA requires confirmation.",
+      "integration": "Streamlit form/local CSV",
+      "source_of_truth": "Local app only",
+      "unavailable_behavior": "Action cannot be saved when required fields are missing.",
+      "evidence": "app.py:2739-2758, app.py:6941-7634"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "Part inventory position",
+      "meaning": "Movement, system/physical stock, shortage and delta by part",
+      "destination": "Plant-material controllers, SCM buyers and PPC",
+      "format": "Streamlit table and local calculation frame",
+      "frequency": "On app rerun/refresh",
+      "granularity": "date and part",
+      "integration": "In-app only",
+      "classification": "Operational calculation",
+      "verification": "Calculation evidence is visible; no external reconciliation sign-off.",
+      "evidence": "app.py:2479-2736, app.py:6073-6940"
+    },
+    {
+      "name": "Supplier requirement queue",
+      "meaning": "System-stock-based quantity and required-by date",
+      "destination": "SCM buyers",
+      "format": "Streamlit table",
+      "frequency": "Daily/intraday",
+      "granularity": "part, supplier and buyer",
+      "integration": "In-app only",
+      "classification": "Recommendation/work queue",
+      "verification": "Human review; no procurement transaction confirmation.",
+      "evidence": "app.py:2991-3170, app.py:5334-5470"
+    },
+    {
+      "name": "Operational shortage queue",
+      "meaning": "Physical-stock-based production risk",
+      "destination": "PPC and plant-material control",
+      "format": "Streamlit table",
+      "frequency": "Daily/intraday",
+      "granularity": "part and required-by date",
+      "integration": "In-app only",
+      "classification": "Operational exception",
+      "verification": "Human review; no production-line event confirmation.",
+      "evidence": "app.py:2690-2725, app.py:5029-5333"
+    },
+    {
+      "name": "Supplier follow-up record",
+      "meaning": "Expected quantity, ETA and next buyer action",
+      "destination": "SCM buyer and PPC user",
+      "format": "Local CSV and Streamlit view",
+      "frequency": "Ad hoc",
+      "granularity": "part and supplier",
+      "integration": "Local persistence only",
+      "classification": "Commitment record/recommendation",
+      "verification": "No supplier acknowledgement or delivery verification integration.",
+      "evidence": "app.py:2739-2758, app.py:6941-7634"
+    },
+    {
+      "name": "Potential excess queue",
+      "meaning": "Indicative stock beyond selected-horizon demand",
+      "destination": "SCM buyer and controller",
+      "format": "Streamlit table",
+      "frequency": "On demand",
+      "granularity": "part",
+      "integration": "In-app only",
+      "classification": "Draft signal",
+      "verification": "Must be validated externally because PO, safety-stock and lead-time data are absent.",
+      "evidence": "app.py:3329-3438, app.py:5884-6072"
+    },
+    {
+      "name": "Inwarding action queue",
+      "meaning": "Buyer-owned gate-entry discrepancy cases",
+      "destination": "SCM buyers and inwarding users",
+      "format": "Local CSV and Streamlit workspace",
+      "frequency": "On refresh",
+      "granularity": "action/gate entry/part",
+      "integration": "In-app/local persistence",
+      "classification": "Exception and action",
+      "verification": "Auto-resolution is based on clean refreshed source evidence.",
+      "evidence": "app.py:8840-9335, app.py:9774-10106"
+    },
+    {
+      "name": "Daily outwarding usage",
+      "meaning": "Production and manual/servicing consumption by part and date",
+      "destination": "Plant-material controller",
+      "format": "Streamlit table, local CSV cache and CSV download",
+      "frequency": "Daily/intraday",
+      "granularity": "date and part",
+      "integration": "In-app/download only",
+      "classification": "Calculated actual",
+      "verification": "Unmapped production and missing BOM rows are disclosed; no ERP posting verification.",
+      "evidence": "app.py:8560-8839"
+    },
+    {
+      "name": "Correction decision log",
+      "meaning": "Proposed stock correction and approval status",
+      "destination": "Controller/approver/auditor",
+      "format": "Local CSV",
+      "frequency": "Ad hoc",
+      "granularity": "correction request",
+      "integration": "Local persistence only",
+      "classification": "Approval record",
+      "verification": "Applied externally status is manually recorded; source write-back is absent.",
+      "evidence": "app.py:5700-5858"
+    }
+  ],
+  "shared_identifiers": [
+    {
+      "name": "Part No.",
+      "usage": "Primary material join key across BOM, stock, supplier, buyer, inwarding and requirements.",
+      "stability": "Revision mismatch logic exists; authoritative format requires team confirmation."
+    },
+    {
+      "name": "FG Code",
+      "usage": "Connects production/SKU records to BOM.",
+      "stability": "Requires team confirmation."
+    },
+    {
+      "name": "Variant",
+      "usage": "Connects plan and P-VIN values to finished-good allocation.",
+      "stability": "String normalization/mapping is code-based."
+    },
+    {
+      "name": "VIN",
+      "usage": "Identifies produced vehicle records.",
+      "stability": "Requires team confirmation."
+    },
+    {
+      "name": "Gate Entry No",
+      "usage": "Fact-checks inwarding issues and evidence.",
+      "stability": "Used directly from source."
+    },
+    {
+      "name": "Invoice Number",
+      "usage": "Inwarding evidence and duplicate detection.",
+      "stability": "Used directly from source."
+    },
+    {
+      "name": "PO Number",
+      "usage": "Inwarding evidence.",
+      "stability": "Used directly from source."
+    },
+    {
+      "name": "Action ID",
+      "usage": "Persistent inwarding issue lifecycle.",
+      "stability": "Locally generated; cross-platform contract absent."
+    },
+    {
+      "name": "Request ID",
+      "usage": "Stock correction audit record.",
+      "stability": "Locally generated; cross-platform contract absent."
+    }
+  ],
+  "connections": [
+    {
+      "platform_or_team": "Google Sheets source workbooks",
+      "direction": "incoming",
+      "information": "Production, BOM, stock, inwarding and ownership data",
+      "trigger": "Manual or in-session timed refresh",
+      "method": "Read-only Google Sheets API",
+      "frequency": "Daily/intraday",
+      "identifier": "Part No., FG Code, Variant, VIN, Gate Entry No.",
+      "owner": "Requires team confirmation.",
+      "reliability": "Partial: prior snapshots are retained, but no durable integration monitoring exists.",
+      "status": "Working locally",
+      "future_need": "Managed service identity, schemas, freshness SLAs and monitored ingestion."
+    },
+    {
+      "platform_or_team": "SCM buyers",
+      "direction": "outgoing",
+      "information": "Shortage, inwarding and supplier action queues",
+      "trigger": "User opens the app",
+      "method": "In-app only",
+      "frequency": "Daily/intraday",
+      "identifier": "Buyer, Supplier, Part No., Action ID",
+      "owner": "Requires team confirmation.",
+      "reliability": "No notification or acknowledgement channel.",
+      "status": "Partial",
+      "future_need": "Identity-based assignment, notifications, acknowledgement and SLA events."
+    },
+    {
+      "platform_or_team": "PPC/production control",
+      "direction": "bidirectional",
+      "information": "Variant plan/actual/P-VIN input and shortage response recommendations",
+      "trigger": "Human input and app review",
+      "method": "Google Sheets/local editor/in-app recommendation",
+      "frequency": "Daily/intraday",
+      "identifier": "Date, Variant, FG Code, Part No.",
+      "owner": "Requires team confirmation.",
+      "reliability": "No plan-write or approval integration.",
+      "status": "Partial",
+      "future_need": "Authoritative production event feed and approved PPC response handoff."
+    },
+    {
+      "platform_or_team": "Stores/inwarding operations",
+      "direction": "bidirectional",
+      "information": "Gate-entry actuals incoming; discrepancy/correction needs outgoing",
+      "trigger": "Sheet refresh and human review",
+      "method": "Google Sheet incoming; in-app queue outgoing",
+      "frequency": "Intraday",
+      "identifier": "Gate Entry No., Invoice Number, Part No.",
+      "owner": "Requires team confirmation.",
+      "reliability": "No write-back or acknowledgement.",
+      "status": "Partial",
+      "future_need": "Source correction API/event and verified closure handoff."
+    },
+    {
+      "platform_or_team": "Trino/Superset GRN source",
+      "direction": "incoming",
+      "information": "GRN material movements",
+      "trigger": "Manual script run",
+      "method": "Trino query or Superset API",
+      "frequency": "Unknown",
+      "identifier": "Material document/reference fields in SQL",
+      "owner": "Requires team confirmation.",
+      "reliability": "Not evidenced in active application flow.",
+      "status": "Prototype/unrouted",
+      "future_need": "Decide whether it is authoritative, schedule it and connect it to the active workflow."
+    },
+    {
+      "platform_or_team": "ERP/MES/procurement platform",
+      "direction": "outgoing",
+      "information": "No implemented transaction, correction, purchase-order or production-plan write-back",
+      "trigger": "None",
+      "method": "None",
+      "frequency": "None",
+      "identifier": "Requires team confirmation.",
+      "owner": "Requires team confirmation.",
+      "reliability": "Not available.",
+      "status": "Missing",
+      "future_need": "Define authoritative write-back, approvals, idempotency and verification."
+    },
+    {
+      "platform_or_team": "Chakra",
+      "direction": "bidirectional",
+      "information": "No current connection",
+      "trigger": "None",
+      "method": "None",
+      "frequency": "None",
+      "identifier": "Capability and workflow identifiers proposed in this profile",
+      "owner": "Requires team confirmation.",
+      "reliability": "Not available.",
+      "status": "Planned/unknown",
+      "future_need": "Expose read models and actions through governed APIs/events after ownership and contracts are confirmed."
+    }
+  ],
+  "events": [],
+  "apis": [
+    {
+      "name": "Google Sheets API",
+      "direction": "outbound read",
+      "status": "Working locally",
+      "evidence": "app.py:1044-1099"
+    },
+    {
+      "name": "Superset API",
+      "direction": "outbound read",
+      "status": "Prototype script only",
+      "evidence": "scripts/scheduled_grn_export.py"
+    },
+    {
+      "name": "Trino client",
+      "direction": "outbound read",
+      "status": "Prototype script only",
+      "evidence": "scripts/scheduled_grn_export.py"
+    },
+    {
+      "name": "Platform-owned API",
+      "direction": "none",
+      "status": "Missing",
+      "evidence": "No API framework or route files are present in the repository."
+    }
+  ],
+  "frontend_routes": [
+    {
+      "page": "Inventory Management Agent",
+      "route": "Single Streamlit app; sidebar selection, no URL router",
+      "purpose": "Inventory command workspace",
+      "primary_user": "Controller, buyer, PPC and management",
+      "actions": "Refresh, edit variant inputs, filter queues, record supplier actions and correction decisions",
+      "output": "Overview, Live Flow, Stock Health, Requirements, Action Centre, Audit & Evidence",
+      "services": "Local functions and CSV caches",
+      "status": "Working locally",
+      "chakra_disposition": "Native Chakra module with specialist drill-downs",
+      "evidence": "app.py:11737-11956"
+    },
+    {
+      "page": "Inwarding Parts",
+      "route": "Single Streamlit app; sidebar selection",
+      "purpose": "Gate-entry review and buyer discrepancy action",
+      "primary_user": "Inwarding user and buyer",
+      "actions": "Refresh, filter, download, update issue follow-up",
+      "output": "Inwarding snapshot and discrepancy workspace",
+      "services": "Google Sheets read, local snapshot and action CSV",
+      "status": "Working locally",
+      "chakra_disposition": "Specialist drill-down under Inbound Materials Control",
+      "evidence": "app.py:8270-8559, app.py:9774-10106"
+    },
+    {
+      "page": "Outwarding Parts",
+      "route": "Single Streamlit app; sidebar selection",
+      "purpose": "Daily BOM-based component usage review",
+      "primary_user": "PPC and controller",
+      "actions": "Refresh, filter and download",
+      "output": "Daily production and part outwarding",
+      "services": "Google Sheets read and local computed cache",
+      "status": "Working locally",
+      "chakra_disposition": "Specialist drill-down under Consumption Control",
+      "evidence": "app.py:8560-8839"
+    },
+    {
+      "page": "Documentation",
+      "route": "Single Streamlit app; sidebar selection",
+      "purpose": "Explain logic and workflows",
+      "primary_user": "All users",
+      "actions": "Read workflow documentation",
+      "output": "In-app guidance",
+      "services": "Static Streamlit content",
+      "status": "Working locally",
+      "chakra_disposition": "Merge into contextual Chakra help and retain detailed specialist documentation",
+      "evidence": "app.py:10133-10867"
+    },
+    {
+      "page": "Setup",
+      "route": "Single Streamlit app; sidebar selection",
+      "purpose": "Connect Google and show source behavior",
+      "primary_user": "Application operator",
+      "actions": "Authorize Google access",
+      "output": "Credential status",
+      "services": "Google OAuth",
+      "status": "Working locally",
+      "chakra_disposition": "Move to governed integration administration",
+      "evidence": "app.py:10107-10132"
+    },
+    {
+      "page": "Dormant legacy/prototype functions",
+      "route": "No active navigation",
+      "purpose": "Legacy live sheet, supplier map, Superset inwarding and agentic flow implementations",
+      "primary_user": "None in current routing",
+      "actions": "Not reachable from active navigation",
+      "output": "None in active app flow",
+      "services": "Various",
+      "status": "Unrouted code; not an active capability",
+      "chakra_disposition": "Do not map as live; evaluate for retirement",
+      "evidence": "app.py:7635, app.py:7725, app.py:7900, app.py:9336 have definitions with no active calls"
+    }
+  ],
+  "exceptions": [
+    {
+      "name": "Missing OAuth configuration or consent",
+      "location": "Source refresh",
+      "detection": "OAuth settings or credentials are absent",
+      "response": "Show warning/connect button; saved data remains available",
+      "user_message": "Google OAuth is not configured or connection is required.",
+      "retry": "Authorize and retry",
+      "escalation": "None",
+      "owner": "Application operator",
+      "blocks": "Blocks fresh Google data, not necessarily saved views",
+      "status": "Implemented",
+      "evidence": "app.py:911-1029, app.py:8270-8310"
+    },
+    {
+      "name": "Partial source refresh failure",
+      "location": "Master refresh",
+      "detection": "Per-source exception",
+      "response": "Retain previous copy and report failed sources",
+      "user_message": "Partial failure summary",
+      "retry": "Manual or next in-session interval",
+      "escalation": "None",
+      "owner": "Application operator",
+      "blocks": "May make dependent data stale",
+      "status": "Implemented",
+      "evidence": "app.py:10868-10995"
+    },
+    {
+      "name": "Stale data",
+      "location": "Control cycle and snapshot captions",
+      "detection": "File age/refresh timestamp",
+      "response": "Show freshness/attention status",
+      "user_message": "Data freshness and last refresh",
+      "retry": "Refresh",
+      "escalation": "No external alert",
+      "owner": "Application operator",
+      "blocks": "Does not hard-block workflow",
+      "status": "Partial",
+      "evidence": "app.py:11767-11918"
+    },
+    {
+      "name": "Missing or revision-mismatched stock",
+      "location": "Inventory calculation",
+      "detection": "Exact SCM part match fails or base revision differs",
+      "response": "Do not treat blank as zero; route to missing/revision queue",
+      "user_message": "Missing stock or revision mismatch",
+      "retry": "Correct source/master data and refresh",
+      "escalation": "UI queue only",
+      "owner": "Requires team confirmation.",
+      "blocks": "Blocks reliable shortage calculation for affected part",
+      "status": "Implemented",
+      "evidence": "app.py:2551-2595, app.py:3056-3088"
+    },
+    {
+      "name": "Unmapped variant, FG or BOM",
+      "location": "Consumption/outwarding",
+      "detection": "Mapping or BOM lookup fails",
+      "response": "Exclude affected quantity and show diagnostics",
+      "user_message": "Unmapped production or missing BOM warning",
+      "retry": "Correct mapping/BOM and refresh",
+      "escalation": "None",
+      "owner": "Master data/PPC owner requires confirmation.",
+      "blocks": "Partially blocks accurate consumption",
+      "status": "Implemented",
+      "evidence": "app.py:1552-1839, app.py:8560-8839"
+    },
+    {
+      "name": "COGI or failed system posting",
+      "location": "Inventory position and reconciliation",
+      "detection": "Generated consumption exceeds postable system stock",
+      "response": "Floor system stock at zero and record COGI separately",
+      "user_message": "COGI posting queue",
+      "retry": "Resolve external posting and refresh",
+      "escalation": "Recommended action only",
+      "owner": "Requires team confirmation.",
+      "blocks": "Does not automatically block physical shortage calculation",
+      "status": "Implemented",
+      "evidence": "app.py:2669-2675, app.py:5484-5615"
+    },
+    {
+      "name": "Unexplained system/physical delta",
+      "location": "Inventory position",
+      "detection": "Delta exceeds configured rule after expected timing/COGI",
+      "response": "Flag for review",
+      "user_message": "Delta review",
+      "retry": "Recount or correct postings",
+      "escalation": "UI queue only",
+      "owner": "Requires team confirmation.",
+      "blocks": "Does not hard-block",
+      "status": "Implemented",
+      "evidence": "app.py:2690-2725, app.py:5484-5615"
+    },
+    {
+      "name": "Incomplete supplier action",
+      "location": "RM planning action form",
+      "detection": "Required fields are blank",
+      "response": "Disable save and list missing fields",
+      "user_message": "Complete before saving",
+      "retry": "Enter required values",
+      "escalation": "None",
+      "owner": "SCM buyer",
+      "blocks": "Blocks local action save",
+      "status": "Implemented",
+      "evidence": "app.py:6961-7634"
+    },
+    {
+      "name": "Supplier delay or late ETA",
+      "location": "Supplier action recommendation",
+      "detection": "Status delayed or ETA after required-by date",
+      "response": "Recommend PPC/build response and follow-up",
+      "user_message": "Action bullet",
+      "retry": "Update commitment",
+      "escalation": "No external workflow",
+      "owner": "SCM buyer/PPC requires confirmation.",
+      "blocks": "Does not automatically block or modify plan",
+      "status": "Partial",
+      "evidence": "app.py:2926-2988"
+    },
+    {
+      "name": "Potential excess false positive",
+      "location": "Excess Prevention",
+      "detection": "Signal relies only on available stock and demand",
+      "response": "Label as potential/indicative and require review",
+      "user_message": "Open POs and safety stock are unavailable",
+      "retry": "Re-evaluate with complete data",
+      "escalation": "None",
+      "owner": "SCM buyer",
+      "blocks": "Blocks safe automated commitment change",
+      "status": "Partially handled",
+      "evidence": "app.py:5884-6072"
+    },
+    {
+      "name": "Invoice and receipt conflict",
+      "location": "Inwarding discrepancy agent",
+      "detection": "Invoice Qty differs from Receipt Qty",
+      "response": "Create buyer-owned quantity discrepancy",
+      "user_message": "Quantity discrepancy",
+      "retry": "Correct source and refresh",
+      "escalation": "Severity/age in UI",
+      "owner": "Mapped buyer",
+      "blocks": "Does not block all inwarding",
+      "status": "Implemented",
+      "evidence": "app.py:8992-9031"
+    },
+    {
+      "name": "Missing inwarding owner or required field",
+      "location": "Inwarding discrepancy agent",
+      "detection": "Buyer, PO, invoice, part or supplier is blank",
+      "response": "Create issue; SCM Admin fallback for owner",
+      "user_message": "Missing-field issue",
+      "retry": "Correct source and refresh",
+      "escalation": "Severity/age in UI",
+      "owner": "Mapped buyer or SCM Admin fallback",
+      "blocks": "Does not block display",
+      "status": "Implemented",
+      "evidence": "app.py:9033-9077"
+    },
+    {
+      "name": "Unloading overdue",
+      "location": "Inwarding discrepancy agent",
+      "detection": "Waiting status and age threshold",
+      "response": "Create High/Critical action",
+      "user_message": "Unloading overdue",
+      "retry": "Update source and refresh",
+      "escalation": "One-day/three-day rule",
+      "owner": "Mapped buyer",
+      "blocks": "Does not block all inwarding",
+      "status": "Implemented",
+      "evidence": "app.py:9079-9101"
+    },
+    {
+      "name": "Duplicate inwarding submission",
+      "location": "Inwarding discrepancy agent/reconciliation",
+      "detection": "Repeated gate-entry, part and invoice key",
+      "response": "Create possible duplicate issue",
+      "user_message": "Possible duplicate inwarding",
+      "retry": "Verify/correct source and refresh",
+      "escalation": "UI only",
+      "owner": "Mapped buyer",
+      "blocks": "Does not block all inwarding",
+      "status": "Implemented",
+      "evidence": "app.py:9103-9126, app.py:5484-5574"
+    },
+    {
+      "name": "Human non-response",
+      "location": "Buyer and correction workflows",
+      "detection": "Age can be calculated for inwarding; no general SLA worker exists",
+      "response": "Issue remains visible",
+      "user_message": "Age/escalation field where implemented",
+      "retry": "Human returns to app",
+      "escalation": "No email, Slack or event escalation",
+      "owner": "Requires team confirmation.",
+      "blocks": "Can leave actions open indefinitely",
+      "status": "Partial/unknown",
+      "evidence": "app.py:8925-8988; no notification service is present"
+    },
+    {
+      "name": "Rejected correction",
+      "location": "Correction request workflow",
+      "detection": "Approver selects Rejected",
+      "response": "Record decision timestamp",
+      "user_message": "Status in audit log",
+      "retry": "New/revised request is manual",
+      "escalation": "None",
+      "owner": "Correction approver",
+      "blocks": "Blocks application of that request",
+      "status": "Implemented as a record only",
+      "evidence": "app.py:5700-5858"
+    },
+    {
+      "name": "Database, notification, event or platform API failure",
+      "location": "Not applicable to current local architecture",
+      "detection": "No such components are implemented",
+      "response": "None",
+      "user_message": "None",
+      "retry": "None",
+      "escalation": "None",
+      "owner": "Requires team confirmation.",
+      "blocks": "Future Chakra integration",
+      "status": "Missing",
+      "evidence": "Repository contains no database, notification worker, event bus or platform API implementation."
+    }
+  ],
+  "technical_inventory": {
+    "frontend_framework": "Streamlit",
+    "backend_framework": "No separate backend; business logic runs in the Streamlit process.",
+    "database": "None; CSV and JSON files are used for local persistence.",
+    "authentication": "Google OAuth only for read-only Sheets access; not application user authentication.",
+    "authorization": "Missing; no user roles or row/action permissions are enforced.",
+    "main_services": [
+      "Google Sheets API client",
+      "pandas calculations",
+      "local CSV/JSON persistence",
+      "optional Trino/Superset GRN script"
+    ],
+    "models_tables": "No database models or migrations.",
+    "background_workers": "None.",
+    "scheduled_jobs": "No configured scheduler. A command-line GRN export script exists.",
+    "external_integrations": [
+      "Google Sheets API",
+      "optional Trino",
+      "optional Superset API"
+    ],
+    "event_system": "None.",
+    "logging": "No structured application logging framework; user-visible Streamlit messages and local metadata/actions.",
+    "monitoring": "None.",
+    "health_endpoint": "None.",
+    "deployment_model": "Local Streamlit process; no deployment manifest is present.",
+    "environment": "Localhost",
+    "test_coverage": "No test files or CI pipeline are present.",
+    "documentation": [
+      "README.md",
+      "in-app Documentation page",
+      "environment examples",
+      "this Chakra profile"
+    ],
+    "evidence": [
+      "requirements.txt",
+      ".streamlit/config.toml",
+      ".streamlit/secrets.toml.example",
+      "README.md",
+      "app.py",
+      "scripts/scheduled_grn_export.py"
+    ]
+  },
+  "integration_readiness": {
+    "working_backend": {
+      "state": "Partial",
+      "evidence": "Business logic runs in app.py, but there is no separately deployable service/API."
+    },
+    "stable_apis": {
+      "state": "Missing",
+      "evidence": "No platform-owned API routes or server framework are present."
+    },
+    "api_documentation": {
+      "state": "Missing",
+      "evidence": "No OpenAPI or API documentation files are present."
+    },
+    "authentication": {
+      "state": "Partial",
+      "evidence": "Google OAuth exists only for Sheets access at app.py:911-1029."
+    },
+    "authorization": {
+      "state": "Missing",
+      "evidence": "No authenticated application roles or permissions are implemented."
+    },
+    "health_endpoint": {
+      "state": "Missing",
+      "evidence": "No endpoint/API framework is present."
+    },
+    "events_webhooks": {
+      "state": "Missing",
+      "evidence": "No event or webhook implementation is present."
+    },
+    "audit_records": {
+      "state": "Partial",
+      "evidence": "Local action and correction CSV records exist, but identity is not authenticated and no central immutable audit store exists."
+    },
+    "clear_business_owners": {
+      "state": "Unknown",
+      "evidence": "README and code do not name an accountable business owner."
+    },
+    "clear_technical_owners": {
+      "state": "Unknown",
+      "evidence": "Repository does not identify a technical owner."
+    },
+    "stable_identifiers": {
+      "state": "Partial",
+      "evidence": "Part No., FG Code, Variant, VIN, Gate Entry No., Action ID and Request ID are used, but no cross-platform contract exists."
+    },
+    "input_output_schemas": {
+      "state": "Partial",
+      "evidence": "Column lists and parsing logic exist in app.py, but no versioned external schema contract exists."
+    },
+    "capability_manifest": {
+      "state": "Available",
+      "evidence": "chakra-module-profile.json provides the initial discovery manifest; it is documentation, not a runtime registry."
+    },
+    "mcp_server": {
+      "state": "Missing",
+      "evidence": "No MCP server is present."
+    },
+    "test_environment": {
+      "state": "Missing",
+      "evidence": "No tests, fixtures or dedicated test deployment are present."
+    },
+    "staging_deployment": {
+      "state": "Missing",
+      "evidence": "No staging configuration or deployment files are present."
+    },
+    "production_deployment": {
+      "state": "Missing",
+      "evidence": "No production deployment manifest or hosted URL is documented."
+    }
+  },
+  "open_questions": [
+    {
+      "category": "Business purpose",
+      "question": "Is HS01 daily material control the formally approved scope, or must Chakra represent additional plants or storage locations?"
+    },
+    {
+      "category": "Workflow",
+      "question": "Which variant/P-VIN fields are authoritative system actuals, and which are temporary human-entered overrides?"
+    },
+    {
+      "category": "Workflow",
+      "question": "Should supplier requirement remain driven by system stock and operational shortage by physical stock in the production design?"
+    },
+    {
+      "category": "Ownership",
+      "question": "Which team owns the platform and each of the stock, BOM, production, inwarding and buyer-mapping data domains?"
+    },
+    {
+      "category": "Ownership",
+      "question": "Who are the accountable business owner and technical owner?"
+    },
+    {
+      "category": "Inputs",
+      "question": "Which source is authoritative for today's opening stock, and what is its required intraday freshness SLA?"
+    },
+    {
+      "category": "Inputs",
+      "question": "Is the HEADER PARTS workbook an approved BOM source or a temporary gap-filling supplement?"
+    },
+    {
+      "category": "Inputs",
+      "question": "Should inwarded quantity use Invoice Qty permanently, and how should Receipt Qty influence discrepancy and stock posting?"
+    },
+    {
+      "category": "Outputs",
+      "question": "Is a saved supplier follow-up a draft internal note, a buyer commitment, or an instruction that must be sent to another system?"
+    },
+    {
+      "category": "Human approvals",
+      "question": "Who may approve stock corrections, supplier commitment changes and PPC plan adjustments, and what segregation of duties is required?"
+    },
+    {
+      "category": "Exceptions",
+      "question": "What thresholds and owners should govern stock-delta, stale-data, COGI and human non-response escalations?"
+    },
+    {
+      "category": "Status",
+      "question": "Has this local MVP been used in a controlled pilot, and which workflows have business acceptance?"
+    },
+    {
+      "category": "Upstream dependencies",
+      "question": "Will Google Sheets remain the source interface, or are ERP/MES/WMS APIs or events planned as authoritative feeds?"
+    },
+    {
+      "category": "Upstream dependencies",
+      "question": "Is the Trino/Superset GRN export intended to replace the Direct Gate Entry sheet or serve a separate reconciliation purpose?"
+    },
+    {
+      "category": "Downstream dependencies",
+      "question": "Which procurement, supplier-portal, PPC, ERP or communication system should receive approved actions?"
+    },
+    {
+      "category": "Integration",
+      "question": "Which identifiers and versioning rules will Chakra use for parts, variants, suppliers, buyers, actions and correction requests?"
+    },
+    {
+      "category": "Integration",
+      "question": "Should Chakra embed these specialist views, call a future service API, or consume read models and action events?"
+    },
+    {
+      "category": "Deployment",
+      "question": "What hosting, identity provider, data store, monitoring, backup and environment model are approved for pilot and production?"
+    }
+  ]
+}
