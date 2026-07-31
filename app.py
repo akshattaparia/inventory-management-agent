@@ -1473,12 +1473,29 @@ def parse_vin_detail_plan_actual(
         return pd.DataFrame(columns=columns), pd.DataFrame(columns=unmatched_columns)
 
     rows = df.astype(str).to_numpy().tolist()
-    header_index = next(
-        (index for index, row in enumerate(rows) if row and row[0].strip() == "Model"),
+    header_match = next(
+        (
+            (row_index, column_index)
+            for row_index, row in enumerate(rows)
+            for column_index, value in enumerate(row)
+            if clean_text(value).lower() == "model"
+            and column_index + 1 < len(row)
+            and clean_text(row[column_index + 1]).lower() == "color"
+        ),
         None,
     )
-    if header_index is None or header_index + 3 >= len(rows):
+    if header_match is None:
         return pd.DataFrame(columns=columns), pd.DataFrame(columns=unmatched_columns)
+    header_index, model_header_column = header_match
+    if header_index + 3 >= len(rows):
+        return pd.DataFrame(columns=columns), pd.DataFrame(columns=unmatched_columns)
+
+    # Google Sheets can insert an empty leading column before the merged Model
+    # header. The model values remain in the column immediately to its left,
+    # while Color remains immediately to its right. Supporting both positions
+    # keeps the saved and live sheet layouts compatible.
+    model_column = max(model_header_column - 1, 0)
+    color_column = model_header_column + 1
 
     date_header = rows[header_index]
     date_columns: list[tuple[list[int], list[int], pd.Timestamp]] = []
@@ -1499,11 +1516,14 @@ def parse_vin_detail_plan_actual(
     unmatched: list[dict[str, object]] = []
     current_model = ""
     for row in rows[header_index + 3 :]:
-        if len(row) < 2:
+        if len(row) <= color_column:
             continue
-        if row[0].strip():
-            current_model = row[0].strip()
-        color = row[1].strip()
+        model_value = clean_text(row[model_column])
+        if not model_value and model_header_column < len(row):
+            model_value = clean_text(row[model_header_column])
+        if model_value:
+            current_model = model_value
+        color = clean_text(row[color_column])
         if not current_model or not color:
             continue
         fg = sku_map.get((canonical_model(current_model), canonical_color(color)))
@@ -1995,6 +2015,7 @@ def parse_scm_system_stock(
             index
             for index, value in enumerate(normalized)
             if value.startswith("system_opening_stock")
+            or value.startswith("opening_stock")
         ]
         if component_indexes and stock_indexes:
             header_index = row_index
@@ -3297,19 +3318,17 @@ def load_inventory_workspace_snapshot() -> tuple[
     dict[str, object],
 ]:
     """Load the last saved inventory-planning snapshot without refreshing Google."""
-    missing_sources = [
-        source["cache"]
-        for source in SOURCE_SHEETS.values()
+    missing_source_keys = [
+        key
+        for key, source in SOURCE_SHEETS.items()
         if not source["cache"].exists()
     ]
-    if missing_sources:
-        return (
-            build_inventory_status(load_table("part_inventory")),
-            {},
-            {"error": "Planning data has not been saved yet."},
-        )
     sources = {
-        key: load_source_cache(source["cache"])
+        key: (
+            load_source_cache(source["cache"])
+            if source["cache"].exists()
+            else pd.DataFrame()
+        )
         for key, source in SOURCE_SHEETS.items()
     }
     sources, supplement_diagnostics = apply_header_parts_supplement(
@@ -3323,6 +3342,20 @@ def load_inventory_workspace_snapshot() -> tuple[
         ),
     )
     diagnostics.update(supplement_diagnostics)
+    diagnostics["missing_source_caches"] = missing_source_keys
+    if missing_source_keys:
+        missing_labels = ", ".join(
+            key.replace("_", " ") for key in missing_source_keys
+        )
+        diagnostics["source_warning"] = (
+            "Saved source data is incomplete: " + missing_labels + "."
+        )
+    if not inventory.empty and diagnostics.get("error"):
+        diagnostics["source_warning"] = str(diagnostics.pop("error"))
+    if inventory.empty and not diagnostics.get("error"):
+        diagnostics["error"] = (
+            "No inventory snapshot is available. Initial source setup is required."
+        )
     return inventory, sources, diagnostics
 
 
@@ -10995,6 +11028,35 @@ def perform_master_refresh(
     return completed, failed
 
 
+def bootstrap_inventory_sources(
+    credentials: Credentials | None,
+) -> dict[str, object] | None:
+    """Load missing inventory caches once per session on a fresh checkout."""
+    missing_keys = [
+        key
+        for key, source in SOURCE_SHEETS.items()
+        if not source["cache"].exists()
+    ]
+    if not missing_keys or credentials is None:
+        return None
+
+    signature = "|".join(sorted(missing_keys))
+    if st.session_state.get("inventory_bootstrap_signature") == signature:
+        cached_result = st.session_state.get("inventory_bootstrap_result")
+        return cached_result if isinstance(cached_result, dict) else None
+
+    st.session_state["inventory_bootstrap_signature"] = signature
+    with st.spinner("Loading the first saved inventory snapshot..."):
+        completed, failed = perform_master_refresh(credentials)
+    result: dict[str, object] = {
+        "completed": completed,
+        "failed": failed,
+        "attempted_sources": missing_keys,
+    }
+    st.session_state["inventory_bootstrap_result"] = result
+    return result
+
+
 @st.fragment(run_every=AUTO_REFRESH_INTERVAL_SECONDS)
 def render_auto_refresh_control(
     credentials: Credentials | None,
@@ -11714,6 +11776,12 @@ with st.sidebar:
         "Documentation": "◫  Documentation",
         "Setup": "⚙  Setup",
     }
+    requested_navigation = st.session_state.pop(
+        "requested_app_navigation",
+        "",
+    )
+    if requested_navigation in sidebar_labels:
+        st.session_state["app_navigation"] = requested_navigation
     page = st.radio(
         "Navigation",
         list(sidebar_labels),
@@ -11766,6 +11834,7 @@ else:
 
 if page == "Inventory Management Agent":
     credentials = load_google_credentials()
+    bootstrap_result = bootstrap_inventory_sources(credentials)
     command_inventory, _, command_diagnostics = (
         load_inventory_workspace_snapshot()
     )
@@ -11902,6 +11971,21 @@ if page == "Inventory Management Agent":
         st.caption(
             "Connect Google in Setup to enable refresh. Saved data remains available."
         )
+    if command_diagnostics.get("source_warning"):
+        st.warning(str(command_diagnostics["source_warning"]))
+    if bootstrap_result:
+        bootstrap_completed = bootstrap_result.get("completed", [])
+        bootstrap_failed = bootstrap_result.get("failed", [])
+        if bootstrap_completed and not bootstrap_failed:
+            st.success(
+                "Initial inventory data loaded automatically. Saved copies will "
+                "be used from now on."
+            )
+        elif bootstrap_failed:
+            st.warning(
+                "The automatic first load was incomplete. Use Refresh all sources "
+                "to retry; any successful saved copies remain available."
+            )
     if master_refresh_clicked:
         with st.spinner("Refreshing all inventory sources and agent checks..."):
             completed, failed = perform_master_refresh(credentials)
@@ -11916,6 +12000,39 @@ if page == "Inventory Management Agent":
                 "Some sources kept their previous saved copy:\n\n"
                 + "\n".join(f"- {item}" for item in failed)
             )
+    if command_diagnostics.get("error") or command_inventory.empty:
+        with st.container(border=True):
+            st.subheader(
+                "Set up inventory data",
+                help=(
+                    "Inventory workspaces share the same saved production, BOM "
+                    "and stock snapshots. They become available together after "
+                    "the first successful load."
+                ),
+            )
+            st.warning(
+                str(
+                    command_diagnostics.get(
+                        "error",
+                        "No inventory snapshot is available yet.",
+                    )
+                )
+            )
+            if credentials is None:
+                st.write(
+                    "Connect a Google account with access to the source sheets. "
+                    "The app will load the first snapshot automatically when you "
+                    "return to Inventory Command."
+                )
+                if st.button("Open Setup", type="primary"):
+                    st.session_state["requested_app_navigation"] = "Setup"
+                    st.rerun()
+            else:
+                st.write(
+                    "Google is connected, but the first load did not complete. "
+                    "Press Refresh all sources above to retry."
+                )
+        st.stop()
     st.markdown(
         '<div class="workflow-caption">'
         '<span>1</span> Overview <i>→</i>'
